@@ -7,87 +7,144 @@
 #include <fstream>
 #include <sstream>
 #include <stack>
+#include <queue>
+#include <set>
 
 namespace py = pybind11;
 
-// 修改 De Bruijn 图构建函数
 std::unordered_map<std::string, std::vector<std::string>> de_bruijn_graph(const std::vector<std::string>& reads, int k) {
     std::unordered_map<std::string, std::vector<std::string>> graph;
+    std::set<std::pair<std::string, std::string>> valid_edges;
     
+    // 首先收集所有有效的边
     for (const auto& read : reads) {
         if (read.length() < k) continue;
         
-        // 处理每个k-mer
         for (size_t i = 0; i <= read.length() - k; ++i) {
             std::string kmer = read.substr(i, k);
             std::string prefix = kmer.substr(0, k-1);
             std::string suffix = kmer.substr(1, k-1);
-            graph[prefix].push_back(suffix);
+            valid_edges.insert({prefix, suffix});
         }
+    }
+    
+    // 只添加有效的边到图中
+    for (const auto& edge : valid_edges) {
+        graph[edge.first].push_back(edge.second);
     }
     
     return graph;
 }
 
-// 查找起始节点
-std::string find_start_node(const std::unordered_map<std::string, std::vector<std::string>>& graph) {
+std::pair<std::string, std::string> find_start_end_nodes(const std::unordered_map<std::string, std::vector<std::string>>& graph) {
     std::unordered_map<std::string, int> in_degree, out_degree;
     
-    // 计算入度和出度
     for (const auto& node : graph) {
         out_degree[node.first] = node.second.size();
         for (const auto& neighbor : node.second) {
             in_degree[neighbor]++;
+            out_degree[neighbor]; // 确保节点存在于out_degree中
         }
     }
     
-    // 首先尝试找到入度为0的节点
+    std::string start_node = "", end_node = "";
+    int max_degree_diff = 0;
+    
+    // 寻找入度出度差最大的节点作为起点和终点
     for (const auto& node : graph) {
-        if (in_degree[node.first] == 0) {
-            return node.first;
+        int in = in_degree[node.first];
+        int out = out_degree[node.first];
+        int diff = out - in;
+        
+        if (diff > max_degree_diff) {
+            max_degree_diff = diff;
+            start_node = node.first;
+        }
+        if (-diff > max_degree_diff) {
+            max_degree_diff = -diff;
+            end_node = node.first;
         }
     }
     
-    // 如果没有入度为0的节点，返回第一个节点
-    return graph.begin()->first;
+    // 如果没有找到明显的起点或终点，使用度数最大的节点
+    if (start_node.empty() || end_node.empty()) {
+        int max_degree = 0;
+        std::string max_degree_node;
+        
+        for (const auto& node : graph) {
+            int total_degree = in_degree[node.first] + out_degree[node.first];
+            if (total_degree > max_degree) {
+                max_degree = total_degree;
+                max_degree_node = node.first;
+            }
+        }
+        
+        if (start_node.empty()) start_node = max_degree_node;
+        if (end_node.empty()) end_node = max_degree_node;
+    }
+    
+    return {start_node, end_node};
 }
 
-// 修改后的序列组装函数
-std::string assemble_sequence(const std::unordered_map<std::string, std::vector<std::string>>& original_graph) {
-    if (original_graph.empty()) {
+std::vector<std::string> find_longest_path(
+    const std::unordered_map<std::string, std::vector<std::string>>& graph,
+    const std::string& start,
+    const std::string& end,
+    int max_path_length = 1000  // 添加最大路径长度限制
+) {
+    std::unordered_map<std::string, std::vector<std::string>> paths;
+    std::unordered_map<std::string, int> visit_count;
+    std::vector<std::string> longest_path;
+    
+    std::function<void(const std::string&, std::vector<std::string>&)> dfs = 
+    [&](const std::string& current, std::vector<std::string>& current_path) {
+        // 添加访问次数限制
+        if (visit_count[current] >= 2) return;
+        if (current_path.size() > max_path_length) return;
+        
+        visit_count[current]++;
+        current_path.push_back(current);
+        
+        if (current_path.size() > longest_path.size()) {
+            longest_path = current_path;
+        }
+        
+        if (graph.count(current)) {
+            for (const auto& next : graph.at(current)) {
+                dfs(next, current_path);
+            }
+        }
+        
+        current_path.pop_back();
+        visit_count[current]--;
+    };
+    
+    std::vector<std::string> current_path;
+    dfs(start, current_path);
+    
+    return longest_path;
+}
+
+std::string assemble_sequence(const std::unordered_map<std::string, std::vector<std::string>>& graph) {
+    if (graph.empty()) {
         return "";
     }
     
-    // 创建图的可修改副本
-    auto graph = original_graph;
+    auto [start_node, end_node] = find_start_end_nodes(graph);
+    auto path = find_longest_path(graph, start_node, end_node);
     
-    // 找到起始节点
-    std::string start = find_start_node(graph);
+    if (path.empty()) {
+        return "";
+    }
     
-    // 存储最终路径
-    std::string result = start;
-    std::string current = start;
-    
-    // 贪婪策略：总是选择可用的下一个节点
-    while (true) {
-        auto it = graph.find(current);
-        if (it == graph.end() || it->second.empty()) {
-            break;
-        }
-        
-        // 获取下一个节点
-        std::string next = it->second.back();
-        it->second.pop_back();
-        
-        // 只添加新节点的最后一个字符
-        result += next.back();
-        current = next;
+    std::string result = path[0];
+    for (size_t i = 1; i < path.size(); ++i) {
+        result += path[i].back();
     }
     
     return result;
 }
 
-// output_gml 函数保持不变
 void output_gml(const std::unordered_map<std::string, std::vector<std::string>>& graph, const std::string& filename) {
     std::ofstream file(filename);
     file << "graph [\n";
