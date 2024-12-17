@@ -2,6 +2,7 @@ from setuptools import setup, Extension
 import pybind11
 
 pybind11_include = pybind11.get_include()
+# run with python3 setup.py build_ext --inplace
 
 ext_modules = [
     Extension(
