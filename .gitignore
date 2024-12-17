@@ -1,0 +1,6 @@
+*.so
+*.fa*
+*.gml
+t*mp*
+build/
+__pycache__/
