@@ -2,145 +2,216 @@
 # -*- coding: utf-8 -*-
 """
 Author: JiangminZheng
-Date: Use reads to assemble cne
+Description: Assemble CNE using sequencing reads with progress tracking
 """
 
-import os, re, sys
+import os
+import re
+import sys
 import mappy
-from collections import defaultdict
 import gzip
 import argparse
 import tqdm
-import multiprocessing
+import multiprocessing as mp
+import shutil
+from collections import defaultdict
+from queue import Empty
 from hip import debruijn
 from hip.validator import validate_read, MerQueryManager
 
 
-def fq_generator(file: str, divider: int = 1, mark: int = 0):
+def chunk_generator(file: str, chunk_size: int = 10000):
     """
-    Generate reads from a FASTQ file (supports both gzipped and plain text files).
-    Only yields entries where the line number is divisible by the divider parameter.
-
+    Generate chunks of reads from a FASTQ file.
+    
     Args:
-        file (str): Path to the FASTQ file (can be gzipped with .gz or plain text).
-        divider (int): Only yield entries where line number is divisible by this value.
-                      Default is 1 (yield all entries).
-
+        file (str): Path to FASTQ file (gzipped or plain text)
+        chunk_size (int): Number of reads per chunk
+        
     Yields:
-        tuple: A tuple containing:
-            - seq_id (str): The sequence ID (from the first line, starting with @).
-            - sequence (str): The nucleotide sequence (from the second line).
-            - quality (str): The quality scores (from the fourth line).
+        list: List of tuples containing (seq_id, sequence, quality) for each chunk
     """
-    # Open file (supports both gzipped and plain text)
     open_func = gzip.open if file.endswith(".gz") else open
-
+    chunk = []
+    
     with open_func(file, "rt") as f:
-        entry_count = 0  # Counter for FASTQ entries
-
         while True:
             try:
-                # Read the 4 lines of each FASTQ entry
-                seq_id = f.readline().strip()  # 1st line: sequence identifier
-                if not seq_id:  # EOF
+                seq_id = f.readline().strip()
+                if not seq_id:
+                    if chunk:
+                        yield chunk
                     break
-
-                sequence = f.readline().strip()  # 2nd line: nucleotide sequence
-                _ = f.readline().strip()  # 3rd line: separator (usually "+")
-                quality = f.readline().strip()  # 4th line: quality scores
-
-                entry_count += 1
-
-                # Only yield entries where entry_count is divisible by divider
-                if entry_count % divider == mark:
-                    yield (seq_id, sequence, quality)
-
+                
+                sequence = f.readline().strip()
+                _ = f.readline().strip()
+                quality = f.readline().strip()
+                
+                chunk.append((seq_id, sequence, quality))
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+                    
             except Exception as e:
                 print(f"Error while reading file: {e}")
                 break
 
 
-def out_write(file, infos):
-    with open(file, "a") as f:
-        f.write("\n".join(["\t".join([str(ele) for ele in info]) for info in infos]))
+def reader_process(files, queue, chunk_size, total_depth, progress_queue):
+    """
+    Reader process that reads files and puts data chunks into queue.
+    
+    Args:
+        files (list): List of input FASTQ files
+        queue (Queue): Queue for data chunks
+        chunk_size (int): Size of each chunk
+        total_depth (int): Maximum number of reads to process
+        progress_queue (Queue): Queue for progress updates
+    """
+    reads_count = 0
+    for file in files:
+        for chunk in chunk_generator(file, chunk_size):
+            if reads_count >= total_depth:
+                break
+            queue.put(chunk)
+            reads_count += len(chunk)
+            progress_queue.put(len(chunk))
+    
+    # Send end signals
+    for _ in range(mp.cpu_count()):
+        queue.put(None)
+    progress_queue.put(None)
 
 
-def assembler(reads_files, mers, assemble_out, depth=20_000_000, threads=4, thread_id=0):
-    # read in mers
+def worker_process(queue, mer_file, output_file, thread_id):
+    """
+    Worker process that processes data chunks from queue.
+    
+    Args:
+        queue (Queue): Queue containing data chunks
+        mer_file (str): Path to mer file
+        output_file (str): Path to output file
+        thread_id (int): Worker thread ID
+    """
+    # Initialize mer query manager
     mer_query = MerQueryManager()
-    mer_size = 0
-    with open(mers) as f:
-        for line in tqdm.tqdm(f, unit="mer"):
+    with open(mer_file) as f:
+        for line in f:
             mer, id, loci, count = line.strip("\n").split("\t")
             mer_size = len(mer)
             try:
                 mer_query.add_mer(mer, int(id), int(loci))
             except ValueError:
                 continue
-    if mer_size == 0:
-        raise ValueError("Confident mer size suggested to be over 7")
-    # read in reads
+    
     confi_reads = []
-    cache_size = 5_000
-    open(assemble_out, "w").close()
-    for file in reads_files:
-        fqs = fq_generator(file, divider=threads, mark=thread_id)
-        for seq_id, seq, qua in tqdm.tqdm(fqs, total=depth, unit="reads"):
-            depth -= 1
-            # forward
-            confi_id = validate_read(seq, mer_query, mer_size)
-            if confi_id > -1:
-                confi_reads.append((confi_id, seq))
-            if len(confi_reads) > cache_size:
-                # write
-                out_write(assemble_out, confi_reads)
-                confi_reads = []
-            if depth < 0:
+    cache_size = 5000
+    
+    while True:
+        try:
+            chunk = queue.get(timeout=60)
+            if chunk is None:
                 break
-
+                
+            for seq_id, seq, qua in chunk:
+                confi_id = validate_read(seq, mer_query, mer_size)
+                if confi_id > -1:
+                    confi_reads.append((confi_id, seq))
+                
+                if len(confi_reads) >= cache_size:
+                    out_write(output_file, confi_reads)
+                    confi_reads = []
+                    
+        except Empty:
+            break
+            
     if confi_reads:
-        out_write(assemble_out, confi_reads)
+        out_write(output_file, confi_reads)
+
+
+def out_write(file, infos):
+    """
+    Write assembled results to output file.
+    
+    Args:
+        file (str): Output file path
+        infos (list): List of results to write
+    """
+    with open(file, "a") as f:
+        f.write("\n".join(["\t".join([str(ele) for ele in info]) for info in infos]))
+
+
+def progress_monitor(progress_queue, total_depth):
+    """
+    Monitor and display progress bar.
+    
+    Args:
+        progress_queue (Queue): Queue containing progress updates
+        total_depth (int): Total number of reads to process
+    """
+    pbar = tqdm.tqdm(total=total_depth, desc="Processing reads")
+    while True:
+        count = progress_queue.get()
+        if count is None:
+            break
+        pbar.update(count)
+    pbar.close()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Assemble element based on confi mers."
+        description="Assemble element based on confident mers."
     )
-    parser.add_argument("reads_files", nargs="+", help="input reads file in gz or not")
-    parser.add_argument("--mers", type=str, required=True, help="mers table")
+    parser.add_argument("reads_files", nargs="+", help="Input reads files (gzipped or plain text)")
+    parser.add_argument("--mers", type=str, required=True, help="Mers table file")
     parser.add_argument(
-        "--depth", type=int, default=200_000_000, help="reads number to assemble"
+        "--depth", type=int, default=200_000_000, help="Number of reads to assemble"
     )
-    parser.add_argument("--threads", type=int, default=4, help="threads number to use")
-    parser.add_argument("--output_dir", type=str, default="out", help="output directory")
+    parser.add_argument("--threads", type=int, default=4, help="Number of threads to use")
+    parser.add_argument("--output_dir", type=str, default="out", help="Output directory")
+    parser.add_argument("--chunk_size", type=int, default=10000, help="Chunk size for reading")
     args = parser.parse_args()
 
-    average_depth = args.depth // (len(args.reads_files) * args.threads)
-
-    pool = multiprocessing.Pool(processes=args.threads)
-    os.makedirs(args.output_dir, exist_ok=True)
+    # clear output_dir
+    shutil.rmtree(args.output_dir) if os.path.exists(args.output_dir) else None
+    os.makedirs(args.output_dir)
+    
+    # Initialize queues for data and progress
+    data_queue = mp.Queue(maxsize=100)
+    progress_queue = mp.Queue()
+    
+    # Start progress monitor
+    monitor = mp.Process(
+        target=progress_monitor,
+        args=(progress_queue, args.depth)
+    )
+    monitor.start()
+    
+    # Start reader process
+    reader = mp.Process(
+        target=reader_process,
+        args=(args.reads_files, data_queue, args.chunk_size, args.depth, progress_queue)
+    )
+    reader.start()
+    
+    # Start worker processes
+    workers = []
     for i in range(args.threads):
-        pool.apply_async(
-            assembler,
-            args=(
-                args.reads_files,
-                args.mers,
-                os.path.join(args.output_dir, f"Assemble.{i}.reads"),
-                average_depth,
-                args.threads,
-                i,
-            ),
+        output_file = os.path.join(args.output_dir, f"Assemble.{i}.reads")
+        open(output_file, "w").close()  # Clear output file
+        
+        p = mp.Process(
+            target=worker_process,
+            args=(data_queue, args.mers, output_file, i)
         )
-    pool.close()
-    pool.join()
-
-    # assembler(
-    #     args.reads_files, 
-    #     args.mers, 
-    #     args.assemble_out, 
-    #     args.depth, 
-    #     args.threads
-    #     )
+        workers.append(p)
+        p.start()
+    
+    # Wait for all processes to complete
+    reader.join()
+    for w in workers:
+        w.join()
+    monitor.join()
 
 
 if __name__ == "__main__":

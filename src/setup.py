@@ -1,8 +1,11 @@
-from setuptools import setup, Extension, find_packages
+import os
 import pybind11
+from setuptools import setup, Extension, find_packages
 
 pybind11_include = pybind11.get_include()
 # run with python3 setup.py build_ext --inplace
+
+robin_map_dir = os.path.join(os.getcwd(), 'robin-map')
 
 ext_modules = [
     Extension(
@@ -10,14 +13,14 @@ ext_modules = [
         sources=['hip/debruijn.cpp'], 
         include_dirs=[pybind11_include], 
         language='c++', 
-        extra_compile_args=['-std=c++11', '-O3'], 
+        extra_compile_args=['-std=c++17', '-O3'], 
     ), 
     Extension(
-        'hip.hpMap', 
-        sources=['hip/hpMap.cpp'], 
-        include_dirs=[pybind11_include], 
+        'hip.validator', 
+        sources=['hip/validator.cpp'], 
+        include_dirs=[pybind11_include, f"{robin_map_dir}/include"], 
         language='c++', 
-        extra_compile_args=['-std=c++11', '-O3'], 
+        extra_compile_args=['-std=c++17', '-O3'], 
     )
 ]
 

@@ -6,7 +6,7 @@ Date: Use reads to assemble cne
 '''
 
 import os, re, sys
-import debruijn
+import mappy
 from collections import defaultdict
 import gzip
 import argparse
@@ -133,7 +133,7 @@ def assembler(reads, mers, assemble_out, depth=20_000_000):
             mer_size = len(mer)
             mer_query[mer] = (int(id), int(loci))
     if mer_size == 0:
-        raise ValueError("Confident mer size should ber over 7")
+        raise ValueError("Confident mer size suggested to be over 7")
     # read in reads
     confi_reads = []
     cache_size = 10_000
