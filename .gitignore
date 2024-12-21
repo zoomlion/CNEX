@@ -6,3 +6,8 @@ build/
 __pycache__/
 reads/
 *.tsv
+out/
+logs/
+.vscode/
+src/build/
+src/build/hip/*.so
