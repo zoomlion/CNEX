@@ -20,7 +20,7 @@ from hip import debruijn
 from hip.validator import validate_read, MerQueryManager
 
 
-def chunk_generator(file: str, chunk_size: int = 10000):
+def chunk_generator(file: str, chunk_size: int = 20000):
     """
     Generate chunks of reads from a FASTQ file.
     
@@ -114,9 +114,14 @@ def worker_process(queue, mer_file, output_file, thread_id):
                 break
                 
             for seq_id, seq, qua in chunk:
-                confi_id = validate_read(seq, mer_query, mer_size)
+                confi_id, strand = validate_read(
+                    seq, 
+                    mer_query, 
+                    mer_size, 
+                    4
+                    )
                 if confi_id > -1:
-                    confi_reads.append((confi_id, seq))
+                    confi_reads.append((seq_id, strand, confi_id, seq))
                 
                 if len(confi_reads) >= cache_size:
                     out_write(output_file, confi_reads)
@@ -139,6 +144,7 @@ def out_write(file, infos):
     """
     with open(file, "a") as f:
         f.write("\n".join(["\t".join([str(ele) for ele in info]) for info in infos]))
+        f.write("\n")
 
 
 def progress_monitor(progress_queue, total_depth):
