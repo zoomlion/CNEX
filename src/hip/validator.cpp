@@ -1,26 +1,3 @@
-// MIT License
-//
-// Copyright (c) 2024 JiangminZheng
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <tsl/robin_map.h>
@@ -31,7 +8,7 @@
 #include <cmath>
 #include <algorithm>
 #include <functional>
-// #include <unordered_map> // slower than robin_map
+#include <utility>
 
 namespace py = pybind11;
 
@@ -56,27 +33,40 @@ uint32_t dna_encoder(const std::string& dna) {
     return result;
 }
 
+std::string reverse_complement(const std::string& dna) {
+    static const std::array<char, 256> complement = [] {
+        std::array<char, 256> table = {};
+        table['A'] = 'T'; table['T'] = 'A';
+        table['C'] = 'G'; table['G'] = 'C';
+        return table;
+    }();
 
-int moore_voting_with_validation(const std::vector<int>& nums) {
-    int candidate = -1;
-    int count = 0;
-
-    // Phase 1: Find candidate
-    for (int num : nums) {
-        if (count == 0) {
-            candidate = num;
-        }
-        count += (num == candidate) ? 1 : -1;
+    std::string result;
+    result.reserve(dna.length());
+    for (auto it = dna.rbegin(); it != dna.rend(); ++it) {
+        result.push_back(complement[*it]);
     }
-
-    // Phase 2: Validate candidate
-    count = std::count(nums.begin(), nums.end(), candidate);
-    if (count > static_cast<int>(nums.size()) / 2) {
-        return candidate;
-    }
-    return -1;
+    return result;
 }
 
+int findFrequentWithMap(const std::vector<int>& nums) {
+    tsl::robin_map<int, int> frequency;
+    // Count frequency of each number
+    for (int num : nums) {
+        frequency[num]++;
+    }
+    
+    int threshold = nums.size() / 4;
+    
+    // Find number with frequency > n/4
+    for (const auto& pair : frequency) {
+        if (pair.second > threshold) {
+            return pair.first;
+        }
+    }
+    
+    return -1;  // Return -1 if no number appears more than n/4 times
+}
 
 class MerQueryManager {
 public:
@@ -102,13 +92,20 @@ public:
     }
 };
 
-
-int validate_read(const std::string& seq, const MerQueryManager& compressed_mer_query, int mer_size) {
+std::pair<int, int> validate_read(
+    const std::string& seq, 
+    const MerQueryManager& compressed_mer_query, 
+    int mer_size, 
+    int min_c) {
     auto is_sorted = [](const std::vector<int>& lst) {
         return std::is_sorted(lst.begin(), lst.end());
     };
 
-    auto is_pattern_gapped = [](const std::vector<int>& lst1, const std::vector<int>& lst2, int min_c = 5, int max_g = 1) {
+    auto is_pattern_gapped = [](
+        const std::vector<int>& lst1, 
+        const std::vector<int>& lst2, 
+        const int min_c, 
+        int max_g = 1) {
         std::vector<int> patterned_gaps;
         if (static_cast<int>(lst1.size()) < min_c) {
             return false;
@@ -121,49 +118,72 @@ int validate_read(const std::string& seq, const MerQueryManager& compressed_mer_
         return static_cast<int>(patterned_gaps.size()) >= min_c * 0.5;
     };
 
-    tsl::robin_map<int, std::vector<std::pair<int, int>>> ordinals;
-    std::vector<int> candidates;
+    auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
+        tsl::robin_map<int, std::vector<std::pair<int, int>>> ordinals;
+        std::vector<int> candidates;
 
-    for (size_t i = 0; i <= seq.size() - mer_size; ++i) {
-        std::string mer = seq.substr(i, mer_size);
-        // check all valid DNA characters
-        bool valid_mer = true;
-        for (char c : mer) {
-            if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
-                valid_mer = false;
-                break;
+        for (size_t i = 0; i <= chain.size() - mer_size; ++i) {
+            std::string mer = chain.substr(i, mer_size);
+            // check all valid DNA characters
+            bool valid_mer = true;
+            for (char c : mer) {
+                if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
+                    valid_mer = false;
+                    break;
+                }
+            }
+            if (!valid_mer) {
+                continue;
+            }
+            uint32_t encoded_mer = dna_encoder(mer);
+            auto it = compressed_mer_query.compressed_mer_query.find(encoded_mer);
+            if (it != compressed_mer_query.compressed_mer_query.end()) {
+                auto [id, loci] = it->second;
+                candidates.push_back(id);
+                ordinals[id].emplace_back(static_cast<int>(i), static_cast<int>(loci));
             }
         }
-        if (!valid_mer) {
-            continue;
+
+        int confi_id = findFrequentWithMap(candidates);
+        if (confi_id == -1) {
+            return {-1, 0};
         }
-        uint32_t encoded_mer = dna_encoder(mer);
-        auto it = compressed_mer_query.compressed_mer_query.find(encoded_mer);
-        if (it != compressed_mer_query.compressed_mer_query.end()) {
-            auto [id, loci] = it->second;
-            candidates.push_back(id);
-            ordinals[id].emplace_back(static_cast<int>(i), static_cast<int>(loci));
+
+        const auto& positions = ordinals[confi_id];
+        std::vector<int> seq_positions;
+        std::vector<int> loci_positions;
+        for (const auto& pos : positions) {
+            seq_positions.push_back(pos.first);
+            loci_positions.push_back(pos.second);
         }
-    }
 
-    int confi_id = moore_voting_with_validation(candidates);
-    if (confi_id == -1) {
-        return -1;
-    }
+        if (is_pattern_gapped(seq_positions, loci_positions, min_c) && is_sorted(loci_positions)) {
+            return {confi_id, static_cast<int>(candidates.size())};
+        }
 
-    const auto& positions = ordinals[confi_id];
-    std::vector<int> seq_positions;
-    std::vector<int> loci_positions;
-    for (const auto& pos : positions) {
-        seq_positions.push_back(pos.first);
-        loci_positions.push_back(pos.second);
-    }
+        return {-1, 0};
+    };
 
-    if (is_pattern_gapped(seq_positions, loci_positions) && is_sorted(loci_positions)) {
-        return confi_id;
-    }
+    // Validate forward chain
+    auto [forward_id, forward_count] = validate_chain(seq);
+    
+    // Validate reverse complement chain
+    std::string rev_comp = reverse_complement(seq);
+    auto [reverse_id, reverse_count] = validate_chain(rev_comp);
 
-    return -1;
+    // Compare results and return the best match
+    if (forward_id == -1 && reverse_id == -1) {
+        return {-1, 0}; // No valid match found
+    } else if (forward_id == -1) {
+        return {reverse_id, -1}; // Reverse complement match
+    } else if (reverse_id == -1) {
+        return {forward_id, 1}; // Forward match
+    } else {
+        // Both chains match, return the one with more matching k-mers
+        return (forward_count >= reverse_count) ? 
+               std::make_pair(forward_id, 1) : 
+               std::make_pair(reverse_id, -1);
+    }
 }
 
 PYBIND11_MODULE(validator, m) {
@@ -177,7 +197,7 @@ PYBIND11_MODULE(validator, m) {
              py::arg("mer"));
 
     m.def("validate_read", &validate_read, "Validate a read sequence using compressed mer query",
-          py::arg("seq"), py::arg("compressed_mer_query"), py::arg("mer_size"));
+          py::arg("seq"), py::arg("compressed_mer_query"), py::arg("mer_size"), py::arg("min_c"));
     m.def("dna_encoder", &dna_encoder, "Encode a DNA string to an integer",
           py::arg("dna"));
 }
