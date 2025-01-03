@@ -1,3 +1,26 @@
+// MIT License
+//
+// Copyright (c) 2024 JiangminZheng
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <tsl/robin_map.h>
@@ -56,16 +79,22 @@ int findFrequentWithMap(const std::vector<int>& nums) {
         frequency[num]++;
     }
     
-    int threshold = nums.size() / 4;
+    // Convert map to a vector of pairs and sort by frequency (descending)
+    std::vector<std::pair<int, int>> freq_vec(frequency.begin(), frequency.end());
+    std::sort(freq_vec.begin(), freq_vec.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second; // Sort by frequency in descending order
+    });
     
-    // Find number with frequency > n/4
-    for (const auto& pair : frequency) {
+    float threshold = (float)nums.size() / 6;
+    
+    // Check the first element in the sorted vector
+    for (const auto& pair : freq_vec) {
         if (pair.second > threshold) {
             return pair.first;
         }
     }
     
-    return -1;  // Return -1 if no number appears more than n/4 times
+    return -1;  // Return -1 if no number appears more than n/6 times
 }
 
 class MerQueryManager {
@@ -105,7 +134,7 @@ std::pair<int, int> validate_read(
         const std::vector<int>& lst1, 
         const std::vector<int>& lst2, 
         const int min_c, 
-        int max_g = 1) {
+        const int max_g = 1) {
         std::vector<int> patterned_gaps;
         if (static_cast<int>(lst1.size()) < min_c) {
             return false;
@@ -115,7 +144,7 @@ std::pair<int, int> validate_read(
                 patterned_gaps.push_back(i);
             }
         }
-        return static_cast<int>(patterned_gaps.size()) >= min_c * 0.5;
+        return static_cast<int>(patterned_gaps.size()) >= min_c;
     };
 
     auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
