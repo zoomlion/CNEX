@@ -20,12 +20,12 @@ from hip import debruijn
 from hip.validator import validate_read, MerQueryManager
 
 
-def chunk_generator(file: str, chunk_size: int = 20000):
+def chunk_generator(file: str, chunk_size: int = 30000):
     """
-    Generate chunks of reads from a FASTQ file.
+    Generate chunks of reads from a FASTQ file or a GENOME fasta file.
     
     Args:
-        file (str): Path to FASTQ file (gzipped or plain text)
+        file (str): Path to file (gzipped or plain text)
         chunk_size (int): Number of reads per chunk
         
     Yields:
@@ -35,26 +35,94 @@ def chunk_generator(file: str, chunk_size: int = 20000):
     chunk = []
     
     with open_func(file, "rt") as f:
-        while True:
-            try:
-                seq_id = f.readline().strip()
-                if not seq_id:
+        first_line = f.readline()
+        if first_line.startswith('>'):
+            type = 'genome'
+            f.seek(0)  # Rewind to include the first line in processing
+        elif first_line.startswith('@'):
+            type = 'fq'
+            f.seek(0)
+        else:
+            raise ValueError("Unsupported file type")
+        window_size = 150
+        step_size = 50 
+        if type == 'fq':
+            lines = f
+            while True:
+                seq_id = next(lines, None)
+                if seq_id is None:
                     if chunk:
                         yield chunk
                     break
+                seq_id = seq_id.strip()
                 
-                sequence = f.readline().strip()
-                _ = f.readline().strip()
-                quality = f.readline().strip()
+                sequence = next(lines, None)
+                if sequence is None:
+                    break
+                sequence = sequence.strip()
                 
-                chunk.append((seq_id, sequence, quality))
+                plus_line = next(lines, None)
+                if plus_line is None:
+                    break
+                plus_line = plus_line.strip()
+                
+                quality = next(lines, None)
+                if quality is None:
+                    break
+                quality = quality.strip()
+                
+                chunk.append((seq_id, sequence, '')) # strip quality
                 if len(chunk) >= chunk_size:
                     yield chunk
                     chunk = []
-                    
-            except Exception as e:
-                print(f"Error while reading file: {e}")
-                break
+        elif type == 'genome':
+            seq_id = ''
+            seq = ''
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    if seq_id != '' and seq != '':
+                        # Generate pseudo-reads for the previous sequence
+                        seq_len = len(seq)
+                        for start in range(0, seq_len, step_size):
+                            end = start + window_size
+                            if end > seq_len:
+                                end = seq_len
+                            if end - start < window_size:
+                                break  # Skip incomplete reads
+                            read_id = f"{seq_id}:{start+1}-{end}"
+                            # if all lowercase, skip
+                            if not re.search('[A-Z]', seq[start:end]):
+                                continue
+                            chunk.append((read_id, seq[start:end].upper(), ''))
+                            if len(chunk) >= chunk_size:
+                                yield chunk
+                                chunk = []
+                        seq = ''
+                    # Start new sequence
+                    seq_id = line[1:].split()[0]  # Use the first word after '>'
+                else:
+                    seq += line
+            # Generate pseudo-reads for the last sequence
+            if seq_id != '' and seq != '':
+                
+                seq_len = len(seq)
+                for start in range(0, seq_len, step_size):
+                    end = start + window_size
+                    if end > seq_len:
+                        end = seq_len
+                    if end - start < window_size:
+                        break  # Skip incomplete reads
+                    read_id = f"{seq_id}:{start+1}-{end}"
+                    # if all lowercase, skip
+                    if not re.search('[A-Z]', seq[start:end]):
+                        continue
+                    chunk.append((read_id, seq[start:end].upper(), ''))
+                    if len(chunk) >= chunk_size:
+                        yield chunk
+                        chunk = []
+            if chunk:
+                yield chunk
 
 
 def reader_process(files, queue, chunk_size, total_depth, progress_queue):
@@ -118,7 +186,7 @@ def worker_process(queue, mer_file, output_file, thread_id):
                     seq, 
                     mer_query, 
                     mer_size, 
-                    4
+                    5
                     )
                 if confi_id > -1:
                     confi_reads.append((seq_id, strand, confi_id, seq))
@@ -173,7 +241,7 @@ def main():
     parser.add_argument(
         "--depth", type=int, default=200_000_000, help="Number of reads to assemble"
     )
-    parser.add_argument("--threads", type=int, default=4, help="Number of threads to use")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads to use")
     parser.add_argument("--output_dir", type=str, default="out", help="Output directory")
     parser.add_argument("--chunk_size", type=int, default=10000, help="Chunk size for reading")
     args = parser.parse_args()
@@ -183,7 +251,7 @@ def main():
     os.makedirs(args.output_dir)
     
     # Initialize queues for data and progress
-    data_queue = mp.Queue(maxsize=100)
+    data_queue = mp.Queue(maxsize=200)
     progress_queue = mp.Queue()
     
     # Start progress monitor
