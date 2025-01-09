@@ -11,3 +11,4 @@ logs/
 .vscode/
 src/build/
 src/build/hip/*.so
+*/*.reads
