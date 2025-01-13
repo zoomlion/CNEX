@@ -115,7 +115,7 @@ def main():
     parser.add_argument("msa", type=str, help="Path to MSA file.")
     parser.add_argument("-k", "--mer_size", type=int, default=13, help="Size of the kmers (default: 13).")
     # parser.add_argument("-t", "--threads", type=int, default=8, help="threads number for confident kmer building")
-    parser.add_argument("-c", "--min_c", type=int, default=4, help="minimum count of the kmers (default: 10).")
+    parser.add_argument("-c", "--min_c", type=int, default=4, help="minimum count of the kmers (default: 4).")
     parser.add_argument("-o", "--output", type=str, default="mers_table.tsv", help="Path to the output TSV file.")
     args = parser.parse_args()
 
