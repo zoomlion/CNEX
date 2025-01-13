@@ -16,7 +16,6 @@ import multiprocessing as mp
 import shutil
 from collections import defaultdict
 from queue import Empty
-from hip import debruijn
 from hip.validator import validate_read, MerQueryManager
 
 
@@ -163,14 +162,26 @@ def worker_process(queue, mer_file, output_file, thread_id):
     """
     # Initialize mer query manager
     mer_query = MerQueryManager()
-    with open(mer_file) as f:
-        for line in f:
-            mer, id, loci, count = line.strip("\n").split("\t")
-            mer_size = len(mer)
-            try:
-                mer_query.add_mer(mer, int(id), int(loci))
-            except ValueError:
-                continue
+    gzipped = mer_file.endswith(".gz")
+    if gzipped:
+        handle = gzip.open(mer_file, "rt")
+    else:
+        handle = open(mer_file, "r")
+        # for line in f:
+        #     mer, id, loci, count = line.strip("\n").split("\t")
+        #     mer_size = len(mer)
+        #     try:
+        #         mer_query.add_mer(mer, int(id), int(loci))
+        #     except ValueError:
+        #         continue
+    for line in handle:
+        mer, id, loci, count = line.strip("\n").split("\t")
+        mer_size = len(mer)
+        try:
+            mer_query.add_mer(mer, int(id), int(loci))
+        except ValueError:
+            continue
+    handle.close()
     
     confi_reads = []
     cache_size = 5000
