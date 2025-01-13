@@ -58,6 +58,71 @@ def reads_generator(input_f: str):
         yield prev_ele_id, temp_reads
 
 
+def bunch_generator(fasta_file):
+    """
+    Build a generator to yield bunched FASTA sequences.
+    """
+    buffer = ''
+    with open(fasta_file, 'r') as file:
+        for line in file:
+            buffer += line
+            while '###\n' in buffer:
+                part, buffer = buffer.split('###\n', 1)
+                if part.strip():
+                    yield part.strip()
+        # Yield any remaining part after the loop
+        if buffer.strip():
+            yield buffer.strip()
+
+
+def bunch2conservedfas(bunch: str) -> dict:
+    """
+    Convert a bunch string to longest fasta, with sequence IDs as keys and sequences as values.
+    Sequences with only '-' are ignored.
+    """
+    def get_most_frequent_base(base_list):
+        return max(set(base_list), key=base_list.count)
+
+    fas_dict = {}
+    for line in bunch.split('\n'):
+        if not line:
+            continue
+        if line.startswith('>'):
+            seq_id = line.strip('>').strip()
+            fas_dict[seq_id] = ''
+        else:
+            if set(line.strip()) - set('-'):  # not all '-'
+                fas_dict[seq_id] += line.strip()
+            else:
+                fas_dict.pop(seq_id, None)
+
+    seq_len = len(list(fas_dict.values())[0])
+    #  fas_dict.values()
+    most_cons = ''.join(
+        [get_most_frequent_base([seq[i] for seq in fas_dict.values()])
+          for i in range(seq_len)]
+    )
+
+    # select the longest sequence as ref
+    conserv = 0
+    ref_seq_id = None
+    for seq_id, seq in fas_dict.items():
+        local_conserv = 0
+        if seq_id.startswith('ref'):
+            continue
+        for i in range(seq_len):
+            if seq[i] == most_cons[i]:
+                local_conserv += 1
+        if local_conserv > conserv:
+            conserv = local_conserv
+            ref_seq_id = seq_id
+
+    if ref_seq_id is None:
+        raise ValueError("No reference sequence found.")
+
+    return f">{ref_seq_id}\n{fas_dict[ref_seq_id].replace('-', '')}\n"
+
+
 def merge_loci(locus):
     """
     merge loci by their range: return a dict of affiliation
@@ -102,7 +167,80 @@ def merge_loci(locus):
     return loci_dict
 
 
-def assemble_reads(ele_id: str, temp_reads: dict, mode: str, k=35):
+def axt2rank(
+        axt_str: str, 
+        index2id: dict, 
+        int_assembled_seqs: dict, 
+        mode: str, 
+        min_percent=0.3
+) -> list:
+    """
+    parse axt alignment string and return a list of (id, seq) pairs 
+    in order of alignment scores, tagged with score rank
+    """
+    ranked_seqs = []
+    index2score = {}
+    aln_info = defaultdict(list)
+    max_score = 0
+    for line in axt_str.split('\n'):
+        if line.startswith('#') or not line:
+            continue
+        if not line[0].isdigit():
+            continue
+        fields = line.strip().split()
+        # all 1-based coordinates
+        _, ref_id, ref_s, ref_e, query_index, query_s, query_e, _, score = fields
+        if float(score) > max_score:
+            max_score = float(score)
+        ref_s, ref_e, query_s, query_e, score = map(int, [ref_s, ref_e, query_s, query_e, score])
+        aln_info[int(query_index)].append((query_s, query_e, score))
+
+    if len(aln_info) == 0:
+        return []
+
+    for query_index in aln_info:
+        for s, e, score in sorted(aln_info[query_index], key=lambda x: (x[2], -x[0]), reverse=True):
+            if score < min_percent * max_score:
+                continue
+            if query_index not in index2score:
+                index2score[query_index] = (s, e, score)
+            else:
+                prev_s, prev_e, prev_score = index2score[query_index]
+                if s > prev_e:
+                    index2score[query_index] = (prev_s, e, score)
+                elif e < prev_s:
+                    index2score[query_index] = (s, prev_e, score)
+    
+    if mode=='genome':
+        # wabble query_id and query_seq by query_s and query_e
+        for rank, (index, (s_bias, e_bias, score)) in enumerate(
+            sorted(index2score.items(), key=lambda x: x[1][2], reverse=True)
+        ):
+            s_bias, e_bias, score = map(int, [s_bias, e_bias, score])
+            query_id = index2id[index]
+            query_seq = int_assembled_seqs[index]
+            chrom_info, s, e = re.search(
+                r'^(\S+[+-]):(\d+)-(\d+)$', query_id
+            ).groups()
+            s, e = map(int, [s, e])
+            query_id = f"{chrom_info}:{s+s_bias-1}-{s+e_bias-1}#{rank}"
+            query_seq = query_seq[s_bias-1:e_bias]
+            ranked_seqs.append((query_id, query_seq))
+    elif mode=='fq':
+        for rank, (index, (s_bias, e_bias, score)) in enumerate(
+            sorted(index2score.items(), key=lambda x: x[1][2], reverse=True)
+        ):
+            s_bias, e_bias, score = map(int, [s_bias, e_bias, score])
+            query_id = index2id[index]
+            query_seq = int_assembled_seqs[index]
+            query_id = f"{query_id}#{rank}"
+            query_seq = query_seq[s_bias-1:e_bias]
+            ranked_seqs.append((query_id, query_seq))
+
+    return ranked_seqs
+
+
+def assemble_reads(ele_id: str, raw_seq: str, temp_reads: dict, mode: str, k=35):
     """
     assemble reads using de bruijn graph from hip
     """
@@ -112,7 +250,7 @@ def assemble_reads(ele_id: str, temp_reads: dict, mode: str, k=35):
             local_seq = seq if strand == 1 else reverse_complement(seq)
             reads.append(local_seq)
         assembled = debruijn_assembler(reads, k)
-        return [(ele_id, assembled)]
+        return {ele_id: assembled}
     elif mode == 'genome':
         locus = []
         reads = {}
@@ -123,7 +261,7 @@ def assemble_reads(ele_id: str, temp_reads: dict, mode: str, k=35):
             locus.append(f"{chrom}{strand}:{s}-{e}")
             reads[f"{chrom}{strand}:{s}-{e}"] = local_seq
         if len(locus) > 100:  # too many loci, skip
-            return []
+            return {}
         loci_dict = merge_loci(locus)
         all_assembled = []
         for merged_locus, reads_list in loci_dict.items():
@@ -132,17 +270,31 @@ def assemble_reads(ele_id: str, temp_reads: dict, mode: str, k=35):
             )
             assembled_id = f"{ele_id}@{merged_locus}"
             all_assembled.append((assembled_id, assembled))
-        return all_assembled
+        return {id: seq for id, seq in all_assembled}
 
 
 def main():
     parser = argparse.ArgumentParser(description="De Bruijn Graph Assembly")
     parser.add_argument("inputs_dir", type=str, help="input dirs holding files")
+    parser.add_argument("-r", "--raw_msa_file", type=str, help="raw msa file", required=True)
     parser.add_argument("-k", "--kmer", type=int, default=35, help="k-mer length")
-    parser.add_argument("-l", "--lastz_path", type=str, default="lastz", help="path to lastz")
+    parser.add_argument("-l", "--lastz_exec", type=str, default="lastz", help="path to lastz")
     parser.add_argument("-o", "--output", type=str, default="assembled.fasta", help="output file")
     parser.add_argument("-t", "--threads", type=int, default=8, help="number of threads")
     args = parser.parse_args()
+
+    if sys.version_info < (3, 7):
+        raise ValueError("Python version must be >= 3.7 for ordered dict support.")
+
+    # Check if input directory exists
+    if not os.path.exists(args.inputs_dir):
+        raise FileNotFoundError(f"Input directory not found: {args.inputs_dir}")
+
+    # Check if Lastz executable exists and is executable
+    if not os.path.exists(args.lastz_exec):
+        raise FileNotFoundError(f"Lastz executable not found: {args.lastz_exec}")
+    if not os.access(args.lastz_exec, os.X_OK):
+        raise PermissionError(f"Lastz executable not executable: {args.lastz_exec}")
 
     # cat and sort all reads to tempfile
     input_f = f"{''.join([random.choice(string.ascii_letters) for _ in range(8)])}.reads"
@@ -150,6 +302,15 @@ def main():
     if not os.path.exists(input_f):
         raise FileNotFoundError(f"File {input_f} not found.")
     
+    # cache_dir in /dev/shm with 8 chars
+    cache_dir = f"/dev/shm/{''.join([random.choice(string.ascii_letters) for _ in range(8)])}"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    refs = {}
+    for bunch_id, bunch in enumerate(bunch_generator(args.raw_msa_file)):
+        ref_seq = bunch2conservedfas(bunch)
+        refs[f"{bunch_id}"] = ref_seq
+
     # get reads type by first line
     # if starts with '@' is read mode, elif : in first line is fasta mode
     type = None
@@ -166,8 +327,41 @@ def main():
     for ele_id, temp_reads in reads_generator(input_f):
         if not ele_id:
             continue
-        print(f"\rAssembling {ele_id}", end="", flush=True)
-        results.extend(assemble_reads(ele_id, temp_reads, mode=type, k=args.kmer))
+        print(f"\rAssembling {int(ele_id)+1}", end="", flush=True)
+        # step 1: assemble all possible reads
+        assembled_seqs = assemble_reads(ele_id, args.raw_msa_file, temp_reads, mode=type, k=args.kmer)
+        if not assembled_seqs:
+            continue
+        int_assembled_seqs = {index: seq for index, seq in enumerate(assembled_seqs.values())}
+        index2id = {index: id for index, id in enumerate(assembled_seqs.keys())}
+
+        # step 2: align to reference by lastz
+        #  a. filter noise sequences
+        #  b. get paralogs
+        filtered_seqs = []
+        # pack seqeucnes into ref and query files
+        with NamedTemporaryFile(mode='w', delete=True, dir=cache_dir) as ref_file, \
+             NamedTemporaryFile(mode='w', delete=True, dir=cache_dir) as query_file:
+            ref_file.write(refs[ele_id])
+            ref_file.flush()
+            query_file.write(''.join([f">{index}\n{seq}\n" for index, seq in int_assembled_seqs.items()]))
+            query_file.flush()
+            lastz_cmd = [
+                args.lastz_exec, 
+                ref_file.name, 
+                query_file.name, 
+                '--hspthresh=500', 
+                '--gappedthresh=2000', 
+                '--strand=forward', 
+                '--ambiguous=iupac', 
+                '--chain', 
+                '--axt'
+            ]
+            align_out = subprocess.run(lastz_cmd, check=True, stdout=subprocess.PIPE).stdout.decode()
+            filtered_seqs = axt2rank(align_out, index2id, int_assembled_seqs, mode=type)
+
+        results.extend(filtered_seqs)
+    print()
     
     # write to fasta file
     with open(args.output, "w") as f:
@@ -176,6 +370,7 @@ def main():
 
     # clean up input_f
     os.remove(input_f)
+    shutil.rmtree(cache_dir)
             
 if __name__ == "__main__":
     main()
