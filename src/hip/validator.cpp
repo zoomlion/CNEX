@@ -85,16 +85,23 @@ int findFrequentWithMap(const std::vector<int>& nums) {
         return a.second > b.second; // Sort by frequency in descending order
     });
     
-    float threshold = (float)nums.size() / 6;
+    float threshold = (float)nums.size() / 10;
     
-    // Check the first element in the sorted vector
-    for (const auto& pair : freq_vec) {
-        if (pair.second > threshold) {
-            return pair.first;
+    if (freq_vec.size() <= 1) {
+        if (!freq_vec.empty() && freq_vec[0].second > threshold) {
+            return freq_vec[0].first;
         }
+        return -1;
     }
     
-    return -1;  // Return -1 if no number appears more than n/6 times
+    int max_freq = freq_vec[0].second;
+    int second_freq = freq_vec[1].second;
+    
+    if (max_freq > threshold && max_freq >= 3 * second_freq) {
+        return freq_vec[0].first;
+    }
+    
+    return -1;
 }
 
 class MerQueryManager {
@@ -216,6 +223,8 @@ std::pair<int, int> validate_read(
 }
 
 PYBIND11_MODULE(validator, m) {
+    m.doc() = "A Python module for validating DNA reads using compressed mer query";
+
     py::class_<MerQueryManager>(m, "MerQueryManager")
         .def(py::init<>())
         .def("add_mer", &MerQueryManager::add_mer, "Add a mer to the query map",
