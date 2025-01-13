@@ -21,6 +21,13 @@ ext_modules = [
         include_dirs=[pybind11_include, f"{robin_map_dir}/include"], 
         language='c++', 
         extra_compile_args=['-std=c++17', '-O3'], 
+    ), 
+    Extension(
+        'hip.tablemer', 
+        sources=['hip/tablemer.cpp'], 
+        include_dirs=[pybind11_include, f"{robin_map_dir}/include"], 
+        language='c++', 
+        extra_compile_args=['-std=c++17', '-O3'], 
     )
 ]
 
