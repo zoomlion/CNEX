@@ -181,7 +181,7 @@ def axt2rank(
     ranked_seqs = []
     index2score = {}
     aln_info = defaultdict(list)
-    max_score = 0
+    max_score, max_len = 0, 0
     for line in axt_str.split('\n'):
         if line.startswith('#') or not line:
             continue
@@ -192,6 +192,8 @@ def axt2rank(
         _, ref_id, ref_s, ref_e, query_index, query_s, query_e, _, score = fields
         if float(score) > max_score:
             max_score = float(score)
+        if int(ref_e) - int(ref_s) > max_len:
+            max_len = int(ref_e) - int(ref_s)
         ref_s, ref_e, query_s, query_e, score = map(int, [ref_s, ref_e, query_s, query_e, score])
         aln_info[int(query_index)].append((query_s, query_e, score))
 
@@ -219,6 +221,8 @@ def axt2rank(
             s_bias, e_bias, score = map(int, [s_bias, e_bias, score])
             query_id = index2id[index]
             query_seq = int_assembled_seqs[index]
+            if e_bias-s_bias+1 < max_len * min_percent:
+                continue
             chrom_info, s, e = re.search(
                 r'^(\S+[+-]):(\d+)-(\d+)$', query_id
             ).groups()
