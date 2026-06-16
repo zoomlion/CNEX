@@ -8,7 +8,6 @@ Description: Assemble CNE using sequencing reads with progress tracking
 import os
 import re
 import sys
-import mappy
 import gzip
 import argparse
 import tqdm
@@ -17,6 +16,10 @@ import shutil
 from collections import defaultdict
 from queue import Empty
 from hip.validator import validate_read, MerQueryManager
+
+# Shared globals inherited by forked workers (read-only after fork)
+_SHARED_MER_QUERY = None
+_SHARED_MER_SIZE = 0
 
 
 def chunk_generator(file: str, chunk_size: int = 30000):
@@ -150,39 +153,18 @@ def reader_process(files, queue, chunk_size, total_depth, progress_queue):
     progress_queue.put(None)
 
 
-def worker_process(queue, mer_file, output_file, thread_id):
+def worker_process(queue, output_file, thread_id):
     """
     Worker process that processes data chunks from queue.
     
     Args:
         queue (Queue): Queue containing data chunks
-        mer_file (str): Path to mer file
         output_file (str): Path to output file
         thread_id (int): Worker thread ID
     """
-    # Initialize mer query manager
-    mer_query = MerQueryManager()
-    gzipped = mer_file.endswith(".gz")
-    if gzipped:
-        handle = gzip.open(mer_file, "rt")
-    else:
-        handle = open(mer_file, "r")
-        # for line in f:
-        #     mer, id, loci, count = line.strip("\n").split("\t")
-        #     mer_size = len(mer)
-        #     try:
-        #         mer_query.add_mer(mer, int(id), int(loci))
-        #     except ValueError:
-        #         continue
-    for line in handle:
-        mer, id, loci, count = line.strip("\n").split("\t")
-        mer_size = len(mer)
-        try:
-            mer_query.add_mer(mer, int(id), int(loci))
-        except ValueError:
-            continue
-    handle.close()
-    
+    mer_query = _SHARED_MER_QUERY
+    mer_size = _SHARED_MER_SIZE
+
     confi_reads = []
     cache_size = 5000
     
@@ -244,6 +226,8 @@ def progress_monitor(progress_queue, total_depth):
 
 
 def main():
+    global _SHARED_MER_QUERY, _SHARED_MER_SIZE
+
     parser = argparse.ArgumentParser(
         description="Assemble element based on confident mers."
     )
@@ -256,6 +240,15 @@ def main():
     parser.add_argument("--output_dir", type=str, default="out", help="Output directory")
     parser.add_argument("--chunk_size", type=int, default=10000, help="Chunk size for reading")
     args = parser.parse_args()
+
+    # Load mers table in parent process (C++ fast path)
+    # Fork workers inherit this read-only memory
+    print(f"Loading mers table from {args.mers} ...")
+    mer_query = MerQueryManager()
+    mer_query.load_from_file(args.mers)
+    _SHARED_MER_QUERY = mer_query
+    _SHARED_MER_SIZE = mer_query.get_mer_size()
+    print(f"  Loaded {_SHARED_MER_QUERY.size()} mers, k={_SHARED_MER_SIZE}")
 
     # clear output_dir
     shutil.rmtree(args.output_dir) if os.path.exists(args.output_dir) else None
@@ -287,7 +280,7 @@ def main():
         
         p = mp.Process(
             target=worker_process,
-            args=(data_queue, args.mers, output_file, i)
+            args=(data_queue, output_file, i)
         )
         workers.append(p)
         p.start()

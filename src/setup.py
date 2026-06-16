@@ -11,7 +11,7 @@ ext_modules = [
     Extension(
         'hip.debruijn', 
         sources=['hip/debruijn.cpp'], 
-        include_dirs=[pybind11_include], 
+        include_dirs=[pybind11_include, f"{robin_map_dir}/include"], 
         language='c++', 
         extra_compile_args=['-std=c++17', '-O3'], 
     ), 

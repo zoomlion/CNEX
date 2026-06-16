@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <functional>
 #include <utility>
+#include <fstream>
 
 namespace py = pybind11;
 
@@ -54,6 +55,23 @@ uint32_t dna_encoder(const std::string& dna) {
         result = (result << 2) | lookup[c];
     }
     return result;
+}
+
+bool encode_mer_at(const std::string& seq, size_t pos, size_t k, uint32_t& result) {
+    static constexpr std::array<int8_t, 256> lookup = [] {
+        std::array<int8_t, 256> table = {};
+        for (auto& v : table) v = -1;
+        table['A'] = 0; table['C'] = 1; table['G'] = 2; table['T'] = 3;
+        return table;
+    }();
+
+    result = 0;
+    for (size_t i = 0; i < k; ++i) {
+        int8_t bits = lookup[static_cast<unsigned char>(seq[pos + i])];
+        if (bits < 0) return false;
+        result = (result << 2) | static_cast<uint32_t>(bits);
+    }
+    return true;
 }
 
 std::string reverse_complement(const std::string& dna) {
@@ -107,25 +125,50 @@ int findFrequentWithMap(const std::vector<int>& nums) {
 class MerQueryManager {
 public:
     tsl::robin_map<uint32_t, std::pair<int, int>> compressed_mer_query;
+    int mer_size = 0;
 
     void add_mer(const std::string& mer, int id, int loci) {
         uint32_t encoded_mer = dna_encoder(mer);
         compressed_mer_query[encoded_mer] = {id, loci};
+        if (mer_size == 0) mer_size = static_cast<int>(mer.length());
     }
 
-    std::pair<int, int> get_mer(const std::string& mer) const {
-        uint32_t encoded_mer = dna_encoder(mer);
-        auto it = compressed_mer_query.find(encoded_mer);
-        if (it != compressed_mer_query.end()) {
-            return it->second;
+    void load_from_file(const std::string& path) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open mers file: " + path);
         }
-        throw std::runtime_error("Mer not found in query.");
+        // Estimate line count from file size for pre-allocation
+        file.seekg(0, std::ios::end);
+        size_t file_size = static_cast<size_t>(file.tellg());
+        file.seekg(0, std::ios::beg);
+        compressed_mer_query.reserve(file_size / 25);
+
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            // Format: mer\tid\tloci\tcount
+            size_t t1 = line.find('\t');
+            if (t1 == std::string::npos) continue;
+            size_t t2 = line.find('\t', t1 + 1);
+            if (t2 == std::string::npos) continue;
+            size_t t3 = line.find('\t', t2 + 1);
+            if (t3 == std::string::npos) continue;
+            std::string mer = line.substr(0, t1);
+            int id = std::stoi(line.substr(t1 + 1, t2 - t1 - 1));
+            int loci = std::stoi(line.substr(t2 + 1, t3 - t2 - 1));
+            if (mer_size == 0) mer_size = static_cast<int>(mer.length());
+            try {
+                uint32_t encoded_mer = dna_encoder(mer);
+                compressed_mer_query[encoded_mer] = {id, loci};
+            } catch (const std::invalid_argument&) {
+                continue;
+            }
+        }
     }
 
-    bool contains_mer(const std::string& mer) const {
-        uint32_t encoded_mer = dna_encoder(mer);
-        return compressed_mer_query.find(encoded_mer) != compressed_mer_query.end();
-    }
+    int get_mer_size() const { return mer_size; }
+    size_t size() const { return compressed_mer_query.size(); }
 };
 
 std::pair<int, int> validate_read(
@@ -157,21 +200,12 @@ std::pair<int, int> validate_read(
     auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
         tsl::robin_map<int, std::vector<std::pair<int, int>>> ordinals;
         std::vector<int> candidates;
+        uint32_t encoded_mer;
 
-        for (size_t i = 0; i <= chain.size() - mer_size; ++i) {
-            std::string mer = chain.substr(i, mer_size);
-            // check all valid DNA characters
-            bool valid_mer = true;
-            for (char c : mer) {
-                if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
-                    valid_mer = false;
-                    break;
-                }
-            }
-            if (!valid_mer) {
+        for (size_t i = 0; i <= chain.size() - static_cast<size_t>(mer_size); ++i) {
+            if (!encode_mer_at(chain, i, static_cast<size_t>(mer_size), encoded_mer)) {
                 continue;
             }
-            uint32_t encoded_mer = dna_encoder(mer);
             auto it = compressed_mer_query.compressed_mer_query.find(encoded_mer);
             if (it != compressed_mer_query.compressed_mer_query.end()) {
                 auto [id, loci] = it->second;
@@ -229,13 +263,16 @@ PYBIND11_MODULE(validator, m) {
         .def(py::init<>())
         .def("add_mer", &MerQueryManager::add_mer, "Add a mer to the query map",
              py::arg("mer"), py::arg("id"), py::arg("loci"))
-        .def("get_mer", &MerQueryManager::get_mer, "Get a mer from the query map",
-             py::arg("mer"))
-        .def("contains_mer", &MerQueryManager::contains_mer, "Check if a mer exists in the query map",
-             py::arg("mer"));
+        .def("load_from_file", &MerQueryManager::load_from_file, 
+             "Load mers from TSV file directly (C++ fast path)",
+             py::arg("path"))
+        .def("get_mer_size", &MerQueryManager::get_mer_size, "Get k-mer size")
+        .def("size", &MerQueryManager::size, "Number of mers in the table");
 
     m.def("validate_read", &validate_read, "Validate a read sequence using compressed mer query",
           py::arg("seq"), py::arg("compressed_mer_query"), py::arg("mer_size"), py::arg("min_c"));
     m.def("dna_encoder", &dna_encoder, "Encode a DNA string to an integer",
           py::arg("dna"));
+    m.def("encode_mer_at", &encode_mer_at, "Encode a k-mer at a position in a string (zero-alloc)",
+          py::arg("seq"), py::arg("pos"), py::arg("k"), py::arg("result"));
 }
