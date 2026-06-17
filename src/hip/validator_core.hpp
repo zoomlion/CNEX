@@ -78,32 +78,47 @@ inline std::string reverse_complement(const std::string& dna) {
 
 
 inline int findFrequentWithMap(const std::vector<int>& nums) {
-    tsl::robin_map<int, int> frequency;
-    for (int num : nums) {
-        frequency[num]++;
-    }
+    if (nums.empty()) return -1;
 
-    std::vector<std::pair<int, int>> freq_vec(frequency.begin(), frequency.end());
-    std::sort(freq_vec.begin(), freq_vec.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
+    int n = static_cast<int>(nums.size());
 
-    float threshold = (float)nums.size() / 10;
+    thread_local std::vector<int> sorted;
+    sorted.assign(nums.begin(), nums.end());
+    std::sort(sorted.begin(), sorted.end());
 
-    if (freq_vec.size() <= 1) {
-        if (!freq_vec.empty() && freq_vec[0].second > threshold) {
-            return freq_vec[0].first;
+    int best_id = sorted[0];
+    int best_cnt = 1;
+    int second_cnt = 0;
+    int cur_id = sorted[0];
+    int cur_cnt = 1;
+
+    for (int i = 1; i < n; ++i) {
+        if (sorted[i] == cur_id) {
+            ++cur_cnt;
+        } else {
+            if (cur_cnt > best_cnt) {
+                second_cnt = best_cnt;
+                best_cnt = cur_cnt;
+                best_id = cur_id;
+            } else if (cur_cnt > second_cnt) {
+                second_cnt = cur_cnt;
+            }
+            cur_id = sorted[i];
+            cur_cnt = 1;
         }
-        return -1;
+    }
+    if (cur_cnt > best_cnt) {
+        second_cnt = best_cnt;
+        best_cnt = cur_cnt;
+        best_id = cur_id;
+    } else if (cur_cnt > second_cnt) {
+        second_cnt = cur_cnt;
     }
 
-    int max_freq = freq_vec[0].second;
-    int second_freq = freq_vec[1].second;
-
-    if (max_freq > threshold && max_freq >= 3 * second_freq) {
-        return freq_vec[0].first;
+    float threshold = static_cast<float>(n) / 10.0f;
+    if (best_cnt > threshold && best_cnt >= 3 * second_cnt) {
+        return best_id;
     }
-
     return -1;
 }
 
@@ -175,16 +190,16 @@ inline std::pair<int, int> validate_read(
         const std::vector<int>& lst2,
         const int min_c,
         const int max_g = 1) {
-        std::vector<int> patterned_gaps;
         if (static_cast<int>(lst1.size()) < min_c) {
             return false;
         }
+        int count = 0;
         for (size_t i = 0; i < lst1.size() - 1; ++i) {
             if (std::abs(std::abs(lst1[i + 1] - lst1[i]) - std::abs(lst2[i + 1] - lst2[i])) <= max_g) {
-                patterned_gaps.push_back(i);
+                if (++count >= min_c) return true;
             }
         }
-        return static_cast<int>(patterned_gaps.size()) >= min_c;
+        return false;
     };
 
     auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
