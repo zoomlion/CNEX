@@ -202,9 +202,17 @@ inline std::pair<int, int> validate_read(
         return false;
     };
 
+    thread_local std::vector<int> match_ids;
+    thread_local std::vector<int> match_starts;
+    thread_local std::vector<int> match_loci;
+    thread_local std::vector<int> seq_positions;
+    thread_local std::vector<int> loci_positions;
+
     auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
-        tsl::robin_map<int, std::vector<std::pair<int, int>>> ordinals;
-        std::vector<int> candidates;
+        match_ids.clear();
+        match_starts.clear();
+        match_loci.clear();
+
         int chain_len = static_cast<int>(chain.size());
         int mer_size_local = mer_size;
 
@@ -219,6 +227,10 @@ inline std::pair<int, int> validate_read(
             t['A'] = 0; t['C'] = 1; t['G'] = 2; t['T'] = 3;
             return t;
         }();
+
+        match_ids.reserve(chain_len);
+        match_starts.reserve(chain_len);
+        match_loci.reserve(chain_len);
 
         uint32_t rolling = 0;
         uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * mer_size_local)) - 1);
@@ -238,27 +250,30 @@ inline std::pair<int, int> validate_read(
                 auto it = compressed_mer_query.compressed_mer_query.find(rolling);
                 if (it != compressed_mer_query.compressed_mer_query.end()) {
                     auto [id, loci] = it->second;
-                    candidates.push_back(id);
-                    ordinals[id].emplace_back(start, static_cast<int>(loci));
+                    match_ids.push_back(id);
+                    match_starts.push_back(start);
+                    match_loci.push_back(static_cast<int>(loci));
                 }
             }
         }
 
-        int confi_id = findFrequentWithMap(candidates);
+        int confi_id = findFrequentWithMap(match_ids);
         if (confi_id == -1) {
             return {-1, 0};
         }
 
-        const auto& positions = ordinals[confi_id];
-        std::vector<int> seq_positions;
-        std::vector<int> loci_positions;
-        for (const auto& pos : positions) {
-            seq_positions.push_back(pos.first);
-            loci_positions.push_back(pos.second);
+        seq_positions.clear();
+        loci_positions.clear();
+        size_t n = match_ids.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (match_ids[i] == confi_id) {
+                seq_positions.push_back(match_starts[i]);
+                loci_positions.push_back(match_loci[i]);
+            }
         }
 
         if (is_pattern_gapped(seq_positions, loci_positions, min_c) && is_sorted(loci_positions)) {
-            return {confi_id, static_cast<int>(candidates.size())};
+            return {confi_id, static_cast<int>(n)};
         }
 
         return {-1, 0};
