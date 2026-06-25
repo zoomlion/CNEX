@@ -37,6 +37,9 @@ struct Args {
     int window_size = 150;
     int step_size = 50;
     std::string pigz_path = "pigz/pigz";
+    int min_c = 5;
+    double vote_frac = 0.1;
+    double vote_ratio = 3.0;
     bool help_requested = false;
 };
 
@@ -278,7 +281,8 @@ void reader_thread(const std::vector<std::string>& files,
 // ─── Worker thread ───
 
 void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
-                   int mer_size, int min_c, const std::string& output_dir,
+                   int mer_size, int min_c, double vote_frac, double vote_ratio,
+                   const std::string& output_dir,
                    std::atomic<int64_t>& processed) {
     std::string output_file = output_dir + "/Assemble." + std::to_string(thread_id) + ".reads";
     FILE* fp = fopen(output_file.c_str(), "a");
@@ -302,7 +306,7 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
     std::vector<Read> chunk;
     while (queue.pop(chunk)) {
         for (const auto& read : chunk) {
-            auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, min_c);
+            auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, min_c, vote_frac, vote_ratio);
             if (confi_id > -1) {
                 int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
                                  "%s\t%d\t%d\t%s\n",
@@ -376,6 +380,15 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--pigz") {
             if (++i >= argc) throw std::runtime_error("Missing value for --pigz");
             args.pigz_path = argv[i];
+        } else if (arg == "--min-c") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --min-c");
+            args.min_c = std::stoi(argv[i]);
+        } else if (arg == "--vote-frac") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --vote-frac");
+            args.vote_frac = std::stod(argv[i]);
+        } else if (arg == "--vote-ratio") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --vote-ratio");
+            args.vote_ratio = std::stod(argv[i]);
         } else if (arg[0] != '-') {
             args.reads_files.push_back(arg);
         } else {
@@ -403,7 +416,10 @@ int main(int argc, char* argv[]) {
                       << "  --chunk_size <n>      Reads per chunk (default: 10000)\n"
                       << "  --window_size <n>     FASTA window size (default: 150)\n"
                       << "  --step_size <n>       FASTA step size (default: 50)\n"
-                      << "  --pigz <path>         pigz binary path (default: pigz/pigz)\n";
+                      << "  --pigz <path>         pigz binary path (default: pigz/pigz)\n"
+                      << "  --min-c <n>           min consecutive colinear k-mer matches (default: 5)\n"
+                      << "  --vote-frac <f>       min fraction of k-mers for top CNE vote (default: 0.1)\n"
+                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 3.0)\n";
             return 1;
         }
 
@@ -442,7 +458,9 @@ int main(int argc, char* argv[]) {
 
         for (int i = 0; i < args.threads; ++i) {
             workers.emplace_back(worker_thread, i, std::ref(queue),
-                                 std::cref(mqm), mer_size, 5, std::cref(args.output_dir),
+                                 std::cref(mqm), mer_size,
+                                 args.min_c, args.vote_frac, args.vote_ratio,
+                                 std::cref(args.output_dir),
                                  std::ref(processed));
         }
 

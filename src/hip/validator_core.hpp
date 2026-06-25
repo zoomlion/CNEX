@@ -77,7 +77,7 @@ inline std::string reverse_complement(const std::string& dna) {
 }
 
 
-inline int findFrequentWithMap(const std::vector<int>& nums) {
+inline int findFrequentWithMap(const std::vector<int>& nums, double vote_frac=0.1, double vote_ratio=3.0) {
     if (nums.empty()) return -1;
 
     int n = static_cast<int>(nums.size());
@@ -115,8 +115,8 @@ inline int findFrequentWithMap(const std::vector<int>& nums) {
         second_cnt = cur_cnt;
     }
 
-    float threshold = static_cast<float>(n) / 10.0f;
-    if (best_cnt > threshold && best_cnt >= 3 * second_cnt) {
+    float threshold = static_cast<float>(n) * static_cast<float>(vote_frac);
+    if (best_cnt > threshold && best_cnt >= static_cast<int>(vote_ratio * second_cnt)) {
         return best_id;
     }
     return -1;
@@ -179,7 +179,9 @@ inline std::pair<int, int> validate_read(
     const std::string& seq,
     const MerQueryManager& compressed_mer_query,
     int mer_size,
-    int min_c)
+    int min_c,
+    double vote_frac = 0.1,
+    double vote_ratio = 3.0)
 {
     auto is_sorted = [](const std::vector<int>& lst) {
         return std::is_sorted(lst.begin(), lst.end());
@@ -257,7 +259,7 @@ inline std::pair<int, int> validate_read(
             }
         }
 
-        int confi_id = findFrequentWithMap(match_ids);
+        int confi_id = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
         if (confi_id == -1) {
             return {-1, 0};
         }
