@@ -19,7 +19,10 @@ def reads_generator(f):
     prev_ele_id = None
     temp_reads = {}
     for line in f:
-        reads_id, strand, ele_id, seq = line.strip().split("\t")
+        parts = line.strip().split("\t")
+        if len(parts) != 4:
+            continue
+        reads_id, strand, ele_id, seq = parts
         seq = seq.upper()
         strand = int(strand)
         if prev_ele_id is None:
@@ -80,7 +83,7 @@ def main():
     # cat and sort all reads by element ID
     tag = ''.join(random.choices(string.ascii_letters, k=8))
     input_f = f"{tag}.reads"
-    os.system(f"cat {args.inputs_dir}/*.reads | sort -k3n > {input_f}")
+    os.system(f"cat {args.inputs_dir}/*.reads | sort -k3n -k1 > {input_f}")
     if not os.path.exists(input_f):
         raise FileNotFoundError(f"Sorted reads file not found: {input_f}")
 

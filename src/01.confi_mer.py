@@ -83,8 +83,7 @@ def build_confident_kmers(msa, mer_size, min_c, output):
     Build confident kmers from MSA alignment.
     """
     mertable = tablemer.TableMer(13)
-    # mertable.set_k(13)
-    # mertable.set_min_entropy(1.4)
+    mertable.set_min_entropy(1.4)
 
     # Load MSA sequences
     for bunch_id, bunch in enumerate(bunch_generator(msa)):

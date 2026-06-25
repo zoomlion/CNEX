@@ -15,6 +15,20 @@ __pycache__/
 # Test data
 sample.reads.gz
 
+# Simulated reads
+reads/
+
+# Pipeline output
+*/Assemble.*.reads
+*/assembled.fasta
+
+# Analysis output
+*.nwk
+*.csv
+*.png
+*tree*
+mers_table*
+
 # pigz build artifacts
 src/pigz/pigz
 src/pigz/unpigz
