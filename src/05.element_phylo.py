@@ -26,8 +26,8 @@ from multiprocessing import Pool
 
 def parse_args():
     p = argparse.ArgumentParser(description="Element phylogeny: famsa + fasttree + astral")
-    p.add_argument("--elements-dir", default="results/elements",
-                   help="Directory with per-element FASTAs")
+    p.add_argument("--elements-dir", default="results/fasta",
+                   help="Directory with per-element FASTAs (default: results/fasta)")
     p.add_argument("--famsa", default="~/Software/famsa",
                    help="Path to famsa binary")
     p.add_argument("--fasttree", default="~/Software/fasttree-2.2.0/FastTree",
@@ -79,10 +79,11 @@ def _flatten_fasta(path):
 
 
 def _process_one(args_tuple):
-    fasta_path, famsa_bin, fasttree_bin, resume = args_tuple
+    fasta_path, famsa_bin, fasttree_bin, resume, aln_dir, nwk_dir = args_tuple
 
-    aln_path = fasta_path.replace(".fasta", ".aln")
-    nwk_path = fasta_path.replace(".fasta", ".nwk")
+    base = os.path.basename(fasta_path).replace(".fasta", "")
+    aln_path = os.path.join(aln_dir, base + ".aln")
+    nwk_path = os.path.join(nwk_dir, base + ".nwk")
 
     # Align (FAMSA, always 1 thread per element process)
     if resume and os.path.isfile(aln_path):
@@ -183,6 +184,14 @@ def main():
     print(f"Resume:   {'on' if args.resume else 'off'}")
     print()
 
+    # Setup output subdirectories based on elements_dir parent
+    base_dir = os.path.dirname(os.path.abspath(args.elements_dir))
+    aln_dir = os.path.join(base_dir, "aln")
+    nwk_dir = os.path.join(base_dir, "nwk")
+    astral_outdir = os.path.join(base_dir, "astral")
+    for d in (aln_dir, nwk_dir, astral_outdir):
+        os.makedirs(d, exist_ok=True)
+
     fasta_files = find_fasta_files(args.elements_dir, args.max_elements)
     print(f"Found {len(fasta_files)} element FASTAs")
     if not fasta_files:
@@ -190,7 +199,7 @@ def main():
 
     # Process elements (parallel)
     total = len(fasta_files)
-    work = [(f, famsa, fasttree, args.resume) for f in fasta_files]
+    work = [(f, famsa, fasttree, args.resume, aln_dir, nwk_dir) for f in fasta_files]
 
     t0 = time.time()
     ok_count = 0
@@ -233,14 +242,15 @@ def main():
     print(f"\n--- Collecting gene trees ---")
     all_trees = []
     for fasta_path in fasta_files:
-        nwk_path = fasta_path.replace(".fasta", ".nwk")
+        base = os.path.basename(fasta_path).replace(".fasta", "")
+        nwk_path = os.path.join(nwk_dir, base + ".nwk")
         if os.path.isfile(nwk_path):
             with open(nwk_path) as f:
                 tree = f.read().strip()
                 if tree:
                     all_trees.append(tree)
 
-    gene_trees_path = os.path.join(os.path.dirname(args.elements_dir), "gene_trees.nwk")
+    gene_trees_path = os.path.join(astral_outdir, "gene_trees.nwk")
     with open(gene_trees_path, "w") as f:
         for t in all_trees:
             f.write(t + "\n")
@@ -249,7 +259,7 @@ def main():
     # ASTRAL
     version = "IV" if use_astral_iv else "III"
     print(f"\n--- Running ASTRAL {version} ---")
-    species_tree_path = os.path.join(os.path.dirname(args.elements_dir), "species_tree.nwk")
+    species_tree_path = os.path.join(astral_outdir, "species_tree.nwk")
     if len(all_trees) < 2:
         print("Too few gene trees for ASTRAL (need >= 2)")
     else:

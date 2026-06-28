@@ -71,14 +71,16 @@ def check_tree_deps():
               + "\n".join(missing) + "\n", file=sys.stderr)
 
 
-def process_one(genome, mers, out_dir, threads, trim, min_c=10,
+def process_one(genome, mers, base_dir, threads, trim, min_c=10,
                 vote_frac=0.1, vote_ratio=5.0, window_size=None, step_size=None, type_=None, log_dir=None):
-    log_path = os.path.join(log_dir, genome_name(genome) + ".log") if log_dir else os.devnull
-    os.makedirs(out_dir, exist_ok=True)
+    name = genome_name(genome)
+    val_dir = os.path.join(base_dir, "assemble", name)
+    os.makedirs(val_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, name + ".log") if log_dir else os.devnull
     log = open(log_path, "w")
 
     val_cmd = [VALIDATE, genome, "--mers", mers, "-t", str(threads),
-               "--output_dir", out_dir, "--pigz", PIGZ,
+               "--output_dir", val_dir, "--pigz", PIGZ,
                "--min-c", str(min_c), "--vote-frac", str(vote_frac), "--vote-ratio", str(vote_ratio)]
     if type_:
         val_cmd += ["--type", type_]
@@ -88,8 +90,8 @@ def process_one(genome, mers, out_dir, threads, trim, min_c=10,
         val_cmd += ["--step_size", str(step_size)]
     subprocess.run(val_cmd, stdout=log, stderr=log)
 
-    asm_out = os.path.join(out_dir, "contigs.fa")
-    asm_cmd = [ASSEMBLE, out_dir + "/", "--mers", mers, "-o", asm_out]
+    asm_out = os.path.join(val_dir, "contigs.fa")
+    asm_cmd = [ASSEMBLE, val_dir + "/", "--mers", mers, "-o", asm_out]
     if trim:
         asm_cmd.append("--trim")
     result = subprocess.run(asm_cmd, stdout=log, stderr=log)
@@ -170,8 +172,7 @@ def cmd_pipeline(args):
         futures = {}
         for genome in genomes:
             name = genome_name(genome)
-            out = os.path.join(args.output_dir, name)
-            f = pool.submit(process_one, genome, mers, out, args.threads, trim,
+            f = pool.submit(process_one, genome, mers, args.output_dir, args.threads, trim,
                             args.min_c, args.vote_frac, args.vote_ratio,
                             args.window_size, args.step_size, args.type, log_dir)
             futures[f] = name

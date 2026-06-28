@@ -3,14 +3,14 @@
 Step 04: Group assembled contigs by CNE element (bunch_id).
 
 Input:
-  results/<species>/assembled.fasta  -- contig headers are bunch_ids
+  results/assemble/<species>/contigs.fa  -- contig headers are bunch_ids
   mers_table.tsv                     -- to know which bunch_ids exist
 
 Output:
   results/elements/<bunch_id>.fasta  -- per-element multi-species FASTA
 
 Usage:
-  python3 src/05.map_contig_to_element.py --max-elements 0 --parallel 8
+  python3 src/04.map_contig_to_element.py --max-elements 0 --parallel 8
 """
 
 import argparse
@@ -23,13 +23,16 @@ from multiprocessing import Pool
 
 def parse_args():
     p = argparse.ArgumentParser(description="Group assembled contigs by CNE element")
-    p.add_argument("--results-dir", default="results", help="Results directory")
+    p.add_argument("--assemble-dir", default="results/assemble",
+                   help="Directory with per-species assembly results (default: results/assemble)")
+    p.add_argument("--results-dir", default="results",
+                   help="Results root directory (for backward compat, deprecated)")
     p.add_argument("--max-elements", type=int, default=100,
                    help="Max number of CNE elements to process (0=all)")
     p.add_argument("--min-species", type=int, default=3,
                    help="Min number of species required per element")
-    p.add_argument("-o", "--outdir", default="results/elements",
-                   help="Output directory for per-element FASTAs")
+    p.add_argument("-o", "--outdir", default="results/fasta",
+                   help="Output directory for per-element FASTAs (default: results/fasta)")
     p.add_argument("--parallel", type=int, default=1,
                    help="Number of parallel processes for reading species")
     return p.parse_args()
@@ -56,8 +59,8 @@ def read_fasta_dict(path):
 
 
 def _read_one_species(sp_and_dir):
-    sp, results_dir = sp_and_dir
-    fa = os.path.join(results_dir, sp, "assembled.fasta")
+    sp, assemble_dir = sp_and_dir
+    fa = os.path.join(assemble_dir, sp, "contigs.fa")
     if not os.path.isfile(fa):
         return {}
     seqs = read_fasta_dict(fa)
@@ -73,11 +76,12 @@ def _read_one_species(sp_and_dir):
 
 def main():
     args = parse_args()
+    assemble_dir = args.assemble_dir
 
     # Discover all species with assemblies
     species = []
-    for sp in sorted(os.listdir(args.results_dir)):
-        fa = os.path.join(args.results_dir, sp, "assembled.fasta")
+    for sp in sorted(os.listdir(assemble_dir)):
+        fa = os.path.join(assemble_dir, sp, "contigs.fa")
         if os.path.isfile(fa):
             species.append(sp)
     print(f"Found {len(species)} species with assemblies")
@@ -88,7 +92,7 @@ def main():
     if args.parallel > 1:
         with Pool(args.parallel) as p:
             for chunk in p.imap_unordered(_read_one_species,
-                                          [(sp, args.results_dir) for sp in species]):
+                                          [(sp, assemble_dir) for sp in species]):
                 for bid, sp_dict in chunk.items():
                     if bid not in elements:
                         elements[bid] = {}
@@ -97,7 +101,7 @@ def main():
                             elements[bid][sp] = seq
     else:
         for sp in species:
-            chunk = _read_one_species((sp, args.results_dir))
+            chunk = _read_one_species((sp, assemble_dir))
             for bid, sp_dict in chunk.items():
                 if bid not in elements:
                     elements[bid] = {}
