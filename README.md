@@ -21,6 +21,11 @@ CNEX is a pipeline for fast identification of conserved non-coding elements (CNE
 | FastTree | Gene tree inference | `~/Software/fasttree-2.2.0/FastTree` | [microbesonline.org/fasttree](http://www.microbesonline.org/fasttree/) |
 | ASTRAL | Species tree inference | `~/Software/ASTRAL-5.7.1/astral_exe/astral.5.7.1.jar` | [github.com/smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
 
+To check your setup:
+```bash
+cnex setup
+```
+
 ## Quick Start
 
 ### Build

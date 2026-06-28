@@ -49,8 +49,9 @@ def check_binaries():
         sys.exit("Error: C++ binaries not found: " + ", ".join(missing) +
                  "\n       Run 'make && make install' first.")
 
-def check_tree_deps():
-    deps = [
+
+def tree_deps():
+    return [
         ("FAMSA",   os.path.expanduser("~/Software/famsa"),
          "https://github.com/refresh-bio/FAMSA"),
         ("FastTree", os.path.expanduser("~/Software/fasttree-2.2.0/FastTree"),
@@ -58,8 +59,11 @@ def check_tree_deps():
         ("ASTRAL",  os.path.expanduser("~/Software/ASTRAL-5.7.1/astral_exe/astral.5.7.1.jar"),
          "https://github.com/smirarab/ASTRAL"),
     ]
+
+
+def check_tree_deps():
     missing = [f"  {name}: {path}\n           Download: {url}"
-               for name, path, url in deps if not os.path.exists(path)]
+               for name, path, url in tree_deps() if not os.path.exists(path)]
     if missing:
         print("Warning: phylogenetic tools not found (needed for steps 04-05):\n"
               + "\n".join(missing) + "\n", file=sys.stderr)
@@ -248,9 +252,22 @@ def main():
     elif args.command == "pipeline":
         return cmd_pipeline(args)
     elif args.command == "setup":
-        check_binaries()
-        check_tree_deps()
-        print("All binaries found." if os.path.exists(VALIDATE) and os.path.exists(ASSEMBLE) else "")
+        items = [
+            ("validate", VALIDATE, None),
+            ("assemble", ASSEMBLE, None),
+            ("pigz",     PIGZ,     "make -C src/pigz"),
+        ]
+        for name, path, hint in tree_deps():
+            items.append((name, path, hint))
+
+        print("CNEX Environment Setup\n")
+        for name, path, hint in items:
+            ok = os.path.exists(path)
+            mark = "✓" if ok else " "
+            print(f"  [{mark}] {name:<12} {path}")
+            if not ok and hint:
+                print(f"       {hint}")
+        print("\nSee README.md for details.")
         return 0
     return 0
 
