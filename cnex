@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """CNEX — Conserved Non-coding Element Discovery Pipeline."""
-import argparse, os, subprocess, sys
+import argparse, glob, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VALIDATE = os.path.join(ROOT, "bin", "validate")
 ASSEMBLE = os.path.join(ROOT, "bin", "assemble")
 PIGZ     = os.path.join(ROOT, "src", "pigz", "pigz")
+
+GENOME_EXTS = (".fa", ".fa.gz", ".fasta", ".fasta.gz", ".fna", ".fna.gz")
 
 
 def run(cmd, **kwargs):
@@ -13,9 +16,84 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
-def cmd_validate(args):
+def find_genomes(paths):
+    files = []
+    for p in paths:
+        if os.path.isdir(p):
+            for ext in GENOME_EXTS:
+                files.extend(glob.glob(os.path.join(p, "*" + ext)))
+        else:
+            files.extend(glob.glob(p))
+    return sorted(set(files))
+
+
+def genome_name(path):
+    name = os.path.basename(path)
+    for ext in GENOME_EXTS:
+        if name.endswith(ext):
+            name = name[:-len(ext)]
+            break
+    # Take the first part before any dot for cleaner names
+    first = name.split(".")[0]
+    # If the split gives a too-short name, use the original
+    return first if len(first) >= 3 else name
+
+
+def check_binaries():
+    missing = []
     if not os.path.exists(VALIDATE):
-        sys.exit("Error: validate binary not found. Run 'make && make install' first.")
+        missing.append("validate")
+    if not os.path.exists(ASSEMBLE):
+        missing.append("assemble")
+    if missing:
+        sys.exit("Error: C++ binaries not found: " + ", ".join(missing) +
+                 "\n       Run 'make && make install' first.")
+
+def check_tree_deps():
+    deps = [
+        ("FAMSA",   os.path.expanduser("~/Software/famsa"),
+         "https://github.com/refresh-bio/FAMSA"),
+        ("FastTree", os.path.expanduser("~/Software/fasttree-2.2.0/FastTree"),
+         "http://www.microbesonline.org/fasttree/"),
+        ("ASTRAL",  os.path.expanduser("~/Software/ASTRAL-5.7.1/astral_exe/astral.5.7.1.jar"),
+         "https://github.com/smirarab/ASTRAL"),
+    ]
+    missing = [f"  {name}: {path}\n           Download: {url}"
+               for name, path, url in deps if not os.path.exists(path)]
+    if missing:
+        print("Warning: phylogenetic tools not found (needed for steps 04-05):\n"
+              + "\n".join(missing) + "\n", file=sys.stderr)
+
+
+def process_one(genome, mers, out_dir, threads, trim, min_c=10,
+                vote_frac=0.1, vote_ratio=5.0, window_size=None, step_size=None, type_=None):
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [VALIDATE, genome,
+           "--mers", mers,
+           "-t", str(threads),
+           "--output_dir", out_dir,
+           "--pigz", PIGZ,
+           "--min-c", str(min_c),
+           "--vote-frac", str(vote_frac),
+           "--vote-ratio", str(vote_ratio)]
+    if type_:
+        cmd += ["--type", type_]
+    if window_size:
+        cmd += ["--window_size", str(window_size)]
+    if step_size:
+        cmd += ["--step_size", str(step_size)]
+    run(cmd)
+    asm_out = os.path.join(out_dir, "contigs.fa")
+    cmd = [ASSEMBLE, out_dir + "/",
+           "--mers", mers,
+           "-o", asm_out]
+    if trim:
+        cmd.append("--trim")
+    run(cmd)
+
+
+def cmd_validate(args):
+    check_binaries()
     cmd = [VALIDATE] + args.files + [
         "--mers", args.mers,
         "-t", str(args.threads),
@@ -35,8 +113,7 @@ def cmd_validate(args):
 
 
 def cmd_assemble(args):
-    if not os.path.exists(ASSEMBLE):
-        sys.exit("Error: assemble binary not found. Run 'make && make install' first.")
+    check_binaries()
     cmd = [ASSEMBLE, args.input_dir,
            "--mers", args.mers,
            "-o", args.output]
@@ -50,23 +127,47 @@ def cmd_assemble(args):
         cmd += ["--max-reads", str(args.max_reads)]
     if args.max_loci_gap:
         cmd += ["--max-loci-gap", str(args.max_loci_gap)]
-    if args.trim:
-        cmd += ["--trim"]
+    if not args.no_trim:
+        cmd.append("--trim")
     return run(cmd).returncode
 
 
 def cmd_pipeline(args):
-    rc = cmd_validate(args)
-    if rc != 0:
-        return rc
-    asm_args = argparse.Namespace(
-        input_dir=args.output_dir,
-        mers=args.mers,
-        output=os.path.join(args.output_dir, "assembled.fasta"),
-        kmer=35, min_c=3, min_count=2, max_reads=200,
-        max_loci_gap=5000, trim=True,
-    )
-    return cmd_assemble(asm_args)
+    check_binaries()
+    genomes = find_genomes(args.files)
+    if not genomes:
+        sys.exit("Error: no genome files found in " + ", ".join(args.files))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    mers = args.mers
+    if args.cne:
+        filtered = os.path.join(args.output_dir, "msa.filtered.fa")
+        cmd = ["python3", os.path.join(ROOT, "src", "00.filter_msa.py"),
+               args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered]
+        run(cmd)
+        mers = os.path.join(args.output_dir, "mers_table.tsv")
+        cmd = ["python3", os.path.join(ROOT, "src", "01.confi_mer.py"),
+               filtered, "-k", "13", "-c", "4", "-o", mers]
+        run(cmd)
+
+    trim = not args.no_trim
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = []
+        for genome in genomes:
+            name = genome_name(genome)
+            out = os.path.join(args.output_dir, name)
+            futures.append(pool.submit(
+                process_one, genome, mers, out, args.threads, trim,
+                args.min_c, args.vote_frac, args.vote_ratio,
+                args.window_size, args.step_size, args.type))
+        for f in futures:
+            exc = f.exception()
+            if exc:
+                print(f"  Error: {exc}", file=sys.stderr)
+
+    check_tree_deps()
 
 
 def main():
@@ -75,21 +176,21 @@ def main():
 
     sub = parser.add_subparsers(dest="command")
 
-    # validate
+    # ─── validate ───
     p_val = sub.add_parser("validate", help="Validate reads or genome against confident k-mers")
     p_val.add_argument("files", nargs="+", help="Input files (FASTQ or FASTA, plain or .gz)")
     p_val.add_argument("--mers", required=True, help="Confident k-mer table")
-    p_val.add_argument("-t", "--threads", type=int, default=8, help="Threads (default: 8)")
-    p_val.add_argument("--output-dir", default="out", help="Output directory (default: out)")
+    p_val.add_argument("-t", "--threads", type=int, default=8, help="Threads per file (default: 8)")
+    p_val.add_argument("-o", "--output-dir", default="out", help="Output directory (default: out)")
     p_val.add_argument("--type", choices=["genome", "fastq"],
                        help="Input type (auto-detected if omitted)")
     p_val.add_argument("--min-c", type=int, default=10, help="Min colinear k-mer matches (default: 10)")
     p_val.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
     p_val.add_argument("--vote-ratio", type=float, default=5.0, help="Vote ratio (default: 5.0)")
-    p_val.add_argument("--window-size", type=int, default=None, help="Genome sliding window size")
-    p_val.add_argument("--step-size", type=int, default=None, help="Genome sliding window step")
+    p_val.add_argument("--window-size", type=int, help="Genome sliding window size (default: 150)")
+    p_val.add_argument("--step-size", type=int, help="Genome sliding window step (default: 25)")
 
-    # assemble
+    # ─── assemble ───
     p_asm = sub.add_parser("assemble", help="De Bruijn assembly from validated reads")
     p_asm.add_argument("input_dir", help="Directory with Assemble.*.reads files")
     p_asm.add_argument("--mers", required=True, help="Confident k-mer table")
@@ -100,15 +201,31 @@ def main():
     p_asm.add_argument("--max-reads", type=int, default=200, help="Max reads per element/locus (default: 200)")
     p_asm.add_argument("--max-loci-gap", type=int, default=5000,
                        help="Max gap for locus clustering in genome mode (default: 5000)")
-    p_asm.add_argument("--trim", action="store_true", default=True, help="Trim contigs (default: on)")
+    p_asm.add_argument("--no-trim", action="store_true", dest="no_trim",
+                       help="Disable contig trimming (trimming enabled by default)")
 
-    # pipeline
-    p_pipe = sub.add_parser("pipeline", help="Run full validate + assemble pipeline")
-    for dest, src in [("files", p_val), ("--mers", p_val), ("-t", p_val),
-                       ("--output-dir", p_val), ("--type", p_val),
-                       ("--min-c", p_val), ("--vote-frac", p_val), ("--vote-ratio", p_val),
-                       ("--window-size", p_val), ("--step-size", p_val)]:
-        pass  # pipeline reuses validate args + assemble args
+    # ─── pipeline ───
+    p_pipe = sub.add_parser("pipeline",
+                            help="Run validate + assemble on multiple genomes")
+    p_pipe.add_argument("files", nargs="+",
+                        help="Input genome directories, files, or glob patterns (e.g. genomes/*.fa)")
+    p_pipe.add_argument("--cne", help="Start from MSA file (runs 00+01 then 02+03)")
+    p_pipe.add_argument("--mers", help="Start from existing k-mer table (runs 02+03)")
+    p_pipe.add_argument("-t", "--threads", type=int, default=8, help="Threads per genome (default: 8)")
+    p_pipe.add_argument("-j", "--jobs", type=int, default=4, help="Parallel genomes (default: 4)")
+    p_pipe.add_argument("-o", "--output-dir", default="out", help="Output root directory (default: out)")
+    p_pipe.add_argument("--no-trim", action="store_true", dest="no_trim",
+                        help="Disable contig trimming")
+    p_pipe.add_argument("--type", choices=["genome", "fastq"],
+                        help="Input type (auto-detected if omitted)")
+    p_pipe.add_argument("--window-size", type=int, help="Sliding window size (default: 150)")
+    p_pipe.add_argument("--step-size", type=int, help="Sliding window step (default: 25)")
+    p_pipe.add_argument("--min-c", type=int, default=10, help="Min colinear k-mer matches (default: 10)")
+    p_pipe.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
+    p_pipe.add_argument("--vote-ratio", type=float, default=5.0, help="Vote ratio (default: 5.0)")
+
+    # ─── setup ───
+    p_setup = sub.add_parser("setup", help="Check dependencies and build instructions")
 
     args = parser.parse_args()
 
@@ -122,6 +239,11 @@ def main():
         return cmd_assemble(args)
     elif args.command == "pipeline":
         return cmd_pipeline(args)
+    elif args.command == "setup":
+        check_binaries()
+        check_tree_deps()
+        print("All binaries found." if os.path.exists(VALIDATE) and os.path.exists(ASSEMBLE) else "")
+        return 0
     return 0
 
 
