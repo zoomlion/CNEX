@@ -5,7 +5,10 @@ PREFIX   := $(CURDIR)
 
 .PHONY: all install clean
 
-all: validate assemble
+all: mertable validate assemble
+
+mertable: src/01.mertable.cpp src/hip/mertable_core.hpp
+	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
 
 validate: src/02.validate.cpp src/hip/validator_core.hpp
 	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
@@ -15,7 +18,7 @@ assemble: src/03.assembler.cpp src/hip/validator_core.hpp src/hip/debruijn_core.
 
 install: all
 	mkdir -p $(PREFIX)/bin
-	mv validate assemble $(PREFIX)/bin/
+	mv mertable validate assemble $(PREFIX)/bin/
 
 clean:
-	rm -rf validate assemble bin/validate bin/assemble
+	rm -rf mertable validate assemble bin/mertable bin/validate bin/assemble
