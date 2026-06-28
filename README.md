@@ -74,7 +74,8 @@ cnex assemble out/ --mers mers_table.tsv --trim
 |------|---------|-------------|--------|
 | FAMSA | Multiple sequence alignment | `~/Software/famsa` | [refresh-bio/FAMSA](https://github.com/refresh-bio/FAMSA) |
 | FastTree | Gene tree inference | `~/Software/fasttree-2.2.0/FastTree` | [microbesonline.org/fasttree](http://www.microbesonline.org/fasttree/) |
-| ASTRAL | Species tree inference | `~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar` | [smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
+| ASTRAL IV (ASTER) | Species tree inference (**recommended**) | `~/Software/bin/astral` | [chaoszhang/ASTER](https://github.com/chaoszhang/ASTER) |
+| ASTRAL III | Species tree inference (fallback) | `~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar` | [smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
 
 ## Input Formats
 

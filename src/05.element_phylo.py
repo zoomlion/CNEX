@@ -32,10 +32,14 @@ def parse_args():
                    help="Path to famsa binary")
     p.add_argument("--fasttree", default="~/Software/fasttree-2.2.0/FastTree",
                    help="Path to FastTree binary")
+    p.add_argument("--astral-bin", default="~/Software/bin/astral",
+                   help="Path to ASTRAL IV / ASTER native binary (default: ~/Software/bin/astral)")
     p.add_argument("--astral-dir", default="~/Software/ASTRAL-5.7.1/astral_exe/Astral",
-                   help="Path to ASTRAL directory")
+                   help="Path to ASTRAL III directory (used only if --astral-bin not found)")
     p.add_argument("--astral-jar", default="",
-                   help="Path to ASTRAL jar (auto-detected if empty)")
+                   help="Path to ASTRAL III jar (overrides --astral-dir)")
+    p.add_argument("-t", "--threads", type=int, default=4,
+                   help="Threads for ASTRAL IV / ASTER (default: 4)")
     p.add_argument("--parallel", type=int, default=1,
                    help="Number of parallel element processes (famsa always uses 1 thread each)")
     p.add_argument("--max-elements", type=int, default=100,
@@ -119,12 +123,21 @@ def _process_one(args_tuple):
     return True, fasta_path, None
 
 
-def run_astral(jar_path, gene_trees_path, output_path):
+def run_astral_iv(bin_path, gene_trees_path, output_path, threads=4):
+    cmd = [bin_path, "-i", gene_trees_path, "-o", output_path, "-t", str(threads)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ASTRAL IV error: {result.stderr[:500]}", file=sys.stderr)
+        return False
+    return True
+
+
+def run_astral_iii(jar_path, gene_trees_path, output_path):
     cmd = ["java", "-Xmx8g", "-jar", jar_path, "-i", gene_trees_path,
            "-o", output_path, "--extraLevel", "0"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  ASTRAL error: {result.stderr[:500]}", file=sys.stderr)
+        print(f"  ASTRAL III error: {result.stderr[:500]}", file=sys.stderr)
         return False
     return True
 
@@ -134,31 +147,38 @@ def main():
 
     famsa = os.path.expanduser(args.famsa)
     fasttree = os.path.expanduser(args.fasttree)
+    astral_bin = os.path.expanduser(args.astral_bin)
     astral_dir = os.path.expanduser(args.astral_dir)
+    astral_jar = os.path.expanduser(args.astral_jar) if args.astral_jar else ""
 
     if not os.path.isfile(famsa):
         sys.exit(f"FAMSA not found: {famsa}")
     if not os.path.isfile(fasttree):
         sys.exit(f"FastTree not found: {fasttree}")
 
-    if args.astral_jar:
-        astral_jar = os.path.expanduser(args.astral_jar)
-    else:
+    # Detect ASTRAL mode: IV (native) > III (jar)
+    use_astral_iv = False
+    if os.path.isfile(astral_bin):
+        use_astral_iv = True
+    elif not astral_jar:
         candidates = [os.path.join(astral_dir, "astral.5.7.1.jar")]
         for f in glob.glob(os.path.join(astral_dir, "*.jar")):
             candidates.insert(0, f)
-        astral_jar = None
         for c in candidates:
             if os.path.isfile(c):
                 astral_jar = c
                 break
-        if astral_jar is None:
-            sys.exit(f"ASTRAL jar not found in {astral_dir}. Use --astral-jar")
+        if not astral_jar:
+            sys.exit(f"No ASTRAL binary found.\n"
+                     f"  Try: --astral-bin {astral_bin} (IV/native)\n"
+                     f"  Or:  --astral-jar <path> (III/Java)")
 
     print(f"FAMSA:    {famsa}")
     print(f"FastTree: {fasttree}")
-    print(f"ASTRAL:   {astral_jar}")
-    print(f"FAMSA threads: 1 per process")
+    if use_astral_iv:
+        print(f"ASTRAL:   {astral_bin} (IV/native, {args.threads} threads)")
+    else:
+        print(f"ASTRAL:   {astral_jar} (III/Java)")
     print(f"Parallel:      {args.parallel} elements simultaneously")
     print(f"Resume:   {'on' if args.resume else 'off'}")
     print()
@@ -227,22 +247,25 @@ def main():
     print(f"Collected {len(all_trees)} gene trees -> {gene_trees_path}")
 
     # ASTRAL
-    print(f"\n--- Running ASTRAL ---")
+    version = "IV" if use_astral_iv else "III"
+    print(f"\n--- Running ASTRAL {version} ---")
     species_tree_path = os.path.join(os.path.dirname(args.elements_dir), "species_tree.nwk")
     if len(all_trees) < 2:
         print("Too few gene trees for ASTRAL (need >= 2)")
     else:
         t0 = time.time()
-        ok = run_astral(astral_jar, gene_trees_path, species_tree_path)
+        if use_astral_iv:
+            ok = run_astral_iv(astral_bin, gene_trees_path, species_tree_path, args.threads)
+        else:
+            ok = run_astral_iii(astral_jar, gene_trees_path, species_tree_path)
         t1 = time.time()
         if ok:
             with open(species_tree_path) as f:
                 tree = f.read().strip()
-            n_nodes = len([c for c in tree if c == ")"] and ":" in tree)
-            print(f"  ASTRAL done in {t1 - t0:.1f}s")
+            print(f"  ASTRAL {version} done in {t1 - t0:.1f}s")
             print(f"\nSpecies tree:\n{tree}")
         else:
-            print("ASTRAL failed!")
+            print(f"ASTRAL {version} failed!")
 
     print("\nDone!")
 
