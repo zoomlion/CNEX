@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 06: Per-element alignment (FAMSA) + gene tree (FastTree) + species tree (ASTRAL).
+Step 05: Per-element alignment (FAMSA) + gene tree (FastTree) + species tree (ASTRAL).
 
 Input:
   results/elements/<bunch_id>.fasta  -- per-element multi-species FASTA (from step 05)

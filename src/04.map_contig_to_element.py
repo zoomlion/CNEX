@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 05: Group assembled contigs by CNE element (bunch_id).
+Step 04: Group assembled contigs by CNE element (bunch_id).
 
 Input:
   results/<species>/assembled.fasta  -- contig headers are bunch_ids
