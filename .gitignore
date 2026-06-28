@@ -35,3 +35,9 @@ src/pigz/pigz
 src/pigz/unpigz
 src/pigz/*.o
 src/pigz/zopfli/src/**/*.o
+bin/
+validate
+assemble
+bin/
+validate
+assemble

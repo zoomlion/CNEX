@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""CNEX — Conserved Non-coding Element Discovery Pipeline."""
+import argparse, os, subprocess, sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+VALIDATE = os.path.join(ROOT, "bin", "validate")
+ASSEMBLE = os.path.join(ROOT, "bin", "assemble")
+PIGZ     = os.path.join(ROOT, "src", "pigz", "pigz")
+
+
+def run(cmd, **kwargs):
+    sys.stderr.write("  " + " ".join(cmd) + "\n")
+    return subprocess.run(cmd, **kwargs)
+
+
+def cmd_validate(args):
+    if not os.path.exists(VALIDATE):
+        sys.exit("Error: validate binary not found. Run 'make && make install' first.")
+    cmd = [VALIDATE] + args.files + [
+        "--mers", args.mers,
+        "-t", str(args.threads),
+        "--output_dir", args.output_dir,
+        "--pigz", PIGZ,
+        "--min-c", str(args.min_c),
+        "--vote-frac", str(args.vote_frac),
+        "--vote-ratio", str(args.vote_ratio),
+    ]
+    if args.window_size:
+        cmd += ["--window_size", str(args.window_size)]
+    if args.step_size:
+        cmd += ["--step_size", str(args.step_size)]
+    if args.type:
+        cmd += ["--type", args.type]
+    return run(cmd).returncode
+
+
+def cmd_assemble(args):
+    if not os.path.exists(ASSEMBLE):
+        sys.exit("Error: assemble binary not found. Run 'make && make install' first.")
+    cmd = [ASSEMBLE, args.input_dir,
+           "--mers", args.mers,
+           "-o", args.output]
+    if args.kmer:
+        cmd += ["-k", str(args.kmer)]
+    if args.min_c:
+        cmd += ["--min-c", str(args.min_c)]
+    if args.min_count:
+        cmd += ["--min-count", str(args.min_count)]
+    if args.max_reads:
+        cmd += ["--max-reads", str(args.max_reads)]
+    if args.max_loci_gap:
+        cmd += ["--max-loci-gap", str(args.max_loci_gap)]
+    if args.trim:
+        cmd += ["--trim"]
+    return run(cmd).returncode
+
+
+def cmd_pipeline(args):
+    rc = cmd_validate(args)
+    if rc != 0:
+        return rc
+    asm_args = argparse.Namespace(
+        input_dir=args.output_dir,
+        mers=args.mers,
+        output=os.path.join(args.output_dir, "assembled.fasta"),
+        kmer=35, min_c=3, min_count=2, max_reads=200,
+        max_loci_gap=5000, trim=True,
+    )
+    return cmd_assemble(asm_args)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CNEX — Conserved Non-coding Element Discovery Pipeline")
+    parser.add_argument("--version", action="version", version="CNEX 1.0")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # validate
+    p_val = sub.add_parser("validate", help="Validate reads or genome against confident k-mers")
+    p_val.add_argument("files", nargs="+", help="Input files (FASTQ or FASTA, plain or .gz)")
+    p_val.add_argument("--mers", required=True, help="Confident k-mer table")
+    p_val.add_argument("-t", "--threads", type=int, default=8, help="Threads (default: 8)")
+    p_val.add_argument("--output-dir", default="out", help="Output directory (default: out)")
+    p_val.add_argument("--type", choices=["genome", "fastq"],
+                       help="Input type (auto-detected if omitted)")
+    p_val.add_argument("--min-c", type=int, default=10, help="Min colinear k-mer matches (default: 10)")
+    p_val.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
+    p_val.add_argument("--vote-ratio", type=float, default=5.0, help="Vote ratio (default: 5.0)")
+    p_val.add_argument("--window-size", type=int, default=None, help="Genome sliding window size")
+    p_val.add_argument("--step-size", type=int, default=None, help="Genome sliding window step")
+
+    # assemble
+    p_asm = sub.add_parser("assemble", help="De Bruijn assembly from validated reads")
+    p_asm.add_argument("input_dir", help="Directory with Assemble.*.reads files")
+    p_asm.add_argument("--mers", required=True, help="Confident k-mer table")
+    p_asm.add_argument("-o", "--output", default="assembled.fasta", help="Output FASTA (default: assembled.fasta)")
+    p_asm.add_argument("-k", "--kmer", type=int, default=35, help="K-mer length (default: 35)")
+    p_asm.add_argument("--min-c", type=int, default=3, help="Min k-mer matches for validation (default: 3)")
+    p_asm.add_argument("--min-count", type=int, default=2, help="Min (k+1)-mer occurrence (default: 2)")
+    p_asm.add_argument("--max-reads", type=int, default=200, help="Max reads per element/locus (default: 200)")
+    p_asm.add_argument("--max-loci-gap", type=int, default=5000,
+                       help="Max gap for locus clustering in genome mode (default: 5000)")
+    p_asm.add_argument("--trim", action="store_true", default=True, help="Trim contigs (default: on)")
+
+    # pipeline
+    p_pipe = sub.add_parser("pipeline", help="Run full validate + assemble pipeline")
+    for dest, src in [("files", p_val), ("--mers", p_val), ("-t", p_val),
+                       ("--output-dir", p_val), ("--type", p_val),
+                       ("--min-c", p_val), ("--vote-frac", p_val), ("--vote-ratio", p_val),
+                       ("--window-size", p_val), ("--step-size", p_val)]:
+        pass  # pipeline reuses validate args + assemble args
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    if args.command == "validate":
+        return cmd_validate(args)
+    elif args.command == "assemble":
+        return cmd_assemble(args)
+    elif args.command == "pipeline":
+        return cmd_pipeline(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
