@@ -154,7 +154,7 @@ def cmd_pipeline(args):
         subprocess.run(["python3", os.path.join(ROOT, "src", "00.filter_msa.py"),
                         args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered])
         mers = os.path.join(args.output_dir, "mers_table.tsv")
-        subprocess.run(["python3", os.path.join(ROOT, "src", "01.confi_mer.py"),
+        subprocess.run([os.path.join(ROOT, "bin", "mertable"),
                         filtered, "-k", "13", "-c", "4", "-o", mers])
 
     trim = not args.no_trim
