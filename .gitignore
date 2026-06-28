@@ -1,5 +1,5 @@
 # Compiled binaries
-src/02.assembler
+src/02.validate
 *.pgo
 *.nopgo
 
@@ -21,6 +21,7 @@ reads/
 # Pipeline output
 */Assemble.*.reads
 */assembled.fasta
+results/
 
 # Analysis output
 *.nwk
