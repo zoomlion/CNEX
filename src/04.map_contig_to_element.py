@@ -62,9 +62,12 @@ def _read_one_species(sp_and_dir):
         return {}
     seqs = read_fasta_dict(fa)
     # Convert to {element_id: {sp: seq}} dict
+    # bunch_id format may be "0.chr:start-end(+)" in genome mode;
+    # strip locus suffix to group all copies under the same element
     result = {}
     for bunch_id, seq in seqs.items():
-        result[bunch_id] = {sp: seq}
+        bid = bunch_id.split(".")[0]
+        result[bid] = {sp: seq}
     return result
 
 
@@ -87,18 +90,20 @@ def main():
             for chunk in p.imap_unordered(_read_one_species,
                                           [(sp, args.results_dir) for sp in species]):
                 for bid, sp_dict in chunk.items():
-                    if bid in elements:
-                        elements[bid].update(sp_dict)
-                    else:
-                        elements[bid] = sp_dict
+                    if bid not in elements:
+                        elements[bid] = {}
+                    for sp, seq in sp_dict.items():
+                        if sp not in elements[bid]:
+                            elements[bid][sp] = seq
     else:
         for sp in species:
             chunk = _read_one_species((sp, args.results_dir))
             for bid, sp_dict in chunk.items():
-                if bid in elements:
-                    elements[bid].update(sp_dict)
-                else:
-                    elements[bid] = sp_dict
+                if bid not in elements:
+                    elements[bid] = {}
+                for sp, seq in sp_dict.items():
+                    if sp not in elements[bid]:
+                        elements[bid][sp] = seq
     t1 = time.time()
     print(f"Read {len(elements)} unique elements in {t1 - t0:.1f}s")
 
