@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CNEX — Conserved Non-coding Element Discovery Pipeline."""
-import argparse, glob, os, subprocess, sys
-from concurrent.futures import ThreadPoolExecutor
+import argparse, glob, os, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VALIDATE = os.path.join(ROOT, "bin", "validate")
@@ -66,30 +66,34 @@ def check_tree_deps():
 
 
 def process_one(genome, mers, out_dir, threads, trim, min_c=10,
-                vote_frac=0.1, vote_ratio=5.0, window_size=None, step_size=None, type_=None):
+                vote_frac=0.1, vote_ratio=5.0, window_size=None, step_size=None, type_=None, log_dir=None):
+    log_path = os.path.join(log_dir, genome_name(genome) + ".log") if log_dir else os.devnull
     os.makedirs(out_dir, exist_ok=True)
-    cmd = [VALIDATE, genome,
-           "--mers", mers,
-           "-t", str(threads),
-           "--output_dir", out_dir,
-           "--pigz", PIGZ,
-           "--min-c", str(min_c),
-           "--vote-frac", str(vote_frac),
-           "--vote-ratio", str(vote_ratio)]
+    log = open(log_path, "w")
+
+    val_cmd = [VALIDATE, genome, "--mers", mers, "-t", str(threads),
+               "--output_dir", out_dir, "--pigz", PIGZ,
+               "--min-c", str(min_c), "--vote-frac", str(vote_frac), "--vote-ratio", str(vote_ratio)]
     if type_:
-        cmd += ["--type", type_]
+        val_cmd += ["--type", type_]
     if window_size:
-        cmd += ["--window_size", str(window_size)]
+        val_cmd += ["--window_size", str(window_size)]
     if step_size:
-        cmd += ["--step_size", str(step_size)]
-    run(cmd)
+        val_cmd += ["--step_size", str(step_size)]
+    subprocess.run(val_cmd, stdout=log, stderr=log)
+
     asm_out = os.path.join(out_dir, "contigs.fa")
-    cmd = [ASSEMBLE, out_dir + "/",
-           "--mers", mers,
-           "-o", asm_out]
+    asm_cmd = [ASSEMBLE, out_dir + "/", "--mers", mers, "-o", asm_out]
     if trim:
-        cmd.append("--trim")
-    run(cmd)
+        asm_cmd.append("--trim")
+    result = subprocess.run(asm_cmd, stdout=log, stderr=log)
+    log.close()
+
+    contigs = 0
+    if os.path.exists(asm_out):
+        with open(asm_out) as f:
+            contigs = sum(1 for line in f if line.startswith(">"))
+    return contigs, result.returncode
 
 
 def cmd_validate(args):
@@ -143,29 +147,33 @@ def cmd_pipeline(args):
     mers = args.mers
     if args.cne:
         filtered = os.path.join(args.output_dir, "msa.filtered.fa")
-        cmd = ["python3", os.path.join(ROOT, "src", "00.filter_msa.py"),
-               args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered]
-        run(cmd)
+        subprocess.run(["python3", os.path.join(ROOT, "src", "00.filter_msa.py"),
+                        args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered])
         mers = os.path.join(args.output_dir, "mers_table.tsv")
-        cmd = ["python3", os.path.join(ROOT, "src", "01.confi_mer.py"),
-               filtered, "-k", "13", "-c", "4", "-o", mers]
-        run(cmd)
+        subprocess.run(["python3", os.path.join(ROOT, "src", "01.confi_mer.py"),
+                        filtered, "-k", "13", "-c", "4", "-o", mers])
 
     trim = not args.no_trim
 
+    n = len(genomes)
+    print(f"Processing {n} genome{'s' if n != 1 else ''} ({args.jobs} jobs, {args.threads} threads each)...")
+    log_dir = os.path.join(args.output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = []
+        futures = {}
         for genome in genomes:
             name = genome_name(genome)
             out = os.path.join(args.output_dir, name)
-            futures.append(pool.submit(
-                process_one, genome, mers, out, args.threads, trim,
-                args.min_c, args.vote_frac, args.vote_ratio,
-                args.window_size, args.step_size, args.type))
-        for f in futures:
-            exc = f.exception()
-            if exc:
-                print(f"  Error: {exc}", file=sys.stderr)
+            f = pool.submit(process_one, genome, mers, out, args.threads, trim,
+                            args.min_c, args.vote_frac, args.vote_ratio,
+                            args.window_size, args.step_size, args.type, log_dir)
+            futures[f] = name
+
+        for f in as_completed(futures):
+            contigs, rc = f.result()
+            status = "✓" if rc == 0 else "✗"
+            print(f"  {status}  {futures[f]:<30} {contigs:>6} contigs")
 
     check_tree_deps()
 
