@@ -2,59 +2,49 @@
 
 CNEX is a pipeline for fast identification of conserved non-coding elements (CNEs) from whole-genome sequences. It supports both sequencing reads and direct genome FASTA input with an ultra-fast sliding-window mode (~15 seconds for the human genome at 6X coverage).
 
-## Dependencies
-
-### Build & Runtime
-
-| Tool | Version | Purpose | Source |
-|------|---------|---------|--------|
-| g++ | 9+ (C++17) | Compile C++ binaries | gcc.gnu.org |
-| Python | 3.8+ | CLI and pipeline scripts | python.org |
-| pigz | 2.6+ | Parallel gzip decompression (bundled in `src/pigz/`) | [madler/pigz](https://github.com/madler/pigz) |
-| robin-map | — | C++ hash map (bundled in `src/robin-map/`) | [Tessil/robin-map](https://github.com/Tessil/robin-map) |
-
-### Phylogenetic Tools (optional — needed for steps 04-05)
-
-| Tool | Purpose | Default Path | Source |
-|------|---------|-------------|--------|
-| FAMSA | Multiple sequence alignment | `~/Software/famsa` | [github.com/refresh-bio/FAMSA](https://github.com/refresh-bio/FAMSA) |
-| FastTree | Gene tree inference | `~/Software/fasttree-2.2.0/FastTree` | [microbesonline.org/fasttree](http://www.microbesonline.org/fasttree/) |
-| ASTRAL | Species tree inference | `~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar` | [github.com/smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
-
-To check your setup:
-```bash
-cnex setup
-```
-
 ## Quick Start
 
-### Build
-
 ```bash
+# Clone — --recurse-submodules is required for robin-map
+git clone --recurse-submodules git@github.com:zoomlion/CNEX.git
+cd CNEX
+
+# If you already cloned without submodules, run this:
+# git submodule update --init
+
+# Build and install
 make && make install
+
+# Check your setup
+cnex setup
+
+# Run pipeline on a genome
+cnex pipeline genome.fa --mers mers_table.tsv --type genome -t 8 -o results/
 ```
 
-### Single Genome Pipeline
+## Examples
+
+### Single Genome
 
 ```bash
-# From a confident k-mer table (recommended — runs 02+03)
+# From a confident k-mer table (runs 02+03)
 cnex pipeline genome.fa --mers mers_table.tsv --type genome -t 8 -o results/
 
 # From raw MSA (runs 00+01 then 02+03)
 cnex pipeline genome.fa --cne most-cons-cne.fa -t 8 -o results/
 ```
 
-### Multi-Genome Pipeline
+### Multi-Genome
 
 ```bash
-# All genomes in a directory
+# Directory of genomes — parallel with -j
 cnex pipeline genomes/ --mers mers_table.tsv -j 4 -t 8 -o results/
 
 # Glob pattern
 cnex pipeline "genomes/*.fa" --mers mers_table.tsv -j 4 -t 8 -o results/
 
-# Each genome gets its own subdirectory under results/
-# results/sp1/contigs.fa  results/sp2/contigs.fa  results/sp3/contigs.fa
+# Each genome gets its own subdirectory:
+# results/Homo_sapiens/contigs.fa  results/Mus_musculus/contigs.fa
 ```
 
 ### Step-by-Step
@@ -65,6 +55,53 @@ cnex validate genome.fa --mers mers_table.tsv --type genome -t 8 -o out/
 
 # Assemble validated reads into contigs
 cnex assemble out/ --mers mers_table.tsv --trim
+```
+
+## Dependencies
+
+### Build & Runtime
+
+| Tool | Version | Purpose | Source |
+|------|---------|---------|--------|
+| g++ | 9+ (C++17) | Compile C++ binaries | gcc.gnu.org |
+| Python | 3.8+ | CLI and pipeline scripts | python.org |
+| pigz | 2.6+ | Parallel gzip decompression (bundled in `src/pigz/`) | [madler/pigz](https://github.com/madler/pigz) |
+| robin-map | — | C++ hash map (git submodule, bundled in `src/robin-map/`) | [Tessil/robin-map](https://github.com/Tessil/robin-map) |
+
+### Phylogenetic Tools (optional — needed for steps 04-05)
+
+| Tool | Purpose | Default Path | Source |
+|------|---------|-------------|--------|
+| FAMSA | Multiple sequence alignment | `~/Software/famsa` | [refresh-bio/FAMSA](https://github.com/refresh-bio/FAMSA) |
+| FastTree | Gene tree inference | `~/Software/fasttree-2.2.0/FastTree` | [microbesonline.org/fasttree](http://www.microbesonline.org/fasttree/) |
+| ASTRAL | Species tree inference | `~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar` | [smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
+
+## Input Formats
+
+Supports plain text and gzip-compressed files:
+
+- **FASTQ** (`.fq`, `.fq.gz`, `.fastq`, `.fastq.gz`) — sequencing reads
+- **FASTA** (`.fa`, `.fa.gz`, `.fasta`) — genome sequences (auto-detected)
+
+## Output
+
+### Validate Output (`Assemble.*.reads`)
+
+Tab-separated, 4 columns:
+
+```
+<seq_id>  <strand>  <ele_id>  <sequence>
+```
+
+In genome mode, `seq_id` encodes genomic coordinates: `chr:start-end`.
+
+### Assemble Output (`contigs.fa`)
+
+FASTA with one entry per element. In genome mode, the header includes the best locus.
+
+```
+>ele_id
+...sequence...
 ```
 
 ## CLI Reference
@@ -109,6 +146,18 @@ usage: cnex validate [-h] --mers MERS [-t THREADS] [-o OUTPUT_DIR]
                      files [files ...]
 ```
 
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--mers` | — | Confident k-mer table (required) |
+| `-t, --threads` | 8 | Worker threads |
+| `-o, --output-dir` | `out` | Output directory |
+| `--type` | auto | Input type: `genome` or `fastq` |
+| `--min-c` | 10 | Minimum colinear k-mer matches |
+| `--vote-frac` | 0.1 | Minimum vote fraction |
+| `--vote-ratio` | 5.0 | Minimum vote ratio (1st/2nd) |
+| `--window-size` | 150 | Sliding window size (genome mode) |
+| `--step-size` | 25 | Sliding window step (genome mode, ~6X) |
+
 ### `cnex assemble`
 
 De Bruijn assembly from validated reads.
@@ -120,36 +169,21 @@ usage: cnex assemble [-h] --mers MERS [-o OUTPUT] [-k KMER] [--min-c MIN_C]
                      input_dir
 ```
 
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--mers` | — | Confident k-mer table (required) |
+| `-o, --output` | `assembled.fasta` | Output FASTA |
+| `-k, --kmer` | 35 | K-mer length |
+| `--min-c` | 3 | Minimum k-mer matches for validation |
+| `--trim` | on | Trim contigs to confident region |
+| `--max-loci-gap` | 5000 | Max gap (bp) for locus clustering |
+
 ### `cnex setup`
 
 Check that all binaries and optional phylogenetic tools are available.
 
-## Input Formats
-
-Supports plain text and gzip-compressed files:
-
-- **FASTQ** (`.fq`, `.fq.gz`, `.fastq`, `.fastq.gz`) — sequencing reads
-- **FASTA** (`.fa`, `.fa.gz`, `.fasta`) — genome sequences (auto-detected)
-
-## Output
-
-### Validate Output (`Assemble.*.reads`)
-
-Tab-separated, 4 columns:
-
 ```
-<seq_id>  <strand>  <ele_id>  <sequence>
-```
-
-In genome mode, `seq_id` encodes genomic coordinates: `chr:start-end`.
-
-### Assemble Output (`contigs.fa`)
-
-FASTA with one entry per element. In genome mode, the header includes the best locus.
-
-```
->ele_id
-...sequence...
+cnex setup
 ```
 
 ## Pipeline Steps
