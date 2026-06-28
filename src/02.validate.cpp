@@ -2,8 +2,8 @@
 //
 // Copyright (c) 2024 JiangminZheng
 //
-// 02.assembler - Standalone C++ read assembler for confident k-mer validation
-// Replaces 02.assembler_hybrid.py with a fully native implementation
+// 02.validate - Standalone C++ k-mer validator for read/genome CNE matching
+// Replaces the Python hybrid prototype with a fully native implementation
 // Streaming pipeline: reader thread + worker thread pool
 
 #include <hip/validator_core.hpp>
@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +29,8 @@
 namespace fs = std::filesystem;
 
 struct Args {
+    enum class InputType { AUTO, GENOME, FASTQ };
+
     std::vector<std::string> reads_files;
     std::string mers_file;
     std::string output_dir = "out";
@@ -35,12 +38,13 @@ struct Args {
     int threads = 4;
     int chunk_size = 10000;
     int window_size = 150;
-    int step_size = 50;
+    int step_size = 25;
     std::string pigz_path = "pigz/pigz";
-    int min_c = 5;
+    int min_c = 10;
     double vote_frac = 0.1;
-    double vote_ratio = 3.0;
+    double vote_ratio = 5.0;
     bool help_requested = false;
+    InputType input_type = InputType::AUTO;
 };
 
 struct Read {
@@ -49,12 +53,15 @@ struct Read {
     std::string qua;
 };
 
-// Thread-safe chunk queue (bounded by available memory)
+// Thread-safe chunk queue with backpressure (max_size chunks in memory)
 
 class ChunkQueue {
 public:
+    explicit ChunkQueue(size_t max_size = 100) : max_size_(max_size) {}
+
     void push(std::vector<Read> chunk) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return queue_.size() < max_size_; });
         queue_.push(std::move(chunk));
         cv_.notify_one();
     }
@@ -65,6 +72,7 @@ public:
         if (!queue_.empty()) {
             chunk = std::move(queue_.front());
             queue_.pop();
+            cv_.notify_one();
             return true;
         }
         return false;
@@ -81,6 +89,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     bool done_ = false;
+    size_t max_size_;
 };
 
 // Returns true if path ends with .gz
@@ -183,7 +192,8 @@ void reader_thread(const std::vector<std::string>& files,
                    int step_size,
                    int64_t depth,
                    const std::string& pigz_path,
-                   std::atomic<int64_t>& total_reads) {
+                   std::atomic<int64_t>& total_reads,
+                   Args::InputType input_type) {
     int64_t count = 0;
 
     auto flush_chunk = [&](std::vector<Read>& chunk) {
@@ -195,7 +205,15 @@ void reader_thread(const std::vector<std::string>& files,
     };
 
     for (const auto& file : files) {
-        auto type = detect_file_type(file, pigz_path);
+        FileType type;
+        if (input_type == Args::InputType::GENOME) {
+            type = FileType::FASTA;
+        } else if (input_type == Args::InputType::FASTQ) {
+            type = FileType::FASTQ;
+        } else {
+            type = detect_file_type(file, pigz_path);
+        }
+
         if (type == FileType::FASTQ) {
             BufferedLineReader reader(file, pigz_path);
             std::string line;
@@ -377,6 +395,12 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--step_size" || arg == "-s") {
             if (++i >= argc) throw std::runtime_error("Missing value for --step_size");
             args.step_size = std::stoi(argv[i]);
+        } else if (arg == "--type") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --type");
+            std::string type = argv[i];
+            if (type == "genome") args.input_type = Args::InputType::GENOME;
+            else if (type == "fastq") args.input_type = Args::InputType::FASTQ;
+            else throw std::runtime_error("Unknown --type: " + type + " (use genome|fastq)");
         } else if (arg == "--pigz") {
             if (++i >= argc) throw std::runtime_error("Missing value for --pigz");
             args.pigz_path = argv[i];
@@ -407,25 +431,32 @@ int main(int argc, char* argv[]) {
 
         if (args.help_requested || args.reads_files.empty()) {
             std::cerr << "Usage: " << argv[0]
-                      << " <reads_files...> --mers <mers_table> [options]\n"
+                      << " <input_files...> --mers <mers_table> [options]\n"
                       << "\nOptions:\n"
                       << "  --mers <file>         TSV mers table (required)\n"
-                      << "  --depth <n>           Max reads to process (default: 200M)\n"
+                      << "  --type genome|fastq   Input type: genome (sliding-window FASTA) or\n"
+                      << "                        fastq (reads). Auto-detected if omitted.\n"
+                      << "  --depth <n>           Max reads/pseudo-reads to process (default: 200M)\n"
                       << "  -t, --threads <n>     Number of threads (default: 4)\n"
                       << "  --output_dir <dir>    Output directory (default: out)\n"
                       << "  --chunk_size <n>      Reads per chunk (default: 10000)\n"
-                      << "  --window_size <n>     FASTA window size (default: 150)\n"
-                      << "  --step_size <n>       FASTA step size (default: 50)\n"
+                      << "  --window_size <n>     Genome sliding window size (default: 150)\n"
+                      << "  --step_size <n>       Genome sliding window step (default: 25, ~6X coverage)\n"
                       << "  --pigz <path>         pigz binary path (default: pigz/pigz)\n"
-                      << "  --min-c <n>           min consecutive colinear k-mer matches (default: 5)\n"
+                      << "  --min-c <n>           min consecutive colinear k-mer matches (default: 10)\n"
                       << "  --vote-frac <f>       min fraction of k-mers for top CNE vote (default: 0.1)\n"
-                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 3.0)\n";
+                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 5.0)\n";
             return 1;
         }
 
         if (args.mers_file.empty()) {
             std::cerr << "Error: --mers is required\n";
             return 1;
+        }
+
+        // Genome mode: process all windows (no depth limit)
+        if (args.input_type == Args::InputType::GENOME) {
+            args.depth = std::numeric_limits<int64_t>::max();
         }
 
         // Load mers table
@@ -468,7 +499,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Reading and processing reads ...\n";
         std::thread reader(reader_thread, std::cref(args.reads_files), std::ref(queue),
                            args.chunk_size, args.window_size, args.step_size,
-                           args.depth, std::cref(args.pigz_path), std::ref(total_reads));
+                           args.depth, std::cref(args.pigz_path), std::ref(total_reads),
+                           args.input_type);
 
         // Wait for reader to finish (all chunks in queue)
         reader.join();

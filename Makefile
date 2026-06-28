@@ -1,4 +1,4 @@
-# Mercury Pipeline Makefile
+# CNEX Pipeline Makefile
 #   make reads  - generate 3X simulated reads
 #   make 01     - build confident k-mer table
 #   make 02     - validate reads or genome (parallel: make -j 5 02)
