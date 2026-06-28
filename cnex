@@ -56,7 +56,7 @@ def tree_deps():
          "https://github.com/refresh-bio/FAMSA"),
         ("FastTree", os.path.expanduser("~/Software/fasttree-2.2.0/FastTree"),
          "http://www.microbesonline.org/fasttree/"),
-        ("ASTRAL",  os.path.expanduser("~/Software/ASTRAL-5.7.1/astral_exe/astral.5.7.1.jar"),
+        ("ASTRAL",  os.path.expanduser("~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar"),
          "https://github.com/smirarab/ASTRAL"),
     ]
 
