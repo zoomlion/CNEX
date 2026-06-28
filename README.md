@@ -12,7 +12,7 @@ cd CNEX
 # If you already cloned without submodules, run this:
 # git submodule update --init
 
-# Build and install
+# Build all C++ binaries in one step
 make && make install
 
 # Check your setup
@@ -63,8 +63,8 @@ cnex assemble out/ --mers mers_table.tsv --trim
 
 | Tool | Version | Purpose | Source |
 |------|---------|---------|--------|
-| g++ | 9+ (C++17) | Compile C++ binaries | gcc.gnu.org |
-| Python | 3.8+ | CLI and pipeline scripts | python.org |
+| g++ | 9+ (C++17) | Compile C++ binaries (mertable, validate, assemble) | gcc.gnu.org |
+| Python | 3.8+ | CLI and pipeline helper scripts | python.org |
 | pigz | 2.6+ | Parallel gzip decompression (bundled in `src/pigz/`) | [madler/pigz](https://github.com/madler/pigz) |
 | robin-map | — | C++ hash map (git submodule, bundled in `src/robin-map/`) | [Tessil/robin-map](https://github.com/Tessil/robin-map) |
 
@@ -191,7 +191,7 @@ cnex setup
 | Step | Script/Binary | Description |
 |------|--------------|-------------|
 | 00 | `00.filter_msa.py` | Filter MSA blocks (invoked by `pipeline --cne`) |
-| 01 | `01.confi_mer.py` | Build confident k-mer table (invoked by `pipeline --cne`) |
+| 01 | `mertable` (C++) | Build confident k-mer table (invoked by `pipeline --cne`) |
 | 02 | `validate` (C++) | k-mer validation (reads or genome FASTA sliding window) |
 | 03 | `assemble` (C++) | De Bruijn assembly (per-locus best pick for genome mode) |
 | 04 | `04.map_contig_to_element.py` | Group contigs by CNE element |
