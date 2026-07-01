@@ -1,6 +1,6 @@
 # CNEX — Conserved Non-coding Element Discovery
 
-CNEX is a pipeline for fast identification of conserved non-coding elements (CNEs) from whole-genome sequences. It supports both sequencing reads and direct genome FASTA input with an ultra-fast sliding-window mode (~15 seconds for the human genome at 6X coverage).
+CNEX is a pipeline for fast identification of conserved non-coding elements (CNEs) from whole-genome sequences. It supports both sequencing reads and direct genome FASTA input with an ultra-fast sliding-window mode (~3 minutes for the human genome at 6X coverage, 16 threads).
 
 ## Quick Start
 
