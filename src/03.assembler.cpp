@@ -19,7 +19,7 @@ struct Args {
     std::string input_dir;
     std::string mers_file;
     std::string output = "assembled.fasta";
-    int kmer = 35;
+    int kmer = 21;
     int min_c = 3;
     int min_count = 2;
     int max_reads = 200;
@@ -400,7 +400,6 @@ int main(int argc, char* argv[]) {
 
                 if (args.trim) trim_contig(contig, mqm, cur_ele);
                 if (contig.size() < 20) continue;
-                if (!filter_contig(contig, mqm, mer_size, cur_ele, args.min_c)) continue;
 
                 results.emplace_back(std::to_string(cur_ele), contig);
             } else {
@@ -463,7 +462,7 @@ int main(int argc, char* argv[]) {
                         std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele);
                         if (!contig.empty()) {
                             if (args.trim) trim_contig(contig, mqm, cur_ele);
-                            if (contig.size() >= 20 && filter_contig(contig, mqm, mer_size, cur_ele, args.min_c)) {
+                            if (contig.size() >= 20) {
                                 int sc = score_contig(contig, mqm, cur_ele);
                                 char s = cluster[0].first.strand == 1 ? '+' : '-';
                                 std::string did = std::to_string(cur_ele) + "." +
@@ -494,7 +493,7 @@ int main(int argc, char* argv[]) {
                     std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele);
                     if (!contig.empty()) {
                         if (args.trim) trim_contig(contig, mqm, cur_ele);
-                        if (contig.size() >= 20 && filter_contig(contig, mqm, mer_size, cur_ele, args.min_c)) {
+                        if (contig.size() >= 20) {
                             int sc = score_contig(contig, mqm, cur_ele);
                             char s = cluster[0].first.strand == 1 ? '+' : '-';
                             std::string did = std::to_string(cur_ele) + "." +

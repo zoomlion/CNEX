@@ -39,3 +39,12 @@ bin/
 validate
 assemble
 mertable
+
+# Benchmark
+benchmark/
+ipynb/
+most-cons-cne.fa
+most-cons-cne.filtered.fa
+shell/probe_test.py
+shell/simu_one.sh
+shell/wgsim_gen.sh
