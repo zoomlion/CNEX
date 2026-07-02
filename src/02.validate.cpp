@@ -40,9 +40,9 @@ struct Args {
     int window_size = 150;
     int step_size = 25;
     std::string pigz_path = "pigz/pigz";
-    int min_c = 10;
+    int min_c = 7;
     double vote_frac = 0.1;
-    double vote_ratio = 5.0;
+    double vote_ratio = 3.0;
     bool help_requested = false;
     InputType input_type = InputType::AUTO;
 };
@@ -443,9 +443,9 @@ int main(int argc, char* argv[]) {
                       << "  --window_size <n>     Genome sliding window size (default: 150)\n"
                       << "  --step_size <n>       Genome sliding window step (default: 25, ~6X coverage)\n"
                       << "  --pigz <path>         pigz binary path (default: pigz/pigz)\n"
-                      << "  --min-c <n>           min consecutive colinear k-mer matches (default: 10)\n"
+                      << "  --min-c <n>           min consecutive colinear k-mer matches (default: 7)\n"
                       << "  --vote-frac <f>       min fraction of k-mers for top CNE vote (default: 0.1)\n"
-                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 5.0)\n";
+                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 3.0)\n";
             return 1;
         }
 
