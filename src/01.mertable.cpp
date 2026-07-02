@@ -13,6 +13,7 @@ struct Args {
     std::string msa_file;
     int k = 13;
     int min_c = 4;
+    float min_entropy = 1.2f;
     std::string output = "mers_table.tsv";
     bool help_requested = false;
 };
@@ -31,6 +32,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "-c" || arg == "--min-c") {
             if (++i >= argc) throw std::runtime_error("Missing value for -c");
             args.min_c = std::stoi(argv[i]);
+        } else if (arg == "--min-entropy") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --min-entropy");
+            args.min_entropy = std::stof(argv[i]);
         } else if (arg == "-o" || arg == "--output") {
             if (++i >= argc) throw std::runtime_error("Missing value for -o");
             args.output = argv[i];
@@ -150,6 +154,7 @@ int main(int argc, char* argv[]) {
                       << "\nOptions:\n"
                       << "  -k, --mer-size <n>    K-mer size (default: 13)\n"
                       << "  -c, --min-c <n>       Minimum species count (default: 4)\n"
+                      << "  --min-entropy <f>     Minimum k-mer entropy (default: 1.2)\n"
                       << "  -o, --output <file>    Output TSV (default: mers_table.tsv)\n";
             return 1;
         }
@@ -162,13 +167,18 @@ int main(int argc, char* argv[]) {
         std::cerr << "  Total bunches: " << bunches.size() << "\n";
 
         TableMer mertable(args.k);
-        mertable.set_min_entropy(1.4f);
+        mertable.set_min_entropy(args.min_entropy);
 
         for (size_t bunch_id = 0; bunch_id < bunches.size(); ++bunch_id) {
             if (bunch_id % 100 == 0)
                 std::cerr << "\r  Processing bunch " << (bunch_id + 1) << "/" << bunches.size();
             auto fas = bunch2fas(bunches[bunch_id]);
-            if ((int)fas.size() < args.min_c + 1) continue;
+            // Count real species (excluding ref)
+            int real_species = 0;
+            for (const auto& [header, _] : fas) {
+                if (header.size() < 3 || header.substr(0, 3) != "ref") real_species++;
+            }
+            if (real_species < args.min_c) continue;
 
             // Track (mer -> (bunch_id, loci)) pairs
             std::unordered_map<std::string, std::vector<std::pair<int, int>>> local_affi;
