@@ -179,31 +179,13 @@ inline std::pair<int, int> validate_read(
     const std::string& seq,
     const MerQueryManager& compressed_mer_query,
     int mer_size,
-    int min_c,
+    int min_c = 7,
+    int max_diff = 2,
+    int min_span = 25,
+    int target_ele_id = -1,
     double vote_frac = 0.1,
     double vote_ratio = 3.0)
 {
-    auto is_sorted = [](const std::vector<int>& lst) {
-        return std::is_sorted(lst.begin(), lst.end());
-    };
-
-    auto is_pattern_gapped = [](
-        const std::vector<int>& lst1,
-        const std::vector<int>& lst2,
-        const int min_c,
-        const int max_g = 1) {
-        if (static_cast<int>(lst1.size()) < min_c) {
-            return false;
-        }
-        int count = 0;
-        for (size_t i = 0; i < lst1.size() - 1; ++i) {
-            if (std::abs(std::abs(lst1[i + 1] - lst1[i]) - std::abs(lst2[i + 1] - lst2[i])) <= max_g) {
-                if (++count >= min_c) return true;
-            }
-        }
-        return false;
-    };
-
     thread_local std::vector<int> match_ids;
     thread_local std::vector<int> match_starts;
     thread_local std::vector<int> match_loci;
@@ -222,7 +204,7 @@ inline std::pair<int, int> validate_read(
             return {-1, 0};
         }
 
-        // Rolling hash: O(1) per position instead of O(k) per position
+        // Rolling hash: O(1) per position
         static auto base_lookup = [] {
             std::array<int8_t, 256> t{};
             t.fill(-1);
@@ -252,18 +234,22 @@ inline std::pair<int, int> validate_read(
                 auto it = compressed_mer_query.compressed_mer_query.find(rolling);
                 if (it != compressed_mer_query.compressed_mer_query.end()) {
                     auto [id, loci] = it->second;
-                    match_ids.push_back(id);
-                    match_starts.push_back(start);
-                    match_loci.push_back(static_cast<int>(loci));
+                    if (target_ele_id == -1 || id == target_ele_id) {
+                        match_ids.push_back(id);
+                        match_starts.push_back(start);
+                        match_loci.push_back(static_cast<int>(loci));
+                    }
                 }
             }
         }
 
-        int confi_id = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
-        if (confi_id == -1) {
-            return {-1, 0};
-        }
+        if (match_ids.empty()) return {-1, 0};
 
+        // Vote for the most frequent ele_id
+        int confi_id = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
+        if (confi_id == -1) return {-1, 0};
+
+        // Filter hits for the winning ele_id only
         seq_positions.clear();
         loci_positions.clear();
         size_t n = match_ids.size();
@@ -274,9 +260,21 @@ inline std::pair<int, int> validate_read(
             }
         }
 
-        if (is_pattern_gapped(seq_positions, loci_positions, min_c) && is_sorted(loci_positions)) {
-            return {confi_id, static_cast<int>(n)};
+        // Check adjacent pair spacing consistency (preserves sign, implies monotonicity)
+        size_t m = seq_positions.size();
+        int passing = 0;
+        for (size_t i = 1; i < m; ++i) {
+            int gap_read = seq_positions[i] - seq_positions[i - 1];
+            int gap_loci = loci_positions[i] - loci_positions[i - 1];
+            if (std::abs(gap_read - gap_loci) <= max_diff)
+                passing++;
         }
+
+        // Check read span coverage
+        int span = seq_positions.back() - seq_positions.front() + mer_size;
+
+        if (passing >= min_c && span >= min_span)
+            return {confi_id, static_cast<int>(n)};
 
         return {-1, 0};
     };
