@@ -28,13 +28,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="Element phylogeny: famsa + fasttree + astral")
     p.add_argument("--elements-dir", default="results/fasta",
                    help="Directory with per-element FASTAs (default: results/fasta)")
-    p.add_argument("--famsa", default="~/Software/famsa",
-                   help="Path to famsa binary")
-    p.add_argument("--fasttree", default="~/Software/fasttree-2.2.0/FastTree",
-                   help="Path to FastTree binary")
-    p.add_argument("--astral-bin", default="~/Software/bin/astral",
-                   help="Path to ASTRAL IV / ASTER native binary (default: ~/Software/bin/astral)")
-    p.add_argument("--astral-dir", default="~/Software/ASTRAL-5.7.1/astral_exe/Astral",
+    p.add_argument("--famsa", default="famsa",
+                   help="Path to famsa binary (default: famsa, searched in PATH)")
+    p.add_argument("--fasttree", default="FastTree",
+                   help="Path to FastTree binary (default: FastTree, searched in PATH)")
+    p.add_argument("--astral-bin", default="astral",
+                   help="Path to ASTRAL IV / ASTER native binary (default: astral, searched in PATH)")
+    p.add_argument("--astral-dir", default="",
                    help="Path to ASTRAL III directory (used only if --astral-bin not found)")
     p.add_argument("--astral-jar", default="",
                    help="Path to ASTRAL III jar (overrides --astral-dir)")

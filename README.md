@@ -72,10 +72,10 @@ cnex assemble out/ --mers mers_table.tsv --trim
 
 | Tool | Purpose | Default Path | Source |
 |------|---------|-------------|--------|
-| FAMSA | Multiple sequence alignment | `~/Software/famsa` | [refresh-bio/FAMSA](https://github.com/refresh-bio/FAMSA) |
-| FastTree | Gene tree inference | `~/Software/fasttree-2.2.0/FastTree` | [microbesonline.org/fasttree](http://www.microbesonline.org/fasttree/) |
-| ASTRAL IV (ASTER) | Species tree inference (**recommended**) | `~/Software/bin/astral` | [chaoszhang/ASTER](https://github.com/chaoszhang/ASTER) |
-| ASTRAL III | Species tree inference (fallback) | `~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar` | [smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
+| FAMSA | Multiple sequence alignment | `famsa` (via PATH or `--famsa`) | [refresh-bio/FAMSA](https://github.com/refresh-bio/FAMSA) |
+| FastTree | Gene tree inference | `FastTree` (via PATH or `--fasttree`) | [microbesonline.org/fasttree](http://www.microbesonline.org/fasttree/) |
+| ASTRAL IV (ASTER) | Species tree inference (**recommended**) | `astral` (via PATH or `--astral-bin`) | [chaoszhang/ASTER](https://github.com/chaoszhang/ASTER) |
+| ASTRAL III | Species tree inference (fallback) | (not set, use `--astral-jar`) | [smirarab/ASTRAL](https://github.com/smirarab/ASTRAL) |
 
 ## Input Formats
 
@@ -131,9 +131,9 @@ Input can be a directory, individual files, or glob patterns.
 | `-o, --output-dir` | `out` | Output root directory |
 | `--type` | auto | Input type: `genome` or `fastq` |
 | `--no-trim` | — | Disable contig trimming (on by default) |
-| `--min-c` | 10 | Minimum colinear k-mer matches |
+| `--min-c` | 7 | Minimum colinear k-mer matches |
 | `--vote-frac` | 0.1 | Minimum vote fraction |
-| `--vote-ratio` | 5.0 | Minimum vote ratio |
+| `--vote-ratio` | 3.0 | Minimum vote ratio |
 
 ### `cnex validate`
 

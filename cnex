@@ -52,13 +52,13 @@ def check_binaries():
 
 def tree_deps():
     return [
-        ("FAMSA",   os.path.expanduser("~/Software/famsa"),
+        ("FAMSA",     "famsa",
          "https://github.com/refresh-bio/FAMSA"),
-        ("FastTree", os.path.expanduser("~/Software/fasttree-2.2.0/FastTree"),
+        ("FastTree",  "FastTree",
          "http://www.microbesonline.org/fasttree/"),
-        ("ASTRAL IV", os.path.expanduser("~/Software/bin/astral"),
+        ("ASTRAL IV", "astral",
          "https://github.com/chaoszhang/ASTER"),
-        ("ASTRAL III", os.path.expanduser("~/Software/ASTRAL-5.7.1/astral_exe/Astral/astral.5.7.1.jar"),
+        ("ASTRAL III","",
          "https://github.com/smirarab/ASTRAL"),
     ]
 
@@ -71,8 +71,9 @@ def check_tree_deps():
               + "\n".join(missing) + "\n", file=sys.stderr)
 
 
-def process_one(genome, mers, base_dir, threads, trim, min_c=10,
-                vote_frac=0.1, vote_ratio=5.0, window_size=None, step_size=None, type_=None, log_dir=None):
+def process_one(genome, mers, base_dir, threads, trim, min_c=7,
+                vote_frac=0.1, vote_ratio=3.0, window_size=None, step_size=None, type_=None, log_dir=None,
+                keep_validate=False):
     name = genome_name(genome)
     val_dir = os.path.join(base_dir, "assemble", name)
     os.makedirs(val_dir, exist_ok=True)
@@ -96,6 +97,11 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=10,
         asm_cmd.append("--trim")
     result = subprocess.run(asm_cmd, stdout=log, stderr=log)
     log.close()
+
+    if not keep_validate:
+        import glob
+        for f in glob.glob(os.path.join(val_dir, "Assemble.*.reads")):
+            os.remove(f)
 
     contigs = 0
     if os.path.exists(asm_out):
@@ -174,7 +180,8 @@ def cmd_pipeline(args):
             name = genome_name(genome)
             f = pool.submit(process_one, genome, mers, args.output_dir, args.threads, trim,
                             args.min_c, args.vote_frac, args.vote_ratio,
-                            args.window_size, args.step_size, args.type, log_dir)
+                            args.window_size, args.step_size, args.type, log_dir,
+                            keep_validate=getattr(args, 'keep_validate', False))
             futures[f] = name
 
         for f in as_completed(futures):
@@ -199,9 +206,9 @@ def main():
     p_val.add_argument("-o", "--output-dir", default="out", help="Output directory (default: out)")
     p_val.add_argument("--type", choices=["genome", "fastq"],
                        help="Input type (auto-detected if omitted)")
-    p_val.add_argument("--min-c", type=int, default=10, help="Min colinear k-mer matches (default: 10)")
+    p_val.add_argument("--min-c", type=int, default=7, help="Min colinear k-mer matches (default: 7)")
     p_val.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
-    p_val.add_argument("--vote-ratio", type=float, default=5.0, help="Vote ratio (default: 5.0)")
+    p_val.add_argument("--vote-ratio", type=float, default=3.0, help="Vote ratio (default: 3.0)")
     p_val.add_argument("--window-size", type=int, help="Genome sliding window size (default: 150)")
     p_val.add_argument("--step-size", type=int, help="Genome sliding window step (default: 25)")
 
@@ -235,9 +242,11 @@ def main():
                         help="Input type (auto-detected if omitted)")
     p_pipe.add_argument("--window-size", type=int, help="Sliding window size (default: 150)")
     p_pipe.add_argument("--step-size", type=int, help="Sliding window step (default: 25)")
-    p_pipe.add_argument("--min-c", type=int, default=10, help="Min colinear k-mer matches (default: 10)")
+    p_pipe.add_argument("--min-c", type=int, default=7, help="Min colinear k-mer matches (default: 7)")
     p_pipe.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
-    p_pipe.add_argument("--vote-ratio", type=float, default=5.0, help="Vote ratio (default: 5.0)")
+    p_pipe.add_argument("--vote-ratio", type=float, default=3.0, help="Vote ratio (default: 3.0)")
+    p_pipe.add_argument("--keep-validate", action="store_true",
+                        help="Keep intermediate validate output (Assemble.*.reads)")
 
     # ─── setup ───
     p_setup = sub.add_parser("setup", help="Check dependencies and build instructions")
