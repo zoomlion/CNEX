@@ -75,9 +75,7 @@ inline void reverse_complement(const std::string& dna, std::string& out) {
     }
 }
 
-inline std::string reverse_complement(const std::string& dna) {
-    std::string r; reverse_complement(dna, r); return r;
-}
+
 
 
 inline int findFrequentWithMap(const std::vector<int>& nums, double vote_frac=0.1, double vote_ratio=3.0) {

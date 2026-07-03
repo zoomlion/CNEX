@@ -383,7 +383,9 @@ int main(int argc, char* argv[]) {
                     const auto& r = all_reads[idx];
                     std::string local_seq = r.seq;
                     if (r.strand == -1) {
-                        local_seq = reverse_complement(local_seq);
+                        thread_local std::string _rc;
+                        reverse_complement(local_seq, _rc);
+                        local_seq = _rc;
                     }
                     for (char& c : local_seq) {
                         if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
@@ -411,7 +413,9 @@ int main(int argc, char* argv[]) {
                     auto& r = all_reads[idx];
                     std::string local_seq = r.seq;
                     if (r.strand == -1) {
-                        local_seq = reverse_complement(local_seq);
+                        thread_local std::string _rc;
+                        reverse_complement(local_seq, _rc);
+                        local_seq = _rc;
                     }
                     for (char& c : local_seq) {
                         if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
