@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CNEX — Conserved Non-coding Element Discovery Pipeline."""
-import argparse, glob, os, subprocess, sys, time
+import argparse, glob, os, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -274,7 +274,7 @@ def main():
 
         print("CNEX Environment Setup\n")
         for name, path, hint in items:
-            ok = os.path.exists(path)
+            ok = os.path.exists(path) or (path and shutil.which(path))
             mark = "✓" if ok else " "
             print(f"  [{mark}] {name:<12} {path}")
             if not ok and hint:
