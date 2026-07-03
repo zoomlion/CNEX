@@ -39,7 +39,7 @@ def find_genomes(paths, type_=None):
 
 def genome_name(path):
     if os.path.isdir(path):
-        return os.path.basename(path).rstrip("/")
+        return os.path.basename(path.rstrip("/"))
     name = os.path.basename(path)
     for ext in GENOME_EXTS:
         if name.endswith(ext):
