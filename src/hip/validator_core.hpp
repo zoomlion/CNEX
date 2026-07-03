@@ -60,7 +60,7 @@ inline bool encode_mer_at(const std::string& seq, size_t pos, size_t k, uint32_t
 }
 
 
-inline std::string reverse_complement(const std::string& dna) {
+inline void reverse_complement(const std::string& dna, std::string& out) {
     static const std::array<char, 256> complement = [] {
         std::array<char, 256> table = {};
         table['A'] = 'T'; table['T'] = 'A';
@@ -68,12 +68,15 @@ inline std::string reverse_complement(const std::string& dna) {
         return table;
     }();
 
-    std::string result;
-    result.reserve(dna.length());
+    out.clear();
+    out.reserve(dna.length());
     for (auto it = dna.rbegin(); it != dna.rend(); ++it) {
-        result.push_back(complement[(unsigned char)*it]);
+        out.push_back(complement[(unsigned char)*it]);
     }
-    return result;
+}
+
+inline std::string reverse_complement(const std::string& dna) {
+    std::string r; reverse_complement(dna, r); return r;
 }
 
 
@@ -278,8 +281,9 @@ inline std::pair<int, int> validate_read(
 
     auto [forward_id, forward_count] = validate_chain(seq);
 
-    std::string rev_comp = reverse_complement(seq);
-    auto [reverse_id, reverse_count] = validate_chain(rev_comp);
+    thread_local std::string _rc_buf;
+    reverse_complement(seq, _rc_buf);
+    auto [reverse_id, reverse_count] = validate_chain(_rc_buf);
 
     if (forward_id == -1 && reverse_id == -1) {
         return {-1, 0};
