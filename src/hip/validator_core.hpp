@@ -245,11 +245,10 @@ inline std::pair<int, int> validate_read(
 
         if (match_ids.empty()) return {-1, 0};
 
-        // Vote for the most frequent ele_id
+        // ─── Vote + filtered check ───
         int confi_id = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
         if (confi_id == -1) return {-1, 0};
 
-        // Filter hits for the winning ele_id only
         seq_positions.clear();
         loci_positions.clear();
         size_t n = match_ids.size();
@@ -260,7 +259,6 @@ inline std::pair<int, int> validate_read(
             }
         }
 
-        // Check adjacent pair spacing consistency (preserves sign, implies monotonicity)
         size_t m = seq_positions.size();
         int passing = 0;
         for (size_t i = 1; i < m; ++i) {
@@ -270,7 +268,6 @@ inline std::pair<int, int> validate_read(
                 passing++;
         }
 
-        // Check read span coverage
         int span = seq_positions.back() - seq_positions.front() + mer_size;
 
         if (passing >= min_c && span >= min_span)
