@@ -113,7 +113,6 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
     log.close()
 
     if not keep_validate:
-        import glob
         for f in glob.glob(os.path.join(val_dir, "Assemble.*.reads")):
             os.remove(f)
 
