@@ -16,26 +16,31 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
-def find_genomes(paths):
+def find_genomes(paths, type_=None):
     files = []
     for p in paths:
         if os.path.isdir(p):
-            for ext in GENOME_EXTS:
-                files.extend(glob.glob(os.path.join(p, "*" + ext)))
+            if type_ == "fastq":
+                # FASTQ mode: directory = one sample (all .fq files inside)
+                files.append(p)
+            else:
+                # Genome mode: scan for FASTA files inside
+                for ext in GENOME_EXTS:
+                    files.extend(glob.glob(os.path.join(p, "*" + ext)))
         else:
-            files.extend(glob.glob(p))
+            files.append(p)
     return sorted(set(files))
 
 
 def genome_name(path):
+    if os.path.isdir(path):
+        return os.path.basename(path).rstrip("/")
     name = os.path.basename(path)
     for ext in GENOME_EXTS:
         if name.endswith(ext):
             name = name[:-len(ext)]
             break
-    # Take the first part before any dot for cleaner names
     first = name.split(".")[0]
-    # If the split gives a too-short name, use the original
     return first if len(first) >= 3 else name
 
 
@@ -80,9 +85,18 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
     log_path = os.path.join(log_dir, name + ".log") if log_dir else os.devnull
     log = open(log_path, "w")
 
-    val_cmd = [VALIDATE, genome, "--mers", mers, "-t", str(threads),
+    val_cmd = [VALIDATE, "--mers", mers, "-t", str(threads),
                "--output_dir", val_dir, "--pigz", PIGZ,
                "--min-c", str(min_c), "--vote-frac", str(vote_frac), "--vote-ratio", str(vote_ratio)]
+    if os.path.isdir(genome) and type_ == "fastq":
+        fastqs = sorted(glob.glob(os.path.join(genome, "*.fastq*")) +
+                        glob.glob(os.path.join(genome, "*.fq*")))
+        if not fastqs:
+            log.close()
+            return 0, 1
+        val_cmd += fastqs
+    else:
+        val_cmd += [genome]
     if type_:
         val_cmd += ["--type", type_]
     if window_size:
@@ -152,7 +166,7 @@ def cmd_assemble(args):
 
 def cmd_pipeline(args):
     check_binaries()
-    genomes = find_genomes(args.files)
+    genomes = find_genomes(args.files, getattr(args, 'type', None))
     if not genomes:
         sys.exit("Error: no genome files found in " + ", ".join(args.files))
 
