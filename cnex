@@ -16,10 +16,15 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
+SKIP_DIRS = {"logs", "log", "tmp", "temp", "backup", "old", "archive"}
+
 def find_genomes(paths, type_=None):
     files = []
     for p in paths:
         if os.path.isdir(p):
+            base = os.path.basename(os.path.normpath(p))
+            if base.lower() in SKIP_DIRS:
+                continue
             if type_ == "fastq":
                 # FASTQ mode: directory = one sample (all .fq files inside)
                 files.append(p)
@@ -70,17 +75,27 @@ def tree_deps():
 
 def check_tree_deps():
     missing = [f"  {name}: {path}\n           Download: {url}"
-               for name, path, url in tree_deps() if not os.path.exists(path)]
+               for name, path, url in tree_deps() if not os.path.exists(path) and not (path and shutil.which(path))]
     if missing:
         print("Warning: phylogenetic tools not found (needed for steps 04-05):\n"
               + "\n".join(missing) + "\n", file=sys.stderr)
 
 
+ASSEMBLE_DIR = "assemble"
+
 def process_one(genome, mers, base_dir, threads, trim, min_c=7,
                 vote_frac=0.1, vote_ratio=3.0, window_size=None, step_size=None, type_=None, log_dir=None,
                 keep_validate=False):
     name = genome_name(genome)
-    val_dir = os.path.join(base_dir, "assemble", name)
+    if not name:
+        return 0, 1
+
+    val_dir = os.path.join(base_dir, ASSEMBLE_DIR, name)
+    # Safety: never write directly to assemble root
+    root_dir = os.path.join(base_dir, ASSEMBLE_DIR)
+    if os.path.normpath(val_dir) == os.path.normpath(root_dir):
+        return 0, 1
+
     os.makedirs(val_dir, exist_ok=True)
     log_path = os.path.join(log_dir, name + ".log") if log_dir else os.devnull
     log = open(log_path, "w")
