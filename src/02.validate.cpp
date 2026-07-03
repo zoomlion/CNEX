@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -246,6 +247,8 @@ void reader_thread(const std::vector<std::string>& files,
             std::vector<Read> chunk;
             chunk.reserve(chunk_size);
 
+            std::string _sid_buf;
+            char _num[16];
             auto flush_sequence = [&]() {
                 if (seq_id.empty() || seq.empty() || count >= depth) return;
                 int seq_len = static_cast<int>(seq.size());
@@ -259,8 +262,16 @@ void reader_thread(const std::vector<std::string>& files,
                         if (c >= 'A' && c <= 'Z') { has_upper = true; break; }
                     }
                     if (!has_upper) continue;
+                    _sid_buf.clear();
+                    _sid_buf += seq_id;
+                    _sid_buf += ':';
+                    auto rc = std::to_chars(_num, _num + 15, start + 1);
+                    _sid_buf.append(_num, rc.ptr - _num);
+                    _sid_buf += '-';
+                    rc = std::to_chars(_num, _num + 15, end);
+                    _sid_buf.append(_num, rc.ptr - _num);
                     Read read;
-                    read.seq_id = seq_id + ":" + std::to_string(start + 1) + "-" + std::to_string(end);
+                    read.seq_id = _sid_buf;
                     read.seq = std::string(sv);
                     for (char& c : read.seq) {
                         if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
