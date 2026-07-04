@@ -35,6 +35,8 @@ def parse_args():
                    help="Output directory for per-element FASTAs (default: results/fasta)")
     p.add_argument("--parallel", type=int, default=1,
                    help="Number of parallel processes for reading species")
+    p.add_argument("--max-length-ratio", type=float, default=3.0,
+                   help="Max sequence length ratio vs median per element (default: 3.0, 0=no filter)")
     return p.parse_args()
 
 
@@ -115,6 +117,23 @@ def main():
     filtered = {bid: sps for bid, sps in elements.items()
                 if len(sps) >= args.min_species}
     print(f"Elements with >= {args.min_species} species: {len(filtered)}")
+
+    # Filter by sequence length outlier ratio
+    if args.max_length_ratio > 0:
+        filtered2 = {}
+        removed_count = 0
+        for bid, sps in filtered.items():
+            lengths = sorted(len(s) for s in sps.values())
+            median = lengths[len(lengths) // 2]
+            keep = {sp: seq for sp, seq in sps.items()
+                    if len(seq) / median <= args.max_length_ratio}
+            removed = len(sps) - len(keep)
+            removed_count += removed
+            if len(keep) >= args.min_species:
+                filtered2[bid] = keep
+        print(f"Removed {removed_count} outlier sequences (ratio > {args.max_length_ratio}x median)")
+        filtered = filtered2
+        print(f"Elements after length filtering: {len(filtered)}")
 
     # Sort by number of species (descending) and take top max_elements
     sorted_elements = sorted(filtered.items(), key=lambda x: -len(x[1]))
