@@ -175,6 +175,8 @@ def cmd_assemble(args):
         cmd += ["--max-loci-gap", str(args.max_loci_gap)]
     if not args.no_trim:
         cmd.append("--trim")
+    if args.snp:
+        cmd.append("--snp")
     return run(cmd).returncode
 
 
@@ -253,6 +255,8 @@ def main():
                        help="Max gap for locus clustering in genome mode (default: 5000)")
     p_asm.add_argument("--no-trim", action="store_true", dest="no_trim",
                        help="Disable contig trimming (trimming enabled by default)")
+    p_asm.add_argument("--snp", action="store_true",
+                       help="Scan for candidate SNPs from validated reads")
 
     # ─── pipeline ───
     p_pipe = sub.add_parser("pipeline",

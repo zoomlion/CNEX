@@ -26,6 +26,7 @@ struct Args {
     int max_loci_gap = 5000;
     bool trim = false;
     double min_density = 0.3;
+    bool output_snp = false;
     bool help_requested = false;
 };
 
@@ -73,6 +74,8 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--min-density") {
             if (++i >= argc) throw std::runtime_error("Missing value for --min-density");
             args.min_density = std::stod(argv[i]);
+        } else if (arg == "--snp") {
+            args.output_snp = true;
         } else if (arg[0] != '-') {
             if (args.input_dir.empty()) args.input_dir = arg;
             else throw std::runtime_error("Unexpected argument: " + arg);
@@ -211,16 +214,23 @@ std::unordered_map<std::string, int> build_node_scores(
 }
 
 std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
-                               int min_count, const MerQueryManager& mqm, int ele_id)
+                               int min_count, const MerQueryManager& mqm, int ele_id,
+                               std::ofstream* snp_out = nullptr)
 {
-    auto graph = de_bruijn_graph(reads, k, min_count);
+    auto [graph, kmer_counts, e_counts] = de_bruijn_graph(reads, k, min_count);
     if (graph.empty()) return "";
 
     std::unordered_map<std::string, int> node_scores;
     auto ns = build_node_scores(graph, mqm, ele_id, k);
     if (!ns.empty()) node_scores = std::move(ns);
 
-    return assemble_sequence(graph, node_scores);
+    std::vector<std::string> contig_path;
+    std::string contig = assemble_sequence(graph, node_scores, &contig_path);
+
+    if (snp_out && !contig_path.empty())
+        scan_snps(graph, e_counts, contig_path, contig, ele_id, k, *snp_out);
+
+    return contig;
 }
 
 void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
@@ -277,7 +287,8 @@ int main(int argc, char* argv[]) {
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
                       << "  --trim                Trim contigs to confident k-mer region\n"
-                      << "  --min-density <f>     Min k-mer density for trim (default: 0.3)\n";
+                      << "  --min-density <f>     Min k-mer density for trim (default: 0.3)\n"
+                      << "  --snp                 Scan for candidate SNPs from validated reads\n";
             return 1;
         }
 
@@ -369,6 +380,15 @@ int main(int argc, char* argv[]) {
         struct BestEntry { std::string display_id; std::string seq; int score; };
         std::map<int, BestEntry> best;
 
+        // Open SNP output if requested (reads mode only)
+        std::ofstream snp_stream;
+        std::ofstream* snp_out_ptr = nullptr;
+        if (args.output_snp && !is_genome) {
+            snp_stream.open("variants.tsv");
+            snp_stream << "ele_id\tpos\tref\talt\tref_cov\talt_cov\talt_freq\tbranch_len\ttype\n";
+            snp_out_ptr = &snp_stream;
+        }
+
         size_t idx = 0;
         while (idx < all_reads.size()) {
             // Start of a new element
@@ -397,7 +417,7 @@ int main(int argc, char* argv[]) {
                 // Skip remaining reads of this element
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele) ++idx;
 
-                std::string contig = debruijn_assemble(reads, args.kmer, args.min_count, mqm, cur_ele);
+                std::string contig = debruijn_assemble(reads, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr);
                 if (contig.empty()) continue;
 
                 if (args.trim) trim_contig(contig, mqm, cur_ele);
@@ -463,7 +483,7 @@ int main(int argc, char* argv[]) {
                             reads_for_graph.push_back(c.second);
                         }
 
-                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele);
+                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr);
                         if (!contig.empty()) {
                             if (args.trim) trim_contig(contig, mqm, cur_ele);
                             if (contig.size() >= 20) {
@@ -494,7 +514,7 @@ int main(int argc, char* argv[]) {
                         reads_for_graph.push_back(c.second);
                     }
 
-                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele);
+                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr);
                     if (!contig.empty()) {
                         if (args.trim) trim_contig(contig, mqm, cur_ele);
                         if (contig.size() >= 20) {

@@ -15,34 +15,70 @@
 
 // Graph type: node -> list of successor nodes
 using Graph = std::unordered_map<std::string, std::vector<std::string>>;
+using KmerCounts = tsl::robin_map<std::string, int>;
 
-inline Graph de_bruijn_graph(
+using EdgeCounts = tsl::robin_map<std::string, int>;  // "src\ttgt" → read count
+
+inline std::tuple<Graph, KmerCounts, EdgeCounts> de_bruijn_graph(
     const std::vector<std::string>& reads, uint64_t k, int min_count = 1
 ) {
-    tsl::robin_map<std::string_view, int> kmer_counts;
-    kmer_counts.reserve(reads.size() * 10);
+    tsl::robin_map<std::string_view, int> sv_raw;
+    KmerCounts k_counts;
+    EdgeCounts e_counts;
+    sv_raw.reserve(reads.size() * 10);
+    k_counts.reserve(reads.size() * 2);
+    e_counts.reserve(reads.size());
+
     for (const auto& read : reads) {
         if (read.length() < (k + 1)) continue;
         auto sv = std::string_view(read);
-        for (size_t i = 0; i <= read.length() - (k + 1); ++i) {
-            kmer_counts[sv.substr(i, k + 1)]++;
-        }
+        for (size_t i = 0; i <= read.length() - k; ++i)
+            k_counts[std::string(sv.substr(i, k))]++;
+        for (size_t i = 0; i <= read.length() - (k + 1); ++i)
+            sv_raw[sv.substr(i, k + 1)]++;
     }
 
     std::set<std::pair<std::string_view, std::string_view>> valid_edges;
-    for (const auto& [kmer, count] : kmer_counts) {
+    for (const auto& [kmer, count] : sv_raw) {
         if (count < min_count) continue;
         auto prefix = kmer.substr(0, k);
         auto suffix = kmer.substr(1, k);
         valid_edges.insert({prefix, suffix});
     }
 
+    // Build graph and count edge traversals (per read, dedup)
     Graph graph;
     graph.reserve(valid_edges.size());
     for (const auto& edge : valid_edges) {
         graph[std::string(edge.first)].push_back(std::string(edge.second));
     }
-    return graph;
+
+    // Count edge traversals: each read counts each edge at most once
+    for (const auto& read : reads) {
+        if (read.length() < (k + 1)) continue;
+        auto sv = std::string_view(read);
+        std::set<std::string> seen_edges;
+        for (size_t i = 0; i <= read.length() - (k + 1); ++i) {
+            auto kmer = sv.substr(i, k + 1);
+            auto prefix = std::string(kmer.substr(0, k));
+            auto suffix = std::string(kmer.substr(1, k));
+            auto git = graph.find(prefix);
+            if (git == graph.end()) continue;
+            bool has_edge = false;
+            for (const auto& tgt : git->second) {
+                if (tgt == suffix) { has_edge = true; break; }
+            }
+            if (has_edge) {
+                std::string ekey = prefix + "\t" + suffix;
+                if (seen_edges.find(ekey) == seen_edges.end()) {
+                    seen_edges.insert(ekey);
+                    e_counts[ekey]++;
+                }
+            }
+        }
+    }
+
+    return {std::move(graph), std::move(k_counts), std::move(e_counts)};
 }
 
 
@@ -269,7 +305,8 @@ inline std::vector<std::string> trace_longest_path(
 
 
 inline std::string assemble_sequence(const Graph& graph,
-                               const std::unordered_map<std::string, int>& node_scores) {
+                               const std::unordered_map<std::string, int>& node_scores,
+                               std::vector<std::string>* out_path = nullptr) {
     if (graph.empty()) {
         return "";
     }
@@ -282,10 +319,105 @@ inline std::string assemble_sequence(const Graph& graph,
         return "";
     }
 
+    if (out_path) *out_path = path;
+
     std::string result = path[0];
     for (size_t i = 1; i < path.size(); ++i) {
         result += path[i].back();
     }
 
     return result;
+}
+
+
+// ─── SNP scan (De Bruijn bubble detection) ───
+
+inline void scan_snps(
+    const Graph& graph,
+    const EdgeCounts& e_counts,
+    const std::vector<std::string>& contig_path,
+    const std::string& contig_seq,
+    int ele_id, int k,
+    std::ofstream& out,
+    double min_af = 0.05,
+    int max_branch_depth = 5)
+{
+    if (contig_path.empty()) return;
+
+    // Build position lookup: contig_path node → its index in path
+    tsl::robin_map<std::string, int> path_pos;
+    for (size_t i = 0; i < contig_path.size(); ++i)
+        path_pos[contig_path[i]] = static_cast<int>(i);
+
+    for (size_t i = 0; i + 1 < contig_path.size(); ++i) {
+        const std::string& node = contig_path[i];
+        const std::string& next_main = contig_path[i + 1];
+
+        auto git = graph.find(node);
+        if (git == graph.end() || git->second.size() < 2) continue;
+
+        for (const auto& branch : git->second) {
+            if (branch == next_main) continue;  // main path, not a branch
+
+            // BFS from branch node: look for reconnection to main path
+            std::vector<std::string> frontier = {branch};
+            tsl::robin_map<std::string, int> visited;
+            visited[branch] = 1;
+            std::string reconnect_node;
+            int reconnect_pos = -1;
+
+            for (int depth = 1; depth <= max_branch_depth && !frontier.empty(); ++depth) {
+                std::vector<std::string> next_frontier;
+                for (const auto& cur : frontier) {
+                    auto cgit = graph.find(cur);
+                    if (cgit == graph.end()) continue;
+                    for (const auto& cn : cgit->second) {
+                        auto pp = path_pos.find(cn);
+                        if (pp != path_pos.end() && pp->second > static_cast<int>(i)) {
+                            // Found reconnection
+                            reconnect_node = cn;
+                            reconnect_pos = pp->second;
+                            break;
+                        }
+                        if (visited.find(cn) == visited.end()) {
+                            visited[cn] = depth + 1;
+                            next_frontier.push_back(cn);
+                        }
+                    }
+                    if (reconnect_pos >= 0) break;
+                }
+                frontier = std::move(next_frontier);
+                if (reconnect_pos >= 0) break;
+            }
+
+            if (reconnect_pos < 0) continue;
+
+            int branch_len = reconnect_pos - static_cast<int>(i);
+            if (branch_len > 10) continue;
+
+            // Edge count: how many reads traverse this specific edge
+            std::string main_key = node + "\t" + next_main;
+            std::string alt_key  = node + "\t" + branch;
+
+            auto rit = e_counts.find(main_key);
+            auto ait = e_counts.find(alt_key);
+            int ref_cov = (rit != e_counts.end()) ? rit->second : 0;
+            int alt_cov = (ait != e_counts.end()) ? ait->second : 0;
+            if (ref_cov < 2 || alt_cov < 2) continue;
+
+            double af = static_cast<double>(alt_cov) / (ref_cov + alt_cov);
+            if (af < min_af) continue;
+
+            int contig_pos = static_cast<int>(i + k - 1);
+            const char* type = (branch_len == 1) ? "SNP" : "INDEL";
+            char ref_base = next_main.back();
+            char alt_base = branch.back();
+
+            out << ele_id << "\t" << contig_pos
+                << "\t" << ref_base << "\t" << alt_base
+                << "\t" << ref_cov << "\t" << alt_cov
+                << "\t" << af << "\t" << branch_len
+                << "\t" << type << "\n";
+        }
+    }
 }
