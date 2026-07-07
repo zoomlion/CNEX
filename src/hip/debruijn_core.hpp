@@ -330,9 +330,77 @@ inline std::string assemble_sequence(const Graph& graph,
 }
 
 
+// ─── Export path GFA for a single element (only contig path + branches) ───
+
+inline void export_path_gfa(
+    const Graph& graph,
+    const std::unordered_map<std::string, int>& node_scores,
+    const std::vector<std::string>& contig_path,
+    int ele_id, int k,
+    std::ofstream& out)
+{
+    if (contig_path.empty()) return;
+
+    // Collect nodes in contig path
+    tsl::robin_map<std::string, int> in_path;
+    for (size_t i = 0; i < contig_path.size(); ++i)
+        in_path[contig_path[i]] = 1;
+
+    // Collect all nodes: path + immediate branches
+    tsl::robin_map<std::string, int> used_set = in_path;
+    for (const auto& node : contig_path) {
+        auto git = graph.find(node);
+        if (git == graph.end()) continue;
+        for (const auto& next : git->second) {
+            if (in_path.find(next) == in_path.end())
+                used_set[next] = 1;
+        }
+    }
+
+    // Assign IDs: {ele_id}_{n}
+    tsl::robin_map<std::string, int> node_id;
+    int n = 0;
+    for (const auto& [node, _] : used_set)
+        node_id[node] = n++;
+
+    // S lines
+    for (const auto& [node, _] : used_set) {
+        auto it = node_scores.find(node);
+        int cov = (it != node_scores.end()) ? it->second : 0;
+        out << "S\t" << ele_id << "_" << node_id[node]
+            << "\t" << node
+            << "\tKC:i:" << cov
+            << "\tEL:Z:" << ele_id << "\n";
+    }
+
+    // L lines (only where both nodes are used)
+    for (const auto& [node, _] : used_set) {
+        auto git = graph.find(node);
+        if (git == graph.end()) continue;
+        int src = node_id[node];
+        for (const auto& next : git->second) {
+            auto nit = node_id.find(next);
+            if (nit == node_id.end()) continue;
+            out << "L\t" << ele_id << "_" << src << "\t+\t"
+                << ele_id << "_" << nit->second << "\t+\t"
+                << (k - 1) << "M\n";
+        }
+    }
+
+    // P line: contig path
+    out << "P\tcontig_" << ele_id;
+    for (const auto& node : contig_path) {
+        auto it = node_id.find(node);
+        if (it != node_id.end())
+            out << "\t" << ele_id << "_" << it->second;
+    }
+    out << "\t" << std::string(contig_path.size(), '+') << "\n";
+}
+
+
 // ─── SNP scan (De Bruijn bubble detection) ───
 
-inline void scan_snps(
+inline bool scan_snps(  // returns true if any variant was found
     const Graph& graph,
     const EdgeCounts& e_counts,
     const std::vector<std::string>& contig_path,
@@ -342,7 +410,8 @@ inline void scan_snps(
     double min_af = 0.05,
     int max_branch_depth = 5)
 {
-    if (contig_path.empty()) return;
+    bool has_var = false;
+    if (contig_path.empty()) return false;
 
     // Build position lookup: contig_path node → its index in path
     tsl::robin_map<std::string, int> path_pos;
@@ -418,6 +487,8 @@ inline void scan_snps(
                 << "\t" << ref_cov << "\t" << alt_cov
                 << "\t" << af << "\t" << branch_len
                 << "\t" << type << "\n";
+            has_var = true;
         }
     }
+    return has_var;
 }

@@ -215,7 +215,8 @@ std::unordered_map<std::string, int> build_node_scores(
 
 std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
                                int min_count, const MerQueryManager& mqm, int ele_id,
-                               std::ofstream* snp_out = nullptr)
+                               std::ofstream* snp_out = nullptr,
+                               std::ofstream* gfa_out = nullptr)
 {
     auto [graph, kmer_counts, e_counts] = de_bruijn_graph(reads, k, min_count);
     if (graph.empty()) return "";
@@ -227,8 +228,12 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
     std::vector<std::string> contig_path;
     std::string contig = assemble_sequence(graph, node_scores, &contig_path);
 
+    bool has_var = false;
     if (snp_out && !contig_path.empty())
-        scan_snps(graph, e_counts, contig_path, contig, ele_id, k, *snp_out);
+        has_var = scan_snps(graph, e_counts, contig_path, contig, ele_id, k, *snp_out);
+
+    if (has_var && gfa_out && !contig_path.empty())
+        export_path_gfa(graph, node_scores, contig_path, ele_id, k, *gfa_out);
 
     return contig;
 }
@@ -381,12 +386,16 @@ int main(int argc, char* argv[]) {
         std::map<int, BestEntry> best;
 
         // Open SNP output if requested (reads mode only)
-        std::ofstream snp_stream;
+        std::ofstream snp_stream, gfa_stream;
         std::ofstream* snp_out_ptr = nullptr;
+        std::ofstream* gfa_out_ptr = nullptr;
         if (args.output_snp && !is_genome) {
             snp_stream.open("variants.tsv");
             snp_stream << "ele_id\tpos\tref\talt\tref_cov\talt_cov\talt_freq\tbranch_len\ttype\n";
             snp_out_ptr = &snp_stream;
+            gfa_stream.open("snp_elements.gfa");
+            gfa_stream << "H\tVN:Z:1.0\n";
+            gfa_out_ptr = &gfa_stream;
         }
 
         size_t idx = 0;
@@ -417,7 +426,7 @@ int main(int argc, char* argv[]) {
                 // Skip remaining reads of this element
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele) ++idx;
 
-                std::string contig = debruijn_assemble(reads, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr);
+                std::string contig = debruijn_assemble(reads, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                 if (contig.empty()) continue;
 
                 if (args.trim) trim_contig(contig, mqm, cur_ele);
@@ -483,7 +492,7 @@ int main(int argc, char* argv[]) {
                             reads_for_graph.push_back(c.second);
                         }
 
-                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr);
+                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                         if (!contig.empty()) {
                             if (args.trim) trim_contig(contig, mqm, cur_ele);
                             if (contig.size() >= 20) {
@@ -514,7 +523,7 @@ int main(int argc, char* argv[]) {
                         reads_for_graph.push_back(c.second);
                     }
 
-                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr);
+                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                     if (!contig.empty()) {
                         if (args.trim) trim_contig(contig, mqm, cur_ele);
                         if (contig.size() >= 20) {
