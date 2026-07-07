@@ -45,18 +45,24 @@ def read_fasta_dict(path):
     seqs = {}
     header = None
     seq = []
-    with open(path) as f:
+    with open(path, errors='replace') as f:
         for line in f:
             line = line.strip()
+            if not line:
+                continue
             if line.startswith(">"):
                 if header is not None:
-                    seqs[header] = "".join(seq)
+                    full_seq = "".join(seq)
+                    if "\x00" not in full_seq:
+                        seqs[header] = full_seq
                 header = line[1:]
                 seq = []
             else:
                 seq.append(line)
     if header is not None:
-        seqs[header] = "".join(seq)
+        full_seq = "".join(seq)
+        if "\x00" not in full_seq:
+            seqs[header] = full_seq
     return seqs
 
 

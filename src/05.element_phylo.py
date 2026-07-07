@@ -60,7 +60,7 @@ def find_fasta_files(elements_dir, max_elements):
 
 
 def _flatten_fasta(path):
-    with open(path) as f:
+    with open(path, errors='replace') as f:
         lines = f.readlines()
     out = []
     buf = []
