@@ -65,6 +65,7 @@ inline void reverse_complement(const std::string& dna, std::string& out) {
         std::array<char, 256> table = {};
         table['A'] = 'T'; table['T'] = 'A';
         table['C'] = 'G'; table['G'] = 'C';
+        table['N'] = 'N'; table['n'] = 'n';
         return table;
     }();
 

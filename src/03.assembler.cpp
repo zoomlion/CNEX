@@ -411,13 +411,13 @@ int main(int argc, char* argv[]) {
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele && cnt < args.max_reads) {
                     const auto& r = all_reads[idx];
                     std::string local_seq = r.seq;
+                    for (char& c : local_seq) {
+                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+                    }
                     if (r.strand == -1) {
                         thread_local std::string _rc;
                         reverse_complement(local_seq, _rc);
                         local_seq = _rc;
-                    }
-                    for (char& c : local_seq) {
-                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
                     }
                     reads.push_back(std::move(local_seq));
                     ++idx;
@@ -441,13 +441,13 @@ int main(int argc, char* argv[]) {
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele && cnt < args.max_reads) {
                     auto& r = all_reads[idx];
                     std::string local_seq = r.seq;
+                    for (char& c : local_seq) {
+                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+                    }
                     if (r.strand == -1) {
                         thread_local std::string _rc;
                         reverse_complement(local_seq, _rc);
                         local_seq = _rc;
-                    }
-                    for (char& c : local_seq) {
-                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
                     }
                     ele_reads.emplace_back(r, std::move(local_seq));
                     ++idx;
