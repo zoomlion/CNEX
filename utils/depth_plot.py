@@ -10,7 +10,7 @@ from pathlib import Path
 FIGS = Path('benchmark/figures')
 FIGS.mkdir(exist_ok=True)
 
-rows = [l.strip().split('\t') for l in open('/tmp/depth_exp/depth_summary.tsv') if l.strip()][1:]
+rows = [l.strip().split('\t') for l in open('/tmp/depth_v2/depth_summary.tsv') if l.strip()][1:]
 depths  = [float(r[0].rstrip('x')) for r in rows]
 contigs = [int(r[1]) for r in rows]
 n50s    = [int(r[5]) for r in rows]
@@ -48,7 +48,7 @@ for i, (ax, vals, tt, yl, hl) in enumerate(zip(axes, vals_list, titles, ylabels,
     ax.set_ylabel(yl, fontsize=9, color='#555')
     ax.set_xscale('log')
     ax.set_xticks(depths)
-    ax.set_xticklabels(['0.25x', '0.5x', '1x', '2x', '3x', '4x', '5x'])
+    ax.set_xticklabels([f'{d:g}x' for d in depths])
     ax.tick_params(labelsize=8, colors='#555')
     ax.spines[['top','right']].set_visible(False)
     ax.spines[['bottom','left']].set_color('#CCCCCC')

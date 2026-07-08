@@ -3,7 +3,7 @@
 import re, statistics, sys
 from pathlib import Path
 
-WORK = Path('/tmp/depth_exp')
+WORK = Path('/tmp/depth_v2')
 BASELINE = list((WORK / 'genome' / 'assemble').rglob('contigs.fa'))[0] if (WORK / 'genome' / 'assemble').exists() else None
 
 def parse_contig_header(hdr):
@@ -50,7 +50,7 @@ def n50(lengths):
     return 0
 
 results = []
-for depth in ['0.25x','0.5x','1x','2x','3x','4x','5x']:
+for depth in ['0.25x','0.5x','1x','2x','3x','4x','5x','6x','7x','8x']:
     # Find contigs.fa within the assemble subdirectory
     asm_dir = WORK / f'out_{depth}' / 'assemble'
     cf = None
