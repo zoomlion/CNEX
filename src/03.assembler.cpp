@@ -1,6 +1,7 @@
 #include <hip/debruijn_core.hpp>
 #include <hip/validator_core.hpp>
 
+#include <tsl/robin_set.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,7 @@ struct Args {
     bool trim = true;
     bool trim_set = false;
     bool no_trim_set = false;
+    double repeat_ratio = 1.2;
     bool output_snp = false;
     bool help_requested = false;
 };
@@ -76,6 +78,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--no-trim") {
             args.trim = false;
             args.no_trim_set = true;
+        } else if (arg == "--repeat-ratio") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --repeat-ratio");
+            args.repeat_ratio = std::stod(argv[i]);
         } else if (arg == "--snp") {
             args.output_snp = true;
         } else if (arg[0] != '-') {
@@ -298,6 +303,7 @@ int main(int argc, char* argv[]) {
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
+                      << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
                       << "  --snp                 Scan for candidate SNPs from validated reads\n";
             return 1;
         }
@@ -424,6 +430,28 @@ int main(int argc, char* argv[]) {
                         reverse_complement(local_seq, _rc);
                         local_seq = _rc;
                     }
+                    // Repeat ratio check
+                    {
+                        tsl::robin_set<uint32_t> seen;
+                        int total = 0;
+                        int ms = mqm.get_mer_size();
+                        for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
+                            uint32_t code;
+                            if (encode_mer_at(local_seq, k, ms, code)) {
+                                auto it = mqm.compressed_mer_query.find(code);
+                                if (it != mqm.compressed_mer_query.end() && it->second.first == cur_ele) {
+                                    ++total;
+                                    seen.insert(code);
+                                }
+                            }
+                        }
+                        double ratio = (double)total / std::max(1, (int)seen.size());
+                        if (ratio > args.repeat_ratio) {
+                            ++idx;
+                            ++cnt;
+                            continue;
+                        }
+                    }
                     reads.push_back(std::move(local_seq));
                     ++idx;
                     ++cnt;
@@ -453,6 +481,28 @@ int main(int argc, char* argv[]) {
                         thread_local std::string _rc;
                         reverse_complement(local_seq, _rc);
                         local_seq = _rc;
+                    }
+                    // Repeat ratio check for genome mode
+                    {
+                        tsl::robin_set<uint32_t> seen;
+                        int total = 0;
+                        int ms = mqm.get_mer_size();
+                        for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
+                            uint32_t code;
+                            if (encode_mer_at(local_seq, k, ms, code)) {
+                                auto it = mqm.compressed_mer_query.find(code);
+                                if (it != mqm.compressed_mer_query.end() && it->second.first == cur_ele) {
+                                    ++total;
+                                    seen.insert(code);
+                                }
+                            }
+                        }
+                        double ratio = (double)total / std::max(1, (int)seen.size());
+                        if (ratio > args.repeat_ratio) {
+                            ++idx;
+                            ++cnt;
+                            continue;
+                        }
                     }
                     ele_reads.emplace_back(r, std::move(local_seq));
                     ++idx;
