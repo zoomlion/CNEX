@@ -24,8 +24,9 @@ struct Args {
     int min_count = 2;
     int max_reads = 200;
     int max_loci_gap = 5000;
-    bool trim = false;
-    double min_density = 0.3;
+    bool trim = true;
+    bool trim_set = false;
+    bool no_trim_set = false;
     bool output_snp = false;
     bool help_requested = false;
 };
@@ -71,9 +72,10 @@ Args parse_args(int argc, char* argv[]) {
             args.max_loci_gap = std::stoi(argv[i]);
         } else if (arg == "--trim") {
             args.trim = true;
-        } else if (arg == "--min-density") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --min-density");
-            args.min_density = std::stod(argv[i]);
+            args.trim_set = true;
+        } else if (arg == "--no-trim") {
+            args.trim = false;
+            args.no_trim_set = true;
         } else if (arg == "--snp") {
             args.output_snp = true;
         } else if (arg[0] != '-') {
@@ -83,6 +85,9 @@ Args parse_args(int argc, char* argv[]) {
             throw std::runtime_error("Unknown option: " + arg);
         }
         ++i;
+    }
+    if (args.trim_set && args.no_trim_set) {
+        throw std::runtime_error("Conflicting flags: --trim and --no-trim");
     }
     return args;
 }
@@ -291,8 +296,8 @@ int main(int argc, char* argv[]) {
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
-                      << "  --trim                Trim contigs to confident k-mer region\n"
-                      << "  --min-density <f>     Min k-mer density for trim (default: 0.3)\n"
+                      << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
+                      << "  --no-trim             Disable trimming\n"
                       << "  --snp                 Scan for candidate SNPs from validated reads\n";
             return 1;
         }
