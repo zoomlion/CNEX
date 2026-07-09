@@ -16,9 +16,9 @@ contigs = [int(r[1]) for r in rows]
 n50s    = [int(r[5]) for r in rows]
 avgs    = [float(r[6]) for r in rows]
 
-genome_ct = 7690
-genome_n50 = 311
-genome_avg = 200
+genome_ct = 7377
+genome_n50 = 298
+genome_avg = 230
 
 plt.rcdefaults()
 plt.rcParams.update({
@@ -48,7 +48,7 @@ for i, (ax, vals, tt, yl, hl) in enumerate(zip(axes, vals_list, titles, ylabels,
     ax.set_ylabel(yl, fontsize=9, color='#555')
     ax.set_xscale('log')
     ax.set_xticks(depths)
-    ax.set_xticklabels([f'{d:g}x' for d in depths])
+    ax.set_xticklabels(['1/4' if d == 0.25 else '1/2' if d == 0.5 else f'{d:g}' for d in depths])
     ax.tick_params(labelsize=8, colors='#555')
     ax.spines[['top','right']].set_visible(False)
     ax.spines[['bottom','left']].set_color('#CCCCCC')
