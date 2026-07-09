@@ -247,7 +247,7 @@ def main():
     p_asm.add_argument("input_dir", help="Directory with Assemble.*.reads files")
     p_asm.add_argument("--mers", required=True, help="Confident k-mer table")
     p_asm.add_argument("-o", "--output", default="assembled.fasta", help="Output FASTA (default: assembled.fasta)")
-    p_asm.add_argument("-k", "--kmer", type=int, default=35, help="K-mer length (default: 35)")
+    p_asm.add_argument("-k", "--kmer", type=int, default=21, help="K-mer length (default: 21)")
     p_asm.add_argument("--min-c", type=int, default=3, help="Min k-mer matches for validation (default: 3)")
     p_asm.add_argument("--min-count", type=int, default=2, help="Min (k+1)-mer occurrence (default: 2)")
     p_asm.add_argument("--max-reads", type=int, default=200, help="Max reads per element/locus (default: 200)")
