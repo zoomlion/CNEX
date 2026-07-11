@@ -243,7 +243,7 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
         has_var = scan_snps(graph, e_counts, contig_path, contig, ele_id, k, *snp_out);
 
     if (has_var && gfa_out && !contig_path.empty())
-        export_path_gfa(graph, node_scores, contig_path, ele_id, k, *gfa_out);
+        export_path_gfa(graph, node_scores, contig_path, ele_id, k, *gfa_out, &kmer_counts);
 
     return contig;
 }

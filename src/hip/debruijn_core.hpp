@@ -337,7 +337,8 @@ inline void export_path_gfa(
     const std::unordered_map<std::string, int>& node_scores,
     const std::vector<std::string>& contig_path,
     int ele_id, int k,
-    std::ofstream& out)
+    std::ofstream& out,
+    const KmerCounts* kmer_counts = nullptr)
 {
     if (contig_path.empty()) return;
 
@@ -365,11 +366,17 @@ inline void export_path_gfa(
 
     // S lines
     for (const auto& [node, _] : used_set) {
-        auto it = node_scores.find(node);
-        int cov = (it != node_scores.end()) ? it->second : 0;
+        int kc = 0;
+        if (kmer_counts) {
+            auto kit = kmer_counts->find(node);
+            if (kit != kmer_counts->end()) kc = kit->second;
+        }
+        auto sit = node_scores.find(node);
+        int ms = (sit != node_scores.end()) ? sit->second : 0;
         out << "S\t" << ele_id << "_" << node_id[node]
             << "\t" << node
-            << "\tKC:i:" << cov
+            << "\tKC:i:" << kc
+            << "\tMS:i:" << ms
             << "\tEL:Z:" << ele_id << "\n";
     }
 
