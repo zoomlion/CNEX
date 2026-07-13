@@ -347,14 +347,49 @@ inline void export_path_gfa(
     for (size_t i = 0; i < contig_path.size(); ++i)
         in_path[contig_path[i]] = 1;
 
-    // Collect all nodes: path + immediate branches
+    // Collect all nodes: path + branches (BFS to merge point, max depth 10)
+    // Also record bubble paths for P-line export
+    constexpr int MAX_BRANCH_DEPTH = 10;
     tsl::robin_map<std::string, int> used_set = in_path;
+    std::vector<std::vector<std::string>> bubble_paths;
     for (const auto& node : contig_path) {
         auto git = graph.find(node);
         if (git == graph.end()) continue;
         for (const auto& next : git->second) {
-            if (in_path.find(next) == in_path.end())
-                used_set[next] = 1;
+            if (in_path.find(next) != in_path.end()) continue;
+            // BFS with parent tracking to reconstruct bubble path
+            struct QItem { std::string node; int depth; };
+            std::queue<QItem> q;
+            tsl::robin_map<std::string, std::string> parent;
+            q.push({next, 0});
+            parent[next] = "";
+            while (!q.empty()) {
+                auto [cur, depth] = q.front(); q.pop();
+                used_set[cur] = 1;
+                if (depth >= MAX_BRANCH_DEPTH) continue;
+                auto cit = graph.find(cur);
+                if (cit == graph.end()) continue;
+                for (const auto& cn : cit->second) {
+                    if (in_path.find(cn) != in_path.end()) {
+                        used_set[cn] = 1;
+                        // Reconstruct bubble path from branch start to merge
+                        std::vector<std::string> bp;
+                        std::string p = cur;
+                        while (!p.empty()) {
+                            bp.push_back(p);
+                            auto it = parent.find(p);
+                            if (it != parent.end()) p = it->second;
+                            else break;
+                        }
+                        std::reverse(bp.begin(), bp.end());
+                        if (bp.size() >= 1) bubble_paths.push_back(bp);
+                        continue;
+                    }
+                    if (parent.find(cn) != parent.end()) continue;
+                    parent[cn] = cur;
+                    q.push({cn, depth + 1});
+                }
+            }
         }
     }
 
@@ -364,7 +399,7 @@ inline void export_path_gfa(
     for (const auto& [node, _] : used_set)
         node_id[node] = n++;
 
-    // S lines
+    // S lines: GFA 1.0 format with KC, MS, EL tags
     for (const auto& [node, _] : used_set) {
         int kc = 0;
         if (kmer_counts) {
@@ -380,7 +415,7 @@ inline void export_path_gfa(
             << "\tEL:Z:" << ele_id << "\n";
     }
 
-    // L lines (only where both nodes are used)
+    // L lines: GFA 1.0 format
     for (const auto& [node, _] : used_set) {
         auto git = graph.find(node);
         if (git == graph.end()) continue;
@@ -394,7 +429,7 @@ inline void export_path_gfa(
         }
     }
 
-    // P line: contig path
+    // P line: main path
     out << "P\tcontig_" << ele_id;
     for (const auto& node : contig_path) {
         auto it = node_id.find(node);
@@ -402,6 +437,17 @@ inline void export_path_gfa(
             out << "\t" << ele_id << "_" << it->second;
     }
     out << "\t" << std::string(contig_path.size(), '+') << "\n";
+
+    // P lines: bubble paths
+    for (size_t bi = 0; bi < bubble_paths.size(); ++bi) {
+        out << "P\tcontig_" << ele_id << "_alt" << std::to_string(bi);
+        for (const auto& node : bubble_paths[bi]) {
+            auto it = node_id.find(node);
+            if (it != node_id.end())
+                out << "\t" << ele_id << "_" << it->second;
+        }
+        out << "\t" << std::string(bubble_paths[bi].size(), '+') << "\n";
+    }
 }
 
 
