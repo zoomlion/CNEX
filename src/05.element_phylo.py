@@ -41,9 +41,11 @@ def parse_args():
     p.add_argument("-t", "--threads", type=int, default=4,
                    help="Threads for ASTRAL IV / ASTER (default: 4)")
     p.add_argument("--parallel", type=int, default=1,
-                   help="Number of parallel element processes (famsa always uses 1 thread each)")
+                    help="Number of parallel element processes (famsa always uses 1 thread each)")
     p.add_argument("--max-elements", type=int, default=100,
-                   help="Max elements to process (0=all)")
+                    help="Max elements to process (0=all)")
+    p.add_argument("--max-gap", type=float, default=0.5,
+                    help="Max gap fraction per column in alignment trimming (default: 0.5)")
     p.add_argument("--resume", action="store_true", default=True,
                    help="Skip elements with existing .nwk files (default: on)")
     p.add_argument("--no-resume", action="store_false", dest="resume",
@@ -78,8 +80,30 @@ def _flatten_fasta(path):
         f.writelines(out)
 
 
+def trim_alignment(aln_path, max_gap=0.5):
+    """Remove alignment columns where gap fraction > max_gap."""
+    with open(aln_path) as f:
+        lines = f.readlines()
+    hdrs, seqs = [], []
+    for line in lines:
+        if line.startswith('>'):
+            hdrs.append(line.strip())
+        else:
+            seqs.append(list(line.strip()))
+    if not seqs or not seqs[0]:
+        return aln_path
+    ncol = len(seqs[0])
+    keep = [j for j in range(ncol)
+            if sum(seqs[i][j] == '-' for i in range(len(seqs))) / len(seqs) <= max_gap]
+    out_path = aln_path.replace('.aln', '.trimmed.aln')
+    with open(out_path, 'w') as f:
+        for i, h in enumerate(hdrs):
+            f.write(f'{h}\n{"".join(seqs[i][j] for j in keep)}\n')
+    return out_path
+
+
 def _process_one(args_tuple):
-    fasta_path, famsa_bin, fasttree_bin, resume, aln_dir, nwk_dir = args_tuple
+    fasta_path, famsa_bin, fasttree_bin, resume, aln_dir, nwk_dir, max_gap = args_tuple
 
     base = os.path.basename(fasta_path).replace(".fasta", "")
     aln_path = os.path.join(aln_dir, base + ".aln")
@@ -96,13 +120,16 @@ def _process_one(args_tuple):
         _flatten_fasta(aln_path)
         aln_ok = True
 
+    # Alignment trimming (zero deps)
+    tree_in = trim_alignment(aln_path, max_gap)
+
     # Gene tree (FastTree)
     if resume and os.path.isfile(nwk_path):
         tree_ok = True
     else:
-        if not os.path.isfile(aln_path):
+        if not os.path.isfile(tree_in):
             return False, fasta_path, "no_aln"
-        with open(aln_path) as f:
+        with open(tree_in) as f:
             seq = ""
             for line in f:
                 if not line.startswith(">"):
@@ -199,7 +226,7 @@ def main():
 
     # Process elements (parallel)
     total = len(fasta_files)
-    work = [(f, famsa, fasttree, args.resume, aln_dir, nwk_dir) for f in fasta_files]
+    work = [(f, famsa, fasttree, args.resume, aln_dir, nwk_dir, args.max_gap) for f in fasta_files]
 
     t0 = time.time()
     ok_count = 0
