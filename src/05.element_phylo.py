@@ -23,17 +23,20 @@ import glob
 import time
 from multiprocessing import Pool
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config as C
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Element phylogeny: famsa + fasttree + astral")
     p.add_argument("--elements-dir", default="results/fasta",
                    help="Directory with per-element FASTAs (default: results/fasta)")
-    p.add_argument("--famsa", default="famsa",
-                   help="Path to famsa binary (default: famsa, searched in PATH)")
-    p.add_argument("--fasttree", default="FastTree",
-                   help="Path to FastTree binary (default: FastTree, searched in PATH)")
-    p.add_argument("--astral-bin", default="astral",
-                   help="Path to ASTRAL IV / ASTER native binary (default: astral, searched in PATH)")
+    p.add_argument("--famsa", default=C.FAMSA,
+                   help="Path to famsa binary")
+    p.add_argument("--fasttree", default=C.FastTree,
+                   help="Path to FastTree binary")
+    p.add_argument("--astral-bin", default=C.ASTRAL,
+                   help="Path to ASTRAL IV / ASTER native binary")
     p.add_argument("--astral-dir", default="",
                    help="Path to ASTRAL III directory (used only if --astral-bin not found)")
     p.add_argument("--astral-jar", default="",

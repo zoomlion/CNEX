@@ -3,10 +3,12 @@
 import argparse, glob, os, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-VALIDATE = os.path.join(ROOT, "bin", "validate")
-ASSEMBLE = os.path.join(ROOT, "bin", "assemble")
-PIGZ     = os.path.join(ROOT, "src", "pigz", "pigz")
+import config as C
+
+VALIDATE = C.VALIDATE
+ASSEMBLE = C.ASSEMBLE
+PIGZ     = C.PIGZ
+MERTABLE = C.MERTABLE
 
 GENOME_EXTS = (".fa", ".fa.gz", ".fasta", ".fasta.gz", ".fna", ".fna.gz")
 
@@ -62,11 +64,11 @@ def check_binaries():
 
 def tree_deps():
     return [
-        ("FAMSA",     "famsa",
+        ("FAMSA",     C.FAMSA,
          "https://github.com/refresh-bio/FAMSA"),
-        ("FastTree",  "FastTree",
+        ("FastTree",  C.FastTree,
          "http://www.microbesonline.org/fasttree/"),
-        ("ASTRAL IV", "astral",
+        ("ASTRAL IV", C.ASTRAL,
          "https://github.com/chaoszhang/ASTER"),
         ("ASTRAL III","",
          "https://github.com/smirarab/ASTRAL"),
@@ -191,10 +193,10 @@ def cmd_pipeline(args):
     mers = args.mers
     if args.cne:
         filtered = os.path.join(args.output_dir, "msa.filtered.fa")
-        subprocess.run(["python3", os.path.join(ROOT, "src", "00.filter_msa.py"),
+        subprocess.run(["python3", os.path.join(C.ROOT, "src", "00.filter_msa.py"),
                         args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered])
         mers = os.path.join(args.output_dir, "mers_table.tsv")
-        subprocess.run([os.path.join(ROOT, "bin", "mertable"),
+        subprocess.run([MERTABLE,
                         filtered, "-k", "13", "-c", "4", "-o", mers])
 
     trim = not args.no_trim
