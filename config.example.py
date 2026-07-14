@@ -13,3 +13,7 @@ PIGZ     = os.path.join(ROOT, "src", "pigz", "pigz")
 FAMSA    = "famsa"
 FastTree = "FastTree"
 ASTRAL   = "astral"
+IQTREE3  = "iqtree3"
+
+# Pipeline thresholds
+MIN_CNE_PER_SPECIES = 100

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Step 05: Per-element alignment (FAMSA) + gene tree (FastTree) + species tree (ASTRAL).
+Step 05: Per-element alignment (FAMSA) + phylogeny.
 
-Input:
-  results/elements/<bunch_id>.fasta  -- per-element multi-species FASTA (from step 05)
+Methods:
+  --method concat (default): align → concat_msa → IQ-TREE 3
+  --method astral (fallback): align → FastTree → ASTRAL
 
+Input:  results/fasta/<bunch_id>.fasta  (from step 04)
 Output:
-  results/elements/<bunch_id>.aln    -- aligned FASTA
-  results/elements/<bunch_id>.nwk    -- gene tree
-  results/species_tree.nwk           -- ASTRAL species tree
-  results/gene_trees.nwk             -- all gene trees concatenated
+  concat: supermatrix.fa + partitions.txt + supermatrix.fa.treefile
+  astral: species_tree.nwk + gene_trees.nwk
 
 Usage:
-  python3 src/06.element_phylo.py --num-threads 8 --parallel 8 --max-elements 0
+  python3 src/05.element_phylo.py --max-elements 0 --method concat
 """
 
 import argparse
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import glob
 import time
+from collections import Counter, OrderedDict
 import multiprocessing as mp
 try:
     mp.set_start_method('spawn')
@@ -33,29 +34,34 @@ import config as C
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Element phylogeny: famsa + fasttree + astral")
+    p = argparse.ArgumentParser(description="Element phylogeny: FAMSA + concat/IQ-TREE or ASTRAL")
     p.add_argument("--elements-dir", default="results/fasta",
                    help="Directory with per-element FASTAs (default: results/fasta)")
-    p.add_argument("--famsa", default=C.FAMSA,
-                   help="Path to famsa binary")
-    p.add_argument("--fasttree", default=C.FastTree,
-                   help="Path to FastTree binary")
+    p.add_argument("--method", default="concat", choices=["concat", "astral"],
+                   help="Phylogenetic method (default: concat)")
+    p.add_argument("--famsa", default=C.FAMSA, help="Path to famsa binary")
+    p.add_argument("--fasttree", default=C.FastTree, help="Path to FastTree binary")
+    p.add_argument("--iqtree3", default=C.IQTREE3, help="Path to IQ-TREE 3 binary (--method concat)")
     p.add_argument("--astral-bin", default=C.ASTRAL,
-                   help="Path to ASTRAL IV / ASTER native binary")
+                   help="Path to ASTRAL IV / ASTER binary (--method astral)")
     p.add_argument("--astral-dir", default="",
-                   help="Path to ASTRAL III directory (used only if --astral-bin not found)")
+                   help="Path to ASTRAL III directory (used if --astral-bin not found)")
     p.add_argument("--astral-jar", default="",
                    help="Path to ASTRAL III jar (overrides --astral-dir)")
+    p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES,
+                   help="Min CNE count per species to retain (default: config value)")
+    p.add_argument("--min-occupancy", type=float, default=0.3,
+                   help="Min species occupancy per element (default: 0.3)")
+    p.add_argument("--min-site-occupancy", type=float, default=0.5,
+                   help="Min site occupancy per column for trimming (default: 0.5)")
     p.add_argument("-t", "--threads", type=int, default=4,
-                   help="Threads for ASTRAL IV / ASTER (default: 4)")
+                   help="Threads for IQ-TREE / ASTRAL (default: 4)")
     p.add_argument("--parallel", type=int, default=1,
-                    help="Number of parallel element processes (famsa always uses 1 thread each)")
+                   help="Parallel elements for FAMSA alignment (default: 1)")
     p.add_argument("--max-elements", type=int, default=100,
-                    help="Max elements to process (0=all)")
-    p.add_argument("--max-gap", type=float, default=0.5,
-                    help="Max gap fraction per column in alignment trimming (default: 0.5)")
+                   help="Max elements to process (0=all)")
     p.add_argument("--resume", action="store_true", default=True,
-                   help="Skip elements with existing .nwk files (default: on)")
+                   help="Skip existing .aln files (default: on)")
     p.add_argument("--no-resume", action="store_false", dest="resume",
                    help="Force reprocess all elements")
     return p.parse_args()
@@ -67,6 +73,46 @@ def find_fasta_files(elements_dir, max_elements):
     if max_elements > 0:
         files = files[:max_elements]
     return files
+
+
+def read_fasta_to_dict(path):
+    seqs = OrderedDict()
+    hdr = None
+    buf = []
+    with open(path, errors='replace') as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith('>'):
+                if hdr is not None:
+                    seqs[hdr] = ''.join(buf)
+                hdr = s[1:]
+                buf = []
+            else:
+                buf.append(s)
+        if hdr is not None:
+            seqs[hdr] = ''.join(buf)
+    return seqs
+
+
+def write_fasta(seqs, path):
+    with open(path, 'w') as f:
+        for hdr, seq in seqs.items():
+            f.write(f'>{hdr}\n{seq}\n')
+
+
+def filter_species_by_cne_count(fasta_files, min_cne):
+    """Compute species-to-keep based on CNE count across elements."""
+    counter = Counter()
+    for fp in fasta_files:
+        seqs = read_fasta_to_dict(fp)
+        counter.update(seqs.keys())
+    keep = {sp for sp, cnt in counter.items() if cnt >= min_cne}
+    removed = len(counter) - len(keep)
+    if removed:
+        print(f"  Species filter: {len(keep)} kept, {removed} removed (< {min_cne} CNEs)")
+    return keep
 
 
 def _flatten_fasta(path):
@@ -88,229 +134,180 @@ def _flatten_fasta(path):
         f.writelines(out)
 
 
-def trim_alignment(aln_path, max_gap=0.5):
-    """Remove alignment columns where gap fraction > max_gap."""
-    with open(aln_path) as f:
-        lines = f.readlines()
-    hdrs, seqs = [], []
-    for line in lines:
-        if line.startswith('>'):
-            hdrs.append(line.strip())
-        else:
-            seqs.append(list(line.strip()))
-    if not seqs or not seqs[0]:
-        return aln_path
-    ncol = len(seqs[0])
-    keep = [j for j in range(ncol)
-            if sum(seqs[i][j] == '-' for i in range(len(seqs))) / len(seqs) <= max_gap]
-    out_path = aln_path.replace('.aln', '.trimmed.aln')
-    with open(out_path, 'w') as f:
-        for i, h in enumerate(hdrs):
-            f.write(f'{h}\n{"".join(seqs[i][j] for j in keep)}\n')
-    return out_path
-
-
-def _process_one(args_tuple):
-    fasta_path, famsa_bin, fasttree_bin, resume, aln_dir, nwk_dir, max_gap = args_tuple
-
+def _align_one(args):
+    fasta_path, famsa_bin, resume, aln_dir, keep_sp = args
     base = os.path.basename(fasta_path).replace(".fasta", "")
     aln_path = os.path.join(aln_dir, base + ".aln")
-    nwk_path = os.path.join(nwk_dir, base + ".nwk")
-
-    # Align (FAMSA, always 1 thread per element process)
     if resume and os.path.isfile(aln_path):
-        aln_ok = True
-    else:
-        cmd = [famsa_bin, "-t", "1", fasta_path, aln_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return False, fasta_path, "align"
-        _flatten_fasta(aln_path)
-        aln_ok = True
-
-    # Alignment trimming (zero deps)
-    tree_in = trim_alignment(aln_path, max_gap)
-
-    # Gene tree (FastTree)
-    if resume and os.path.isfile(nwk_path):
-        tree_ok = True
-    else:
-        if not os.path.isfile(tree_in):
-            return False, fasta_path, "no_aln"
-        with open(tree_in) as f:
-            seq = ""
-            for line in f:
-                if not line.startswith(">"):
-                    seq += line.strip()
-                if len(seq) > 100:
-                    break
-        is_nucleotide = all(c in "ACGTacgtNn-" for c in seq) if seq else True
-        cmd = [fasttree_bin]
-        if is_nucleotide:
-            cmd.append("-nt")
-        cmd.extend(["-gtr", "-nosupport"])
-        with open(aln_path) as inp, open(nwk_path, "w") as out:
-            result = subprocess.run(cmd, stdin=inp, stdout=out,
-                                    stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            return False, fasta_path, "tree"
-        tree_ok = True
-
+        return True, fasta_path, None
+    seqs = read_fasta_to_dict(fasta_path)
+    if keep_sp is not None:
+        seqs = {h: s for h, s in seqs.items() if h in keep_sp}
+    if len(seqs) < 2:
+        return False, fasta_path, "too_few_species"
+    tmp_fa = fasta_path.replace('.fasta', '_filtered.fasta')
+    write_fasta(seqs, tmp_fa)
+    cmd = [famsa_bin, "-t", "1", tmp_fa, aln_path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, fasta_path, "align"
+    _flatten_fasta(aln_path)
+    os.remove(tmp_fa)
     return True, fasta_path, None
 
 
-def run_astral_iv(bin_path, gene_trees_path, output_path, threads=4):
-    cmd = [bin_path, "-i", gene_trees_path, "-o", output_path, "-t", str(threads)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ASTRAL IV error: {result.stderr[:500]}", file=sys.stderr)
+def run_concat_msa(aln_dir, min_occ, min_site_occ, out_dir, threads, iqtree3):
+    concat_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "utils", "concat_msa.py")
+    supermatrix = os.path.join(out_dir, "supermatrix.fa")
+    partitions = os.path.join(out_dir, "partitions.txt")
+    cmd = ["python3", concat_script, "-i", aln_dir, "--suffix", ".aln",
+           "--min-occupancy", str(min_occ),
+           "--min-site-occupancy", str(min_site_occ),
+           "-o", supermatrix, "-p", partitions]
+    if subprocess.run(cmd).returncode != 0:
+        print("  concat_msa.py failed!")
         return False
+    iq_cmd = [iqtree3, "-s", supermatrix, "-p", partitions,
+              "-m", "MFP+MERGE", "-bb", "1000", "-nt", str(threads)]
+    subprocess.run(iq_cmd)
     return True
 
 
-def run_astral_iii(jar_path, gene_trees_path, output_path):
-    cmd = ["java", "-Xmx8g", "-jar", jar_path, "-i", gene_trees_path,
-           "-o", output_path, "--extraLevel", "0"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ASTRAL III error: {result.stderr[:500]}", file=sys.stderr)
-        return False
-    return True
+def run_astral_method(fasta_files, aln_dir, out_dir, fasttree_bin,
+                      astral_bin, astral_jar, threads, parallel, resume, keep_sp):
+    nwk_dir = os.path.join(out_dir, "nwk")
+    astral_outdir = os.path.join(out_dir, "astral")
+    os.makedirs(nwk_dir, exist_ok=True)
+    os.makedirs(astral_outdir, exist_ok=True)
+
+    # Detect ASTRAL mode
+    use_iv = os.path.isfile(astral_bin) if astral_bin else False
+    jar_path = astral_jar
+    if not use_iv and not jar_path:
+        print("  No ASTRAL binary found, skipping ASTRAL step.")
+        return
+
+    # FastTree per element
+    print(f"\n--- Gene trees (FastTree) ---")
+    ok_count = fail_count = 0
+    total = len(fasta_files)
+    for i, fp in enumerate(fasta_files):
+        base = os.path.basename(fp).replace(".fasta", "")
+        nwk_path = os.path.join(nwk_dir, base + ".nwk")
+        aln_path = os.path.join(aln_dir, base + ".aln")
+        if resume and os.path.isfile(nwk_path):
+            ok_count += 1
+            continue
+        if not os.path.isfile(aln_path):
+            fail_count += 1
+            continue
+        with open(aln_path) as f:
+            seq = "".join(line.strip() for line in f if not line.startswith(">"))[:100]
+        is_nt = all(c in "ACGTacgtNn-" for c in seq) if seq else True
+        cmd = [fasttree_bin]
+        if is_nt:
+            cmd.append("-nt")
+        cmd.extend(["-gtr", "-nosupport"])
+        with open(aln_path) as inp, open(nwk_path, "w") as out:
+            r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0:
+            ok_count += 1
+        else:
+            fail_count += 1
+    print(f"  FastTree: {ok_count} OK, {fail_count} FAIL")
+
+    # Collect gene trees
+    all_trees = []
+    for fp in fasta_files:
+        base = os.path.basename(fp).replace(".fasta", "")
+        nwk_path = os.path.join(nwk_dir, base + ".nwk")
+        if os.path.isfile(nwk_path):
+            with open(nwk_path) as f:
+                t = f.read().strip()
+                if t:
+                    all_trees.append(t)
+    gene_trees_path = os.path.join(astral_outdir, "gene_trees.nwk")
+    with open(gene_trees_path, 'w') as f:
+        for t in all_trees:
+            f.write(t + '\n')
+    print(f"  Collected {len(all_trees)} gene trees")
+
+    # ASTRAL
+    if len(all_trees) < 2:
+        print("  Too few gene trees for ASTRAL (need >= 2)")
+        return
+    species_tree_path = os.path.join(astral_outdir, "species_tree.nwk")
+    if use_iv:
+        cmd = [astral_bin, "-i", gene_trees_path, "-o", species_tree_path, "-t", str(threads)]
+    else:
+        cmd = ["java", "-Xmx8g", "-jar", jar_path, "-i", gene_trees_path,
+               "-o", species_tree_path, "--extraLevel", "0"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0:
+        with open(species_tree_path) as f:
+            print(f"\nSpecies tree:\n{f.read().strip()}")
+    else:
+        print(f"  ASTRAL failed: {r.stderr[:300]}")
 
 
 def main():
     args = parse_args()
-
     famsa = os.path.expanduser(args.famsa)
-    fasttree = os.path.expanduser(args.fasttree)
-    astral_bin = os.path.expanduser(args.astral_bin)
-    astral_dir = os.path.expanduser(args.astral_dir)
-    astral_jar = os.path.expanduser(args.astral_jar) if args.astral_jar else ""
 
     if not os.path.isfile(famsa):
         sys.exit(f"FAMSA not found: {famsa}")
-    if not os.path.isfile(fasttree):
-        sys.exit(f"FastTree not found: {fasttree}")
 
-    # Detect ASTRAL mode: IV (native) > III (jar)
-    use_astral_iv = False
-    if os.path.isfile(astral_bin):
-        use_astral_iv = True
-    elif not astral_jar:
-        candidates = [os.path.join(astral_dir, "astral.5.7.1.jar")]
-        for f in glob.glob(os.path.join(astral_dir, "*.jar")):
-            candidates.insert(0, f)
-        for c in candidates:
-            if os.path.isfile(c):
-                astral_jar = c
-                break
-        if not astral_jar:
-            sys.exit(f"No ASTRAL binary found.\n"
-                     f"  Try: --astral-bin {astral_bin} (IV/native)\n"
-                     f"  Or:  --astral-jar <path> (III/Java)")
-
+    print(f"Method:   {args.method}")
     print(f"FAMSA:    {famsa}")
-    print(f"FastTree: {fasttree}")
-    if use_astral_iv:
-        print(f"ASTRAL:   {astral_bin} (IV/native, {args.threads} threads)")
-    else:
-        print(f"ASTRAL:   {astral_jar} (III/Java)")
-    print(f"Parallel:      {args.parallel} elements simultaneously")
-    print(f"Resume:   {'on' if args.resume else 'off'}")
+    print(f"Min CNE/species: {args.min_cne_per_species}")
+    print(f"Max elements:    {'all' if args.max_elements == 0 else args.max_elements}")
     print()
 
-    # Setup output subdirectories based on elements_dir parent
     base_dir = os.path.dirname(os.path.abspath(args.elements_dir))
     aln_dir = os.path.join(base_dir, "aln")
-    nwk_dir = os.path.join(base_dir, "nwk")
-    astral_outdir = os.path.join(base_dir, "astral")
-    for d in (aln_dir, nwk_dir, astral_outdir):
-        os.makedirs(d, exist_ok=True)
+    os.makedirs(aln_dir, exist_ok=True)
 
     fasta_files = find_fasta_files(args.elements_dir, args.max_elements)
     print(f"Found {len(fasta_files)} element FASTAs")
     if not fasta_files:
-        sys.exit("No element FASTAs found. Run step 05 first.")
+        sys.exit("No element FASTAs found. Run step 04 first.")
 
-    # Process elements (parallel)
-    total = len(fasta_files)
-    work = [(f, famsa, fasttree, args.resume, aln_dir, nwk_dir, args.max_gap) for f in fasta_files]
+    keep_sp = filter_species_by_cne_count(fasta_files, args.min_cne_per_species)
 
+    # FAMSA alignment
+    print(f"\n--- Aligning elements (FAMSA) ---")
     t0 = time.time()
-    ok_count = 0
-    fail_count = 0
-    done_count = 0
-
+    work = [(f, famsa, args.resume, aln_dir, keep_sp) for f in fasta_files]
+    ok_count = fail_count = 0
     if args.parallel > 1:
         with Pool(args.parallel) as p:
-            for ok, fpath, stage in p.imap_unordered(_process_one, work):
-                done_count += 1
-                if ok:
-                    ok_count += 1
-                else:
-                    fail_count += 1
-                if done_count % 500 == 0 or done_count == total:
-                    elapsed = time.time() - t0
-                    rate = done_count / elapsed if elapsed > 0 else 0
-                    eta = (total - done_count) / rate if rate > 0 else 0
-                    print(f"  {done_count}/{total}  OK={ok_count}  "
-                          f"FAIL={fail_count}  {rate:.1f}/s  ETA={eta:.0f}s")
+            for ok, _, _ in p.imap_unordered(_align_one, work):
+                if ok: ok_count += 1
+                else: fail_count += 1
     else:
         for w in work:
-            ok, fpath, stage = _process_one(w)
-            done_count += 1
-            if ok:
-                ok_count += 1
-            else:
-                fail_count += 1
-            if done_count % 100 == 0 or done_count == total:
-                elapsed = time.time() - t0
-                rate = done_count / elapsed if elapsed > 0 else 0
-                eta = (total - done_count) / rate if rate > 0 else 0
-                print(f"  {done_count}/{total}  OK={ok_count}  "
-                      f"FAIL={fail_count}  {rate:.1f}/s  ETA={eta:.0f}s")
+            ok, _, _ = _align_one(w)
+            if ok: ok_count += 1
+            else: fail_count += 1
+    print(f"  Done in {time.time() - t0:.1f}s ({ok_count} OK, {fail_count} FAIL)")
 
-    t1 = time.time()
-    print(f"\n  Done in {t1 - t0:.1f}s  ({ok_count} OK, {fail_count} FAIL)")
-
-    # Collect gene trees
-    print(f"\n--- Collecting gene trees ---")
-    all_trees = []
-    for fasta_path in fasta_files:
-        base = os.path.basename(fasta_path).replace(".fasta", "")
-        nwk_path = os.path.join(nwk_dir, base + ".nwk")
-        if os.path.isfile(nwk_path):
-            with open(nwk_path) as f:
-                tree = f.read().strip()
-                if tree:
-                    all_trees.append(tree)
-
-    gene_trees_path = os.path.join(astral_outdir, "gene_trees.nwk")
-    with open(gene_trees_path, "w") as f:
-        for t in all_trees:
-            f.write(t + "\n")
-    print(f"Collected {len(all_trees)} gene trees -> {gene_trees_path}")
-
-    # ASTRAL
-    version = "IV" if use_astral_iv else "III"
-    print(f"\n--- Running ASTRAL {version} ---")
-    species_tree_path = os.path.join(astral_outdir, "species_tree.nwk")
-    if len(all_trees) < 2:
-        print("Too few gene trees for ASTRAL (need >= 2)")
-    else:
-        t0 = time.time()
-        if use_astral_iv:
-            ok = run_astral_iv(astral_bin, gene_trees_path, species_tree_path, args.threads)
-        else:
-            ok = run_astral_iii(astral_jar, gene_trees_path, species_tree_path)
-        t1 = time.time()
+    # Phylogeny
+    if args.method == "concat":
+        iqtree3 = os.path.expanduser(args.iqtree3)
+        if not os.path.isfile(iqtree3):
+            sys.exit(f"IQ-TREE 3 not found: {iqtree3}")
+        print(f"\n--- Concatenation + IQ-TREE 3 ---")
+        ok = run_concat_msa(aln_dir, args.min_occupancy, args.min_site_occupancy,
+                            base_dir, args.threads, iqtree3)
         if ok:
-            with open(species_tree_path) as f:
-                tree = f.read().strip()
-            print(f"  ASTRAL {version} done in {t1 - t0:.1f}s")
-            print(f"\nSpecies tree:\n{tree}")
-        else:
-            print(f"ASTRAL {version} failed!")
+            print(f"  Species tree: {os.path.join(base_dir, 'supermatrix.fa.treefile')}")
+    else:
+        fasttree = os.path.expanduser(args.fasttree)
+        astral_bin = os.path.expanduser(args.astral_bin)
+        run_astral_method(fasta_files, aln_dir, base_dir, fasttree,
+                          astral_bin, args.astral_jar, args.threads,
+                          args.parallel, args.resume, keep_sp)
 
     print("\nDone!")
 
