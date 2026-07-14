@@ -61,9 +61,9 @@ def parse_args():
     p.add_argument("--parallel", dest="alignment_jobs", type=int,
                    default=C.ALIGNMENT_JOBS, help=argparse.SUPPRESS)
     p.add_argument("--astral-threads", dest="astral_threads", type=int,
-                   default=C.DEFAULT_THREADS)
+                   default=C.ASTRAL_THREADS)
     p.add_argument("-t", "--threads", dest="astral_threads", type=int,
-                   default=C.DEFAULT_THREADS, help=argparse.SUPPRESS)
+                   default=C.ASTRAL_THREADS, help=argparse.SUPPRESS)
     p.add_argument("--max-elements", type=int, default=100)
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no-resume", action="store_false", dest="resume")
