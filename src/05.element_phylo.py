@@ -58,10 +58,14 @@ def parse_args():
                    help="Min species occupancy per element (default: 0.3)")
     p.add_argument("--min-site-occupancy", type=float, default=0.5,
                    help="Min site occupancy per column for trimming (default: 0.5)")
-    p.add_argument("-t", "--threads", type=int, default=4,
-                   help="Threads for IQ-TREE / ASTRAL (default: 4)")
-    p.add_argument("--parallel", type=int, default=1,
-                   help="Parallel elements for FAMSA alignment (default: 1)")
+    p.add_argument("--alignment-jobs", dest="alignment_jobs", type=int,
+                   default=C.ALIGNMENT_JOBS, help="Parallel FAMSA processes (default: config)")
+    p.add_argument("--parallel", dest="alignment_jobs", type=int,
+                   default=C.ALIGNMENT_JOBS, help=argparse.SUPPRESS)
+    p.add_argument("--astral-threads", dest="astral_threads", type=int,
+                   default=C.DEFAULT_THREADS, help="Threads for ASTRAL (default: config)")
+    p.add_argument("-t", "--threads", dest="astral_threads", type=int,
+                   default=C.DEFAULT_THREADS, help=argparse.SUPPRESS)
     p.add_argument("--max-elements", type=int, default=100,
                    help="Max elements to process (0=all)")
     p.add_argument("--resume", action="store_true", default=True,
@@ -297,8 +301,8 @@ def main():
     t0 = time.time()
     work = [(f, famsa, args.resume, aln_dir, keep_sp) for f in fasta_files]
     ok_count = fail_count = 0
-    if args.parallel > 1:
-        with Pool(args.parallel) as p:
+    if args.alignment_jobs > 1:
+        with Pool(args.alignment_jobs) as p:
             for ok, _, _ in p.imap_unordered(_align_one, work):
                 if ok: ok_count += 1
                 else: fail_count += 1
@@ -323,8 +327,8 @@ def main():
         fasttree = os.path.expanduser(args.fasttree)
         astral_bin = os.path.expanduser(args.astral_bin)
         run_astral_method(fasta_files, aln_dir, base_dir, fasttree,
-                          astral_bin, args.astral_jar, args.threads,
-                          args.parallel, args.resume, keep_sp,
+                          astral_bin, args.astral_jar, args.astral_threads,
+                          args.alignment_jobs, args.resume, keep_sp,
                           args.min_site_occupancy)
 
     print("\nDone!")
