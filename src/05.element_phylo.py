@@ -44,6 +44,8 @@ def parse_args():
     p.add_argument("--famsa", default=C.FAMSA, help="Path to famsa binary")
     p.add_argument("--fasttree", default=C.FastTree, help="Path to FastTree binary")
     p.add_argument("--iqtree3", default=C.IQTREE3, help="Path to IQ-TREE 3 binary (--method concat)")
+    p.add_argument("--iqtree-threads", type=int, default=C.IQTREE_THREADS,
+                   help="Threads for IQ-TREE 3 (default: config value)")
     p.add_argument("--astral-bin", default=C.ASTRAL,
                    help="Path to ASTRAL IV / ASTER binary (--method astral)")
     p.add_argument("--astral-dir", default="",
@@ -158,7 +160,7 @@ def _align_one(args):
     return True, fasta_path, None
 
 
-def run_concat_msa(aln_dir, min_occ, min_site_occ, out_dir, threads, iqtree3):
+def run_concat_msa(aln_dir, min_occ, min_site_occ, out_dir, iqtree3, iqtree_threads):
     concat_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "utils", "concat_msa.py")
     supermatrix = os.path.join(out_dir, "supermatrix.fa")
@@ -171,7 +173,7 @@ def run_concat_msa(aln_dir, min_occ, min_site_occ, out_dir, threads, iqtree3):
         print("  concat_msa.py failed!")
         return False
     iq_cmd = [iqtree3, "-s", supermatrix, "-p", partitions,
-              "-m", "MFP+MERGE", "-bb", "1000", "-nt", str(threads)]
+              "-m", "GTR+G4", "-bb", "1000", "-nt", str(iqtree_threads)]
     subprocess.run(iq_cmd)
     return True
 
@@ -314,7 +316,7 @@ def main():
             sys.exit(f"IQ-TREE 3 not found: {iqtree3}")
         print(f"\n--- Concatenation + IQ-TREE 3 ---")
         ok = run_concat_msa(aln_dir, args.min_occupancy, args.min_site_occupancy,
-                            base_dir, args.threads, iqtree3)
+                            base_dir, iqtree3, args.iqtree_threads)
         if ok:
             print(f"  Species tree: {os.path.join(base_dir, 'supermatrix.fa.treefile')}")
     else:

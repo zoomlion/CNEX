@@ -17,3 +17,4 @@ IQTREE3  = "iqtree3"
 
 # Pipeline thresholds
 MIN_CNE_PER_SPECIES = 100
+IQTREE_THREADS = 20
