@@ -18,6 +18,26 @@ def parse_args():
 def clean_seq(s):
     return s.replace("\x00", "N").replace(".", "-")
 
+def trim_alignment_by_occupancy(seqs, min_site_occupancy=0.5):
+    """Filter alignment columns by site occupancy.
+
+    Args:
+        seqs: {name: sequence_string} — aligned sequences of equal length.
+        min_site_occupancy: 0–1, fraction of non-gap species required per column.
+
+    Returns:
+        {name: filtered_sequence}
+    """
+    if not seqs or min_site_occupancy <= 0:
+        return seqs
+    names = list(seqs.keys())
+    ncol = len(seqs[names[0]])
+    min_non_gap = max(1, int(len(names) * min_site_occupancy))
+    keep = [j for j in range(ncol)
+            if sum(1 for sp in names if seqs[sp][j] not in '-Nn?') >= min_non_gap]
+    return {sp: ''.join(seqs[sp][j] for j in keep) for sp in names}
+
+
 def read_fasta(path):
     seqs = OrderedDict()
     with open(path) as f:
@@ -90,31 +110,32 @@ def main():
     if args.min_site_occupancy > 0:
         min_occ = args.min_site_occupancy / 100 if args.min_site_occupancy > 1 else args.min_site_occupancy
         total_sp = len(species_list)
-        min_non_gap = int(total_sp * min_occ)
+        min_non_gap = max(1, int(total_sp * min_occ))
         flat = {sp: ''.join(supermatrix[sp]) for sp in species_list}
         aln_len = len(next(iter(flat.values())))
-        keep_cols = [i for i in range(aln_len)
+        # Build column-to-element map
+        elem_of_col = []
+        for i, seqs in enumerate(aln_data):
+            elem_of_col.extend([i] * len(next(iter(seqs.values()))))
+        # Filter columns
+        keep_cols = [j for j in range(aln_len)
                      if sum(1 for sp in species_list
-                            if flat[sp][i] not in '-Nn?') >= min_non_gap]
+                            if flat[sp][j] not in '-Nn?') >= min_non_gap]
         for sp in species_list:
-            supermatrix[sp] = [flat[sp][i] for i in keep_cols]
+            supermatrix[sp] = [flat[sp][j] for j in keep_cols]
         print(f"Site occupancy filter >= {min_occ:.0%}: {aln_len} -> {len(keep_cols)} sites (removed {aln_len - len(keep_cols)})")
 
-        # Recalculate partition coordinates after site filtering
-        part_boundaries = []
-        p = 0
-        for i, seqs in enumerate(aln_data):
-            aln_len = len(next(iter(seqs.values()))) if seqs else 0
-            kept = sum(1 for ci in range(p, p + aln_len) if ci in keep_cols)
-            if kept > 0:
-                part_boundaries.append((i, kept))
-            p += aln_len
-
+        # Recalculate partitions
+        part_counts = {}
+        for j in keep_cols:
+            ei = elem_of_col[j]
+            part_counts[ei] = part_counts.get(ei, 0) + 1
         pos = 1
         partitions = []
-        for orig_idx, kept_len in part_boundaries:
-            partitions.append(f"GTR+G4, {orig_idx}={pos}-{pos + kept_len - 1}")
-            pos += kept_len
+        for orig_idx in sorted(part_counts):
+            kept = part_counts[orig_idx]
+            partitions.append(f"GTR+G4, {orig_idx}={pos}-{pos + kept - 1}")
+            pos += kept
 
     # Write FASTA
     with open(args.output, "w") as f:

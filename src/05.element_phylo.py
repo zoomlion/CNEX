@@ -30,7 +30,9 @@ except RuntimeError:
 Pool = mp.get_context('spawn').Pool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
 import config as C
+from concat_msa import trim_alignment_by_occupancy, read_fasta
 
 
 def parse_args():
@@ -175,7 +177,8 @@ def run_concat_msa(aln_dir, min_occ, min_site_occ, out_dir, threads, iqtree3):
 
 
 def run_astral_method(fasta_files, aln_dir, out_dir, fasttree_bin,
-                      astral_bin, astral_jar, threads, parallel, resume, keep_sp):
+                      astral_bin, astral_jar, threads, parallel, resume, keep_sp,
+                      min_site_occ=0.0):
     nwk_dir = os.path.join(out_dir, "nwk")
     astral_outdir = os.path.join(out_dir, "astral")
     os.makedirs(nwk_dir, exist_ok=True)
@@ -202,14 +205,26 @@ def run_astral_method(fasta_files, aln_dir, out_dir, fasttree_bin,
         if not os.path.isfile(aln_path):
             fail_count += 1
             continue
-        with open(aln_path) as f:
+        # Trim alignment by site occupancy
+        if min_site_occ > 0:
+            sq = read_fasta(aln_path)
+            trimmed = trim_alignment_by_occupancy(sq, min_site_occ)
+            aln_trimmed = aln_path + ".trimmed"
+            with open(aln_trimmed, 'w') as tf:
+                for h, s in trimmed.items():
+                    tf.write(f'>{h}\n{s}\n')
+            fasta_input = aln_trimmed
+        else:
+            fasta_input = aln_path
+        # Detect nucleotide type
+        with open(fasta_input) as f:
             seq = "".join(line.strip() for line in f if not line.startswith(">"))[:100]
         is_nt = all(c in "ACGTacgtNn-" for c in seq) if seq else True
         cmd = [fasttree_bin]
         if is_nt:
             cmd.append("-nt")
         cmd.extend(["-gtr", "-nosupport"])
-        with open(aln_path) as inp, open(nwk_path, "w") as out:
+        with open(fasta_input) as inp, open(nwk_path, "w") as out:
             r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
         if r.returncode == 0:
             ok_count += 1
@@ -307,7 +322,8 @@ def main():
         astral_bin = os.path.expanduser(args.astral_bin)
         run_astral_method(fasta_files, aln_dir, base_dir, fasttree,
                           astral_bin, args.astral_jar, args.threads,
-                          args.parallel, args.resume, keep_sp)
+                          args.parallel, args.resume, keep_sp,
+                          args.min_site_occupancy)
 
     print("\nDone!")
 
