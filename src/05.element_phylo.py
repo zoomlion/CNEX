@@ -4,7 +4,8 @@ Step 05: Per-element alignment (FAMSA) + phylogeny.
 
 Methods:
   --method concat (default): align → concat_msa → script → IQ-TREE 3
-  --method astral (fallback): align → FastTree → script → ASTRAL
+  --method astral           : align → FastTree → script → ASTRAL
+  --method both             : run concat + astral in a single command
 
 Tags + thresholds: loops over tag × threshold combos, generates run scripts.
   --submit (default): auto-execute scripts after generation.
@@ -41,7 +42,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Element phylogeny: FAMSA + concat/IQ-TREE or ASTRAL")
     p.add_argument("--elements-dir", default="results/fasta",
                    help="Directory with per-element FASTAs")
-    p.add_argument("--method", default=C.DEFAULT_METHOD, choices=["concat", "astral"])
+    p.add_argument("--method", default=C.DEFAULT_METHOD, choices=["concat", "astral", "both"])
     p.add_argument("--famsa", default=C.FAMSA)
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
@@ -260,8 +261,8 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, min_site_occ, out_dir,
         print(f"  concat_msa.py failed for {tag_name}/{thr_label}")
         return
 
-    # write run script
-    script_path = os.path.join(out_dir, f"run_iqtree_{tag_name}_{thr_label}.sh")
+    # write run.sh
+    script_path = os.path.join(out_dir, "run.sh")
     n_threads = iqtree_threads
     cmds = [
         f"iqtree3 -s {os.path.basename(supermatrix)}",
@@ -347,7 +348,7 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
 
     # write ASTRAL run script
     species_tree_path = os.path.join(out_dir, "species_tree.nwk")
-    script_path = os.path.join(out_dir, f"run_astral_{tag_name}_{thr_label}.sh")
+    script_path = os.path.join(out_dir, "run.sh")
     if use_iv:
         cmds = [f"{astral_bin} -i {os.path.basename(gene_trees_path)}",
                 f"    -o {os.path.basename(species_tree_path)} -t {astral_threads}"]
@@ -424,12 +425,24 @@ def main():
     astral_levels = [None] + (astral_quantiles if astral_quantiles else [])
 
     # ─── Method-dispatch ─────────────────────────────────
-    all_scripts = []
+    methods = ["concat", "astral"] if args.method == "both" else [args.method]
 
-    if args.method == "concat":
-        iqtree3 = os.path.expanduser(args.iqtree3)
-        if not os.path.isfile(iqtree3):
-            sys.exit(f"IQ-TREE 3 not found: {iqtree3}")
+    for m in methods:
+        all_scripts = []
+
+        if m == "concat":
+            iqtree3 = os.path.expanduser(args.iqtree3)
+            if not os.path.isfile(iqtree3):
+                sys.exit(f"IQ-TREE 3 not found: {iqtree3}")
+            base_out = os.path.join(base_dir, "iqtree")
+            levels = concat_levels
+            quantiles = concat_quantiles
+        else:
+            fasttree = os.path.expanduser(args.fasttree)
+            astral_bin = os.path.expanduser(args.astral_bin)
+            base_out = os.path.join(base_dir, "astral")
+            levels = astral_levels
+            quantiles = astral_quantiles
 
         for tag_name, tag_ids in sorted(tag_dict.items()):
             tag_files = fasta_files
@@ -440,13 +453,12 @@ def main():
                 print(f"  Skip tag '{tag_name}': only {len(tag_files)} elements")
                 continue
 
-            # compute length quantiles for this tag
             tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
-            tag_cuts = quantile_cutoffs(tag_lens, concat_quantiles) if concat_quantiles else {}
+            tag_cuts = quantile_cutoffs(tag_lens, quantiles) if quantiles else {}
 
-            for level in concat_levels:
+            for level in levels:
                 thr_label = f"quantile_{level}" if level is not None else "all"
-                out_dir = os.path.join(base_dir, "iqtree", tag_name, thr_label)
+                out_dir = os.path.join(base_out, tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
 
                 if level is not None:
@@ -468,72 +480,23 @@ def main():
                     keep = tag_files
                     print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
 
-                sp = run_concat_subset(aln_dir, keep, args.min_occupancy,
-                                       args.min_site_occupancy, out_dir,
-                                       iqtree3, args.iqtree_threads, submit,
-                                       tag_name, thr_label)
-                if sp:
-                    all_scripts.append(sp)
-
-        # write run_all.sh
-        all_scr_path = os.path.join(base_dir, "iqtree", "run_all_iqtree.sh")
-        write_script(all_scr_path,
-                     [os.path.relpath(s, os.path.dirname(all_scr_path))
-                      for s in all_scripts],
-                     "Run all IQ-TREE scripts")
-
-    else:  # astral
-        fasttree = os.path.expanduser(args.fasttree)
-        astral_bin = os.path.expanduser(args.astral_bin)
-
-        for tag_name, tag_ids in sorted(tag_dict.items()):
-            tag_files = fasta_files
-            if tag_ids is not None:
-                tag_files = [f for f in fasta_files
-                             if int(os.path.basename(f).replace(".fasta", "").split('.')[0]) in tag_ids]
-            if len(tag_files) < 3:
-                continue
-
-            # compute length quantiles for this tag
-            tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
-            tag_cuts = quantile_cutoffs(tag_lens, astral_quantiles) if astral_quantiles else {}
-
-            for level in astral_levels:
-                thr_label = f"quantile_{level}" if level is not None else "all"
-                out_dir = os.path.join(base_dir, "astral", tag_name, thr_label)
-                os.makedirs(out_dir, exist_ok=True)
-
-                if level is not None:
-                    cutoff = tag_cuts.get(level, 0)
-                    keep = []
-                    for fp in tag_files:
-                        b = os.path.basename(fp).replace(".fasta", "")
-                        ap = os.path.join(aln_dir, b + ".aln")
-                        if os.path.isfile(ap):
-                            sq = read_fasta(ap)
-                            avg = sum(sum(1 for c in s if c not in '-Nn?') for s in sq.values()) / len(sq)
-                            if avg >= cutoff:
-                                keep.append(fp)
-                    if len(keep) < 3:
-                        continue
-                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements (≥{cutoff:.0f}bp, P{level})")
+                if m == "concat":
+                    sp = run_concat_subset(aln_dir, keep, args.min_occupancy,
+                                           args.min_site_occupancy, out_dir,
+                                           iqtree3, args.iqtree_threads, submit,
+                                           tag_name, thr_label)
                 else:
-                    keep = tag_files
-                    print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
-
-                sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
-                                       astral_bin, args.astral_jar,
-                                       args.astral_threads, args.min_site_occupancy,
-                                       submit, tag_name, thr_label)
+                    sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
+                                           astral_bin, args.astral_jar,
+                                           args.astral_threads, args.min_site_occupancy,
+                                           submit, tag_name, thr_label)
                 if sp:
                     all_scripts.append(sp)
 
         # write run_all.sh
-        all_scr_path = os.path.join(base_dir, "astral", "run_all_astral.sh")
-        write_script(all_scr_path,
-                     [os.path.relpath(s, os.path.dirname(all_scr_path))
-                      for s in all_scripts],
-                     "Run all ASTRAL scripts")
+        all_scr_path = os.path.join(base_out, "run_all.sh")
+        cmds = [f"bash {os.path.relpath(s, base_out)}" for s in all_scripts]
+        write_script(all_scr_path, cmds, f"Run all {m.upper()} scripts")
 
     print("\nDone!")
 
