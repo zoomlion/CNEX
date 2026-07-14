@@ -49,3 +49,5 @@ shell/probe_test.py
 shell/simu_one.sh
 shell/wgsim_gen.sh
 config.py
+element_tags.tsv
+bugs/

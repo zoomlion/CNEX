@@ -20,3 +20,10 @@ MIN_CNE_PER_SPECIES = 100
 ALIGNMENT_JOBS = 4           # parallel FAMSA processes
 DEFAULT_THREADS = 20         # default threads for ASTRAL
 IQTREE_THREADS = 20          # IQ-TREE 3 thread count
+
+# Phylogeny defaults
+DEFAULT_METHOD = "concat"                    # "concat" or "astral"
+CONCAT_IDENTITY_THRESHOLDS = "0.4,0.6,0.8"  # comma-separated thresholds; empty = single run
+ASTRAL_LENGTH_THRESHOLDS = "50,100"          # comma-separated min-length thresholds; empty = single run
+ELEMENT_TAGS_FILE = ""                       # path to element_tags.tsv (ele_id\\ttag with header), empty = no tags
+DRY_RUN = False                              # True = only generate scripts, don't run
