@@ -52,7 +52,8 @@ def parse_args():
     p.add_argument("--element-tags", default=C.ELEMENT_TAGS_FILE,
                    help="TSV (ele_id\\ttag); empty = no tags")
     p.add_argument("--identity-thresholds", type=str, default=C.CONCAT_IDENTITY_THRESHOLDS)
-    p.add_argument("--length-thresholds", type=str, default=C.ASTRAL_LENGTH_THRESHOLDS)
+    p.add_argument("--astral-identity-thresholds", type=str, default=C.ASTRAL_IDENTITY_THRESHOLDS)
+    p.add_argument("--length-thresholds", type=str, default=C.ASTRAL_IDENTITY_THRESHOLDS, help=argparse.SUPPRESS)
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
     p.add_argument("--min-occupancy", type=float, default=0.3)
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
@@ -392,8 +393,8 @@ def main():
     # ─── Thresholds ──────────────────────────────────────
     concat_thrs = [float(x) for x in args.identity_thresholds.split(",") if x.strip()] \
                   if args.identity_thresholds.strip() else []
-    astral_thrs = [int(x) for x in args.length_thresholds.split(",") if x.strip()] \
-                  if args.length_thresholds.strip() else []
+    astral_thrs = [float(x) for x in args.astral_identity_thresholds.split(",") if x.strip()] \
+                  if args.astral_identity_thresholds.strip() else []
 
     # all + thresholds
     concat_levels = [None] + (concat_thrs if concat_thrs else [])
@@ -464,7 +465,7 @@ def main():
                 continue
 
             for level in astral_levels:
-                thr_label = f"len_{level}" if level is not None else "all"
+                thr_label = f"identity_{level}" if level is not None else "all"
                 out_dir = os.path.join(base_dir, "astral", tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
 
@@ -473,14 +474,11 @@ def main():
                     for fp in tag_files:
                         b = os.path.basename(fp).replace(".fasta", "")
                         ap = os.path.join(aln_dir, b + ".aln")
-                        if os.path.isfile(ap):
-                            sq = read_fasta(ap)
-                            aln_len = len(next(iter(sq.values()))) if sq else 0
-                            if aln_len >= level:
-                                keep.append(fp)
+                        if os.path.isfile(ap) and average_pairwise_identity(ap) >= level:
+                            keep.append(fp)
                     if len(keep) < 3:
                         continue
-                    print(f"  {tag_name}/{thr_label}: {len(keep)} elements (min_len={level})")
+                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements")
                 else:
                     keep = tag_files
                     print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
