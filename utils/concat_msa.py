@@ -15,26 +15,6 @@ def parse_args():
                    help="Min species occupancy per site (0-1) to retain column (default: 0)")
     return p.parse_args()
 
-def average_pairwise_identity(aln_path):
-    """Compute average pairwise identity from an aligned FASTA file."""
-    seqs = read_fasta(aln_path)
-    names = list(seqs.keys())
-    if len(names) < 2:
-        return 1.0
-    total_id = 0
-    pairs = 0
-    for i in range(len(names)):
-        si = seqs[names[i]]
-        for j in range(i + 1, len(names)):
-            sj = seqs[names[j]]
-            match = sum(1 for a, b in zip(si, sj) if a == b and a not in '-Nn?')
-            total_col = sum(1 for a, b in zip(si, sj) if a not in '-Nn?' or b not in '-Nn?')
-            if total_col > 0:
-                total_id += match / total_col
-                pairs += 1
-    return total_id / pairs if pairs > 0 else 1.0
-
-
 def clean_seq(s):
     return s.replace("\x00", "N").replace(".", "-")
 

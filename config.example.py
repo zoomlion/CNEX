@@ -23,7 +23,7 @@ IQTREE_THREADS = 20          # IQ-TREE 3 thread count
 
 # Phylogeny defaults
 DEFAULT_METHOD = "concat"                    # "concat" or "astral"
-CONCAT_IDENTITY_THRESHOLDS = "0.4,0.6,0.8"  # comma-separated identity thresholds; empty = single run
-ASTRAL_IDENTITY_THRESHOLDS = "0.4,0.6,0.8"  # comma-separated identity thresholds; empty = single run
+CONCAT_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
+ASTRAL_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
 ELEMENT_TAGS_FILE = ""                       # path to element_tags.tsv (ele_id\\ttag with header), empty = no tags
 DRY_RUN = False                              # True = only generate scripts, don't run

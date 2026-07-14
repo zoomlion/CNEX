@@ -32,7 +32,7 @@ Pool = mp.get_context('spawn').Pool
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
 import config as C
-from concat_msa import trim_alignment_by_occupancy, read_fasta, average_pairwise_identity
+from concat_msa import trim_alignment_by_occupancy, read_fasta
 
 
 # ─── helpers ───────────────────────────────────────────────
@@ -51,9 +51,8 @@ def parse_args():
     p.add_argument("--astral-jar", default="")
     p.add_argument("--element-tags", default=C.ELEMENT_TAGS_FILE,
                    help="TSV (ele_id\\ttag); empty = no tags")
-    p.add_argument("--identity-thresholds", type=str, default=C.CONCAT_IDENTITY_THRESHOLDS)
-    p.add_argument("--astral-identity-thresholds", type=str, default=C.ASTRAL_IDENTITY_THRESHOLDS)
-    p.add_argument("--length-thresholds", type=str, default=C.ASTRAL_IDENTITY_THRESHOLDS, help=argparse.SUPPRESS)
+    p.add_argument("--concat-length-quantiles", type=str, default=C.CONCAT_LENGTH_QUANTILES)
+    p.add_argument("--astral-length-quantiles", type=str, default=C.ASTRAL_LENGTH_QUANTILES)
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
     p.add_argument("--min-occupancy", type=float, default=0.3)
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
@@ -181,6 +180,31 @@ def _align_one(args):
     _flatten_fasta(aln_path)
     os.remove(tmp_fa)
     return True, fasta_path, None
+
+
+def compute_aligned_lengths(aln_dir, fasta_files):
+    """Yield average non-gap length per element (aligned sequences)."""
+    for fp in fasta_files:
+        base = os.path.basename(fp).replace(".fasta", "")
+        ap = os.path.join(aln_dir, base + ".aln")
+        if not os.path.isfile(ap):
+            continue
+        sq = read_fasta(ap)
+        if not sq:
+            continue
+        lens = [sum(1 for c in s if c not in '-Nn?') for s in sq.values()]
+        yield sum(lens) / len(lens)
+
+
+def quantile_cutoffs(values, quantiles):
+    """Compute cutoffs for given quantile percentages (0-100)."""
+    sv = sorted(values)
+    n = len(sv)
+    cuts = {}
+    for q in quantiles:
+        idx = max(0, min(n - 1, int(n * q / 100)))
+        cuts[q] = sv[idx]
+    return cuts
 
 
 def write_script(path, cmds, description=""):
@@ -391,14 +415,13 @@ def main():
     tag_dict["all"] = None  # always include full set
 
     # ─── Thresholds ──────────────────────────────────────
-    concat_thrs = [float(x) for x in args.identity_thresholds.split(",") if x.strip()] \
-                  if args.identity_thresholds.strip() else []
-    astral_thrs = [float(x) for x in args.astral_identity_thresholds.split(",") if x.strip()] \
-                  if args.astral_identity_thresholds.strip() else []
+    concat_quantiles = [int(x) for x in args.concat_length_quantiles.split(",") if x.strip()] \
+                       if args.concat_length_quantiles.strip() else []
+    astral_quantiles = [int(x) for x in args.astral_length_quantiles.split(",") if x.strip()] \
+                       if args.astral_length_quantiles.strip() else []
 
-    # all + thresholds
-    concat_levels = [None] + (concat_thrs if concat_thrs else [])
-    astral_levels = [None] + (astral_thrs if astral_thrs else [])
+    concat_levels = [None] + (concat_quantiles if concat_quantiles else [])
+    astral_levels = [None] + (astral_quantiles if astral_quantiles else [])
 
     # ─── Method-dispatch ─────────────────────────────────
     all_scripts = []
@@ -417,23 +440,30 @@ def main():
                 print(f"  Skip tag '{tag_name}': only {len(tag_files)} elements")
                 continue
 
+            # compute length quantiles for this tag
+            tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
+            tag_cuts = quantile_cutoffs(tag_lens, concat_quantiles) if concat_quantiles else {}
+
             for level in concat_levels:
-                thr_label = f"identity_{level}" if level is not None else "all"
+                thr_label = f"quantile_{level}" if level is not None else "all"
                 out_dir = os.path.join(base_dir, "iqtree", tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
 
-                # filter by identity
                 if level is not None:
+                    cutoff = tag_cuts.get(level, 0)
                     keep = []
                     for fp in tag_files:
                         b = os.path.basename(fp).replace(".fasta", "")
                         ap = os.path.join(aln_dir, b + ".aln")
-                        if os.path.isfile(ap) and average_pairwise_identity(ap) >= level:
-                            keep.append(fp)
+                        if os.path.isfile(ap):
+                            sq = read_fasta(ap)
+                            avg = sum(sum(1 for c in s if c not in '-Nn?') for s in sq.values()) / len(sq)
+                            if avg >= cutoff:
+                                keep.append(fp)
                     if len(keep) < 3:
                         print(f"  Skip {tag_name}/{thr_label}: {len(keep)} elements")
                         continue
-                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements")
+                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements (≥{cutoff:.0f}bp, P{level})")
                 else:
                     keep = tag_files
                     print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
@@ -464,21 +494,29 @@ def main():
             if len(tag_files) < 3:
                 continue
 
+            # compute length quantiles for this tag
+            tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
+            tag_cuts = quantile_cutoffs(tag_lens, astral_quantiles) if astral_quantiles else {}
+
             for level in astral_levels:
-                thr_label = f"identity_{level}" if level is not None else "all"
+                thr_label = f"quantile_{level}" if level is not None else "all"
                 out_dir = os.path.join(base_dir, "astral", tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
 
                 if level is not None:
+                    cutoff = tag_cuts.get(level, 0)
                     keep = []
                     for fp in tag_files:
                         b = os.path.basename(fp).replace(".fasta", "")
                         ap = os.path.join(aln_dir, b + ".aln")
-                        if os.path.isfile(ap) and average_pairwise_identity(ap) >= level:
-                            keep.append(fp)
+                        if os.path.isfile(ap):
+                            sq = read_fasta(ap)
+                            avg = sum(sum(1 for c in s if c not in '-Nn?') for s in sq.values()) / len(sq)
+                            if avg >= cutoff:
+                                keep.append(fp)
                     if len(keep) < 3:
                         continue
-                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements")
+                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements (≥{cutoff:.0f}bp, P{level})")
                 else:
                     keep = tag_files
                     print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
