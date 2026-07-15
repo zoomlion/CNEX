@@ -162,7 +162,7 @@ def _flatten_fasta(path):
 
 
 def _align_one(args):
-    fasta_path, famsa_bin, resume, aln_dir, keep_sp = args
+    fasta_path, famsa_bin, resume, aln_dir, keep_sp, min_site_occ = args
     base = os.path.basename(fasta_path).replace(".fasta", "")
     aln_path = os.path.join(aln_dir, base + ".aln")
     if resume and os.path.isfile(aln_path):
@@ -180,26 +180,26 @@ def _align_one(args):
         return False, fasta_path, "align"
     _flatten_fasta(aln_path)
     os.remove(tmp_fa)
+    # local trim: remove gap-rich columns
+    if min_site_occ > 0:
+        sq = read_fasta(aln_path)
+        trimmed = trim_alignment_by_occupancy(sq, min_site_occ)
+        trim_path = aln_path.replace(".aln", ".trimmed.aln")
+        with open(trim_path, 'w') as f:
+            for h, s in trimmed.items():
+                f.write(f'>{h}\n{s}\n')
     return True, fasta_path, None
 
 
 def _fasttree_one(args):
-    fp, aln_dir, out_dir, fasttree_bin, min_site_occ = args
+    fp, aln_dir, out_dir, fasttree_bin = args[:4]
     base_name = os.path.basename(fp).replace(".fasta", "")
     nwk_path = os.path.join(out_dir, "nwk", base_name + ".nwk")
-    aln_path = os.path.join(aln_dir, base_name + ".aln")
-    if not os.path.isfile(aln_path):
-        return False, base_name
-    if min_site_occ > 0:
-        sq = read_fasta(aln_path)
-        trimmed = trim_alignment_by_occupancy(sq, min_site_occ)
-        trim_path = nwk_path + ".trimmed"
-        with open(trim_path, 'w') as f:
-            for h, s in trimmed.items():
-                f.write(f'>{h}\n{s}\n')
-        fasta_input = trim_path
-    else:
-        fasta_input = aln_path
+    fasta_input = os.path.join(aln_dir, base_name + ".trimmed.aln")
+    if not os.path.isfile(fasta_input):
+        fasta_input = os.path.join(aln_dir, base_name + ".aln")
+        if not os.path.isfile(fasta_input):
+            return False, base_name
     with open(fasta_input) as f:
         seq = "".join(line.strip() for line in f if not line.startswith(">"))[:100]
     is_nt = all(c in "ACGTacgtNn-" for c in seq) if seq else True
@@ -271,7 +271,9 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, min_site_occ, out_dir,
     # symlink filtered alignments
     for fp in keep_fastas:
         base_name = os.path.basename(fp).replace(".fasta", "")
-        src = os.path.join(aln_dir, base_name + ".aln")
+        src = os.path.join(aln_dir, base_name + ".trimmed.aln")
+        if not os.path.isfile(src):
+            src = os.path.join(aln_dir, base_name + ".aln")
         dst = os.path.join(aln_subdir, base_name + ".aln")
         if os.path.isfile(src) and not os.path.isfile(dst):
             os.symlink(os.path.abspath(src), dst)
@@ -321,7 +323,7 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     nwk_dir = os.path.join(out_dir, "nwk")
     os.makedirs(nwk_dir, exist_ok=True)
     ok_count = fail_count = 0
-    work = [(fp, aln_dir, out_dir, fasttree_bin, min_site_occ) for fp in keep_fastas]
+    work = [(fp, aln_dir, out_dir, fasttree_bin) for fp in keep_fastas]
     if alignment_jobs > 1:
         with Pool(alignment_jobs) as p:
             for ok, _ in p.imap_unordered(_fasttree_one, work):
@@ -396,7 +398,7 @@ def main():
     # ─── FAMSA alignment ─────────────────────────────────
     print(f"\n--- Aligning elements (FAMSA) ---")
     t0 = time.time()
-    work = [(f, famsa, args.resume, aln_dir, keep_sp) for f in fasta_files]
+    work = [(f, famsa, args.resume, aln_dir, keep_sp, args.min_site_occupancy) for f in fasta_files]
     ok_count = fail_count = 0
     if args.alignment_jobs > 1:
         with Pool(args.alignment_jobs) as p:
