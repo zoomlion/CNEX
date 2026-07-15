@@ -312,19 +312,36 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     # FastTree per element (parallel)
     nwk_dir = os.path.join(out_dir, "nwk")
     os.makedirs(nwk_dir, exist_ok=True)
-    ok_count = fail_count = 0
-    work = [(fp, aln_dir, out_dir, fasttree_bin) for fp in keep_fastas]
-    if threads > 1:
-        with Pool(threads) as p:
-            for ok, _ in p.imap_unordered(_fasttree_one, work):
+    fasttree_skip = False
+    if thr_label != "all":
+        all_nwk = os.path.join(os.path.dirname(out_dir), "all", "nwk")
+        if os.path.isdir(all_nwk):
+            linked = 0
+            for fp in keep_fastas:
+                base = os.path.basename(fp).replace(".fasta", "")
+                src = os.path.join(all_nwk, base + ".nwk")
+                dst = os.path.join(nwk_dir, base + ".nwk")
+                if os.path.isfile(src) and not os.path.isfile(dst):
+                    os.symlink(os.path.abspath(src), dst)
+                    linked += 1
+            print(f"  Symlinked {linked}/{len(keep_fastas)} trees from all/nwk/ ({tag_name}/{thr_label})")
+            if linked > 0:
+                fasttree_skip = True
+
+    if not fasttree_skip:
+        ok_count = fail_count = 0
+        work = [(fp, aln_dir, out_dir, fasttree_bin) for fp in keep_fastas]
+        if threads > 1:
+            with Pool(threads) as p:
+                for ok, _ in p.imap_unordered(_fasttree_one, work):
+                    if ok: ok_count += 1
+                    else: fail_count += 1
+        else:
+            for w in work:
+                ok, _ = _fasttree_one(w)
                 if ok: ok_count += 1
                 else: fail_count += 1
-    else:
-        for w in work:
-            ok, _ = _fasttree_one(w)
-            if ok: ok_count += 1
-            else: fail_count += 1
-    print(f"  FastTree: {ok_count} OK, {fail_count} FAIL ({tag_name}/{thr_label})")
+        print(f"  FastTree: {ok_count} OK, {fail_count} FAIL ({tag_name}/{thr_label})")
 
     # collect gene trees
     all_trees = []
