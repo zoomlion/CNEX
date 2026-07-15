@@ -17,9 +17,7 @@ IQTREE3  = "iqtree3"
 
 # Pipeline thresholds
 MIN_CNE_PER_SPECIES = 100
-ALIGNMENT_JOBS = 20          # parallel FAMSA processes
-ASTRAL_THREADS = 20          # threads for ASTRAL
-IQTREE_THREADS = 20          # IQ-TREE 3 thread count
+THREADS = 20                 # global worker count: FAMSA/FastTree parallelism, IQ-TREE/ASTRAL threads
 
 # Phylogeny defaults
 DEFAULT_METHOD = "concat"                    # "concat" or "astral"

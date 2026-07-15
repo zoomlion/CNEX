@@ -28,9 +28,7 @@ Key settings in `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `ALIGNMENT_JOBS` | 20 | Parallel FAMSA / FastTree processes |
-| `IQTREE_THREADS` | 20 | Threads for IQ-TREE 3 |
-| `ASTRAL_THREADS` | 20 | Threads for ASTRAL |
+| `THREADS` | 20 | Global: FAMSA/FastTree parallelism, IQ-TREE/ASTRAL threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
 | `CONCAT_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for concat method |
 | `ASTRAL_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for astral method |

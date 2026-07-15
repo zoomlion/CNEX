@@ -46,7 +46,6 @@ def parse_args():
     p.add_argument("--famsa", default=C.FAMSA)
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
-    p.add_argument("--iqtree-threads", type=int, default=C.IQTREE_THREADS)
     p.add_argument("--astral-bin", default=C.ASTRAL)
     p.add_argument("--astral-dir", default="")
     p.add_argument("--astral-jar", default="")
@@ -57,14 +56,8 @@ def parse_args():
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
     p.add_argument("--min-occupancy", type=float, default=0.3)
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
-    p.add_argument("--alignment-jobs", dest="alignment_jobs", type=int,
-                   default=C.ALIGNMENT_JOBS)
-    p.add_argument("--parallel", dest="alignment_jobs", type=int,
-                   default=C.ALIGNMENT_JOBS, help=argparse.SUPPRESS)
-    p.add_argument("--astral-threads", dest="astral_threads", type=int,
-                   default=C.ASTRAL_THREADS)
-    p.add_argument("-t", "--threads", dest="astral_threads", type=int,
-                   default=C.ASTRAL_THREADS, help=argparse.SUPPRESS)
+    p.add_argument("-t", "--threads", type=int, default=C.THREADS,
+                   help="Worker count: FAMSA/FastTree parallelism, IQ-TREE/ASTRAL threads")
     p.add_argument("--max-elements", type=int, default=100)
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no-resume", action="store_false", dest="resume")
@@ -309,8 +302,8 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, min_site_occ, out_dir,
 # ─── astral pipeline ───────────────────────────────────────
 
 def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
-                      astral_bin, astral_jar, astral_threads, min_site_occ,
-                      submit, tag_name, thr_label, alignment_jobs=1):
+                       astral_bin, astral_jar, astral_threads, min_site_occ,
+                       submit, tag_name, thr_label, threads=1):
     """FastTree per element (local) + write ASTRAL run script."""
     if not keep_fastas:
         return
@@ -324,8 +317,8 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     os.makedirs(nwk_dir, exist_ok=True)
     ok_count = fail_count = 0
     work = [(fp, aln_dir, out_dir, fasttree_bin) for fp in keep_fastas]
-    if alignment_jobs > 1:
-        with Pool(alignment_jobs) as p:
+    if threads > 1:
+        with Pool(threads) as p:
             for ok, _ in p.imap_unordered(_fasttree_one, work):
                 if ok: ok_count += 1
                 else: fail_count += 1
@@ -400,8 +393,8 @@ def main():
     t0 = time.time()
     work = [(f, famsa, args.resume, aln_dir, keep_sp, args.min_site_occupancy) for f in fasta_files]
     ok_count = fail_count = 0
-    if args.alignment_jobs > 1:
-        with Pool(args.alignment_jobs) as p:
+    if args.threads > 1:
+        with Pool(args.threads) as p:
             for ok, _, _ in p.imap_unordered(_align_one, work):
                 if ok: ok_count += 1
                 else: fail_count += 1
@@ -493,14 +486,14 @@ def main():
                 if m == "concat":
                     sp = run_concat_subset(aln_dir, keep, args.min_occupancy,
                                            args.min_site_occupancy, out_dir,
-                                           iqtree3, args.iqtree_threads, submit,
+                                           iqtree3, args.threads, submit,
                                            tag_name, thr_label)
                 else:
                     sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
                                            astral_bin, args.astral_jar,
-                                           args.astral_threads, args.min_site_occupancy,
+                                           args.threads, args.min_site_occupancy,
                                            submit, tag_name, thr_label,
-                                           args.alignment_jobs)
+                                           args.threads)
                 if sp:
                     all_scripts.append(sp)
 
