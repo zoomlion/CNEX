@@ -24,4 +24,5 @@ DEFAULT_METHOD = "concat"                    # "concat" or "astral"
 CONCAT_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
 ASTRAL_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
 ELEMENT_TAGS_FILE = ""                       # path to element_tags.tsv (ele_id\\ttag with header), empty = no tags
+PARTITION = False                            # True = output partition file for IQ-TREE
 DRY_RUN = False                              # True = only generate scripts, don't run

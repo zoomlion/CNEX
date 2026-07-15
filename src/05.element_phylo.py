@@ -248,7 +248,8 @@ def execute_script(path, submit):
 # ─── concat pipeline ───────────────────────────────────────
 
 def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
-                      iqtree3, iqtree_threads, submit, tag_name, thr_label):
+                      iqtree3, iqtree_threads, submit, tag_name, thr_label,
+                      partition=False):
     """Filter alignments, run concat_msa, write + execute run script."""
     if not keep_fastas:
         return
@@ -271,8 +272,9 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
     supermatrix = os.path.join(out_dir, "supermatrix.fa")
     partitions = os.path.join(out_dir, "partitions.txt")
     cmd = ["python3", concat_script, "-i", aln_subdir, "--suffix", ".aln",
-           "--min-occupancy", str(min_occ),
-           "-o", supermatrix, "-p", partitions]
+           "--min-occupancy", str(min_occ), "-o", supermatrix]
+    if partition:
+        cmd += ["-p", partitions]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.isfile(supermatrix):
         print(f"  concat_msa.py failed for {tag_name}/{thr_label}")
@@ -285,11 +287,11 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
     # write run.sh
     script_path = os.path.join(out_dir, "run.sh")
     n_threads = iqtree_threads
-    cmds = [
-        f"iqtree3 -s {os.path.basename(supermatrix)}",
-        f"    -p {os.path.basename(partitions)}",
-        f"    -m GTR+G4 -bb 1000 -nt {n_threads}"
-    ]
+    iq_cmd = f"iqtree3 -s {os.path.basename(supermatrix)}"
+    if partition:
+        iq_cmd += f" -p {os.path.basename(partitions)}"
+    iq_cmd += f" -m GTR+F+R4 -bb 1000 -nt {n_threads}"
+    cmds = [iq_cmd]
     write_script(script_path, cmds,
                  f"IQ-TREE 3: {tag_name} / {thr_label} ({len(keep_fastas)} elements)")
     execute_script(script_path, submit)
@@ -501,7 +503,8 @@ def main():
                 if m == "concat":
                     sp = run_concat_subset(aln_dir, keep, args.min_occupancy,
                                            out_dir, iqtree3, args.threads, submit,
-                                           tag_name, thr_label)
+                                           tag_name, thr_label,
+                                           C.PARTITION)
                 else:
                     sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
                                            astral_bin, args.astral_jar,
