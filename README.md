@@ -28,11 +28,12 @@ Key settings in `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `THREADS` | 20 | Global: FAMSA/FastTree parallelism, IQ-TREE/ASTRAL threads |
+| `THREADS` | 20 | Worker count: FAMSA/FastTree parallelism, IQ-TREE 3 / ASTRAL threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
+| `DEFAULT_METHOD` | `concat` | `concat`, `astral`, or `both` |
 | `CONCAT_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for concat method |
 | `ASTRAL_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for astral method |
-| `ELEMENT_TAGS_FILE` | `""` | Path to TSV for per-tag filtering |
+| `ELEMENT_TAGS_FILE` | `""` | Path to TSV (ele_id\\ttag) for per-tag filtering |
 | `DRY_RUN` | `False` | Only generate scripts, skip execution |
 
 ## Quick Start

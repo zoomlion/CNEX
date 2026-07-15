@@ -247,7 +247,7 @@ def execute_script(path, submit):
 
 # ─── concat pipeline ───────────────────────────────────────
 
-def run_concat_subset(aln_dir, keep_fastas, min_occ, min_site_occ, out_dir,
+def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
                       iqtree3, iqtree_threads, submit, tag_name, thr_label):
     """Filter alignments, run concat_msa, write + execute run script."""
     if not keep_fastas:
@@ -272,7 +272,6 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, min_site_occ, out_dir,
     partitions = os.path.join(out_dir, "partitions.txt")
     cmd = ["python3", concat_script, "-i", aln_subdir, "--suffix", ".aln",
            "--min-occupancy", str(min_occ),
-           "--min-site-occupancy", str(min_site_occ),
            "-o", supermatrix, "-p", partitions]
     r = subprocess.run(cmd)
     if r.returncode != 0 or not os.path.isfile(supermatrix):
@@ -479,8 +478,7 @@ def main():
 
                 if m == "concat":
                     sp = run_concat_subset(aln_dir, keep, args.min_occupancy,
-                                           args.min_site_occupancy, out_dir,
-                                           iqtree3, args.threads, submit,
+                                           out_dir, iqtree3, args.threads, submit,
                                            tag_name, thr_label)
                 else:
                     sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,

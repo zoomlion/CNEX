@@ -11,8 +11,6 @@ def parse_args():
     p.add_argument("--suffix", default=".aln")
     p.add_argument("--min-occupancy", type=float, default=0,
                    help="Min species occupancy (0-1) to include an element (default: 0)")
-    p.add_argument("--min-site-occupancy", type=float, default=0,
-                   help="Min species occupancy per site (0-1) to retain column (default: 0)")
     return p.parse_args()
 
 def clean_seq(s):
@@ -105,37 +103,6 @@ def main():
             supermatrix[sp].append(s if s else "-" * aln_len)
         partitions.append(f"GTR+G4, {i}={pos}-{pos + aln_len - 1}")
         pos += aln_len
-
-    # Filter by min-site-occupancy
-    if args.min_site_occupancy > 0:
-        min_occ = args.min_site_occupancy / 100 if args.min_site_occupancy > 1 else args.min_site_occupancy
-        total_sp = len(species_list)
-        min_non_gap = max(1, int(total_sp * min_occ))
-        flat = {sp: ''.join(supermatrix[sp]) for sp in species_list}
-        aln_len = len(next(iter(flat.values())))
-        # Build column-to-element map
-        elem_of_col = []
-        for i, seqs in enumerate(aln_data):
-            elem_of_col.extend([i] * len(next(iter(seqs.values()))))
-        # Filter columns
-        keep_cols = [j for j in range(aln_len)
-                     if sum(1 for sp in species_list
-                            if flat[sp][j] not in '-Nn?') >= min_non_gap]
-        for sp in species_list:
-            supermatrix[sp] = [flat[sp][j] for j in keep_cols]
-        print(f"Site occupancy filter >= {min_occ:.0%}: {aln_len} -> {len(keep_cols)} sites (removed {aln_len - len(keep_cols)})")
-
-        # Recalculate partitions
-        part_counts = {}
-        for j in keep_cols:
-            ei = elem_of_col[j]
-            part_counts[ei] = part_counts.get(ei, 0) + 1
-        pos = 1
-        partitions = []
-        for orig_idx in sorted(part_counts):
-            kept = part_counts[orig_idx]
-            partitions.append(f"GTR+G4, {orig_idx}={pos}-{pos + kept - 1}")
-            pos += kept
 
     # Write FASTA
     with open(args.output, "w") as f:
