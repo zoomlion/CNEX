@@ -22,13 +22,7 @@ import sys
 import glob
 import time
 from collections import Counter, OrderedDict
-import multiprocessing as mp
-
-try:
-    mp.set_start_method('spawn')
-except RuntimeError:
-    pass
-Pool = mp.get_context('spawn').Pool
+from multiprocessing import Pool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
