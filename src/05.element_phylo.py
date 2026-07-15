@@ -308,7 +308,7 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, min_site_occ, out_dir,
 
 def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
                       astral_bin, astral_jar, astral_threads, min_site_occ,
-                      submit, tag_name, thr_label):
+                      submit, tag_name, thr_label, alignment_jobs=1):
     """FastTree per element (local) + write ASTRAL run script."""
     if not keep_fastas:
         return
@@ -497,7 +497,8 @@ def main():
                     sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
                                            astral_bin, args.astral_jar,
                                            args.astral_threads, args.min_site_occupancy,
-                                           submit, tag_name, thr_label)
+                                           submit, tag_name, thr_label,
+                                           args.alignment_jobs)
                 if sp:
                     all_scripts.append(sp)
 
