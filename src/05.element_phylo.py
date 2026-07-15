@@ -273,10 +273,14 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
     cmd = ["python3", concat_script, "-i", aln_subdir, "--suffix", ".aln",
            "--min-occupancy", str(min_occ),
            "-o", supermatrix, "-p", partitions]
-    r = subprocess.run(cmd)
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.isfile(supermatrix):
         print(f"  concat_msa.py failed for {tag_name}/{thr_label}")
         return
+    # print key lines from concat_msa.py output
+    for line in r.stdout.strip().split('\n'):
+        if any(k in line for k in ('Total species', 'Occupancy', 'Supermatrix', 'Partitions')):
+            print(f"  {line.strip()}")
 
     # write run.sh
     script_path = os.path.join(out_dir, "run.sh")
@@ -454,6 +458,7 @@ def main():
 
             for level in levels:
                 thr_label = f"quantile_{level}" if level is not None else "all"
+                print(f"\n=== {m.upper()}: {tag_name} / {thr_label} ===")
                 out_dir = os.path.join(base_out, tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
 
