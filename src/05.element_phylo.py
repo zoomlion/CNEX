@@ -369,11 +369,10 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     species_tree_path = os.path.join(out_dir, "species_tree.nwk")
     script_path = os.path.join(out_dir, "run.sh")
     if use_iv:
-        cmds = [f"{astral_bin} -i {os.path.basename(gene_trees_path)}",
-                f"    -o {os.path.basename(species_tree_path)} -t {astral_threads}"]
+        cmd = f"{astral_bin} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads}"
     else:
-        cmds = [f"java -Xmx8g -jar {jar_path} -i {os.path.basename(gene_trees_path)}",
-                f"    -o {os.path.basename(species_tree_path)} --extraLevel 0"]
+        cmd = f"java -Xmx8g -jar {jar_path} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} --extraLevel 0"
+    cmds = [cmd]
     write_script(script_path, cmds,
                  f"ASTRAL: {tag_name} / {thr_label} ({len(all_trees)} gene trees)")
     execute_script(script_path, submit)
