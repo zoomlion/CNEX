@@ -183,6 +183,35 @@ def _align_one(args):
     return True, fasta_path, None
 
 
+def _fasttree_one(args):
+    fp, aln_dir, out_dir, fasttree_bin, min_site_occ = args
+    base_name = os.path.basename(fp).replace(".fasta", "")
+    nwk_path = os.path.join(out_dir, "nwk", base_name + ".nwk")
+    aln_path = os.path.join(aln_dir, base_name + ".aln")
+    if not os.path.isfile(aln_path):
+        return False, base_name
+    if min_site_occ > 0:
+        sq = read_fasta(aln_path)
+        trimmed = trim_alignment_by_occupancy(sq, min_site_occ)
+        trim_path = nwk_path + ".trimmed"
+        with open(trim_path, 'w') as f:
+            for h, s in trimmed.items():
+                f.write(f'>{h}\n{s}\n')
+        fasta_input = trim_path
+    else:
+        fasta_input = aln_path
+    with open(fasta_input) as f:
+        seq = "".join(line.strip() for line in f if not line.startswith(">"))[:100]
+    is_nt = all(c in "ACGTacgtNn-" for c in seq) if seq else True
+    cmd = [fasttree_bin]
+    if is_nt:
+        cmd.append("-nt")
+    cmd.extend(["-gtr", "-nosupport"])
+    with open(fasta_input) as inp, open(nwk_path, "w") as out:
+        r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
+    return r.returncode == 0, base_name
+
+
 def compute_aligned_lengths(aln_dir, fasta_files):
     """Yield average non-gap length per element (aligned sequences)."""
     for fp in fasta_files:
@@ -288,42 +317,21 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     use_iv = os.path.isfile(astral_bin) if astral_bin else False
     jar_path = astral_jar
 
-    # FastTree per element
+    # FastTree per element (parallel)
     nwk_dir = os.path.join(out_dir, "nwk")
     os.makedirs(nwk_dir, exist_ok=True)
     ok_count = fail_count = 0
-    for fp in keep_fastas:
-        base_name = os.path.basename(fp).replace(".fasta", "")
-        nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
-        aln_path = os.path.join(aln_dir, base_name + ".aln")
-        if not os.path.isfile(aln_path):
-            fail_count += 1
-            continue
-        # trim
-        if min_site_occ > 0:
-            sq = read_fasta(aln_path)
-            trimmed = trim_alignment_by_occupancy(sq, min_site_occ)
-            trim_path = aln_path + ".trimmed"
-            with open(trim_path, 'w') as f:
-                for h, s in trimmed.items():
-                    f.write(f'>{h}\n{s}\n')
-            fasta_input = trim_path
-        else:
-            fasta_input = aln_path
-        # check nucleotide
-        with open(fasta_input) as f:
-            seq = "".join(line.strip() for line in f if not line.startswith(">"))[:100]
-        is_nt = all(c in "ACGTacgtNn-" for c in seq) if seq else True
-        cmd = [fasttree_bin]
-        if is_nt:
-            cmd.append("-nt")
-        cmd.extend(["-gtr", "-nosupport"])
-        with open(fasta_input) as inp, open(nwk_path, "w") as out:
-            r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
-        if r.returncode == 0:
-            ok_count += 1
-        else:
-            fail_count += 1
+    work = [(fp, aln_dir, out_dir, fasttree_bin, min_site_occ) for fp in keep_fastas]
+    if alignment_jobs > 1:
+        with Pool(alignment_jobs) as p:
+            for ok, _ in p.imap_unordered(_fasttree_one, work):
+                if ok: ok_count += 1
+                else: fail_count += 1
+    else:
+        for w in work:
+            ok, _ = _fasttree_one(w)
+            if ok: ok_count += 1
+            else: fail_count += 1
     print(f"  FastTree: {ok_count} OK, {fail_count} FAIL ({tag_name}/{thr_label})")
 
     # collect gene trees
