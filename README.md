@@ -5,7 +5,7 @@ Fast identification of conserved non-coding elements (CNEs) from whole-genome se
 - **Ultra-fast sliding-window genome mode** (~3 min for human genome at 6X, 16 threads)
 - **k-mer guided assembly** — De Bruijn graph with element-specific k-mer prior
 - **SNP/INDEL detection** via De Bruijn bubble scanning
-- **Phylogeny pipeline** — concat/IQ-TREE 3 or FastTree + ASTRAL, with configurable threshold and tag filtering
+- **Phylogeny pipeline** — astral (default) with block-gap clustering, or concat/IQ-TREE 3
 
 ## Install
 
@@ -18,8 +18,6 @@ cnex setup
 
 ## Configuration
 
-Copy the example and edit:
-
 ```bash
 cp config.example.py config.py
 ```
@@ -28,154 +26,123 @@ Key settings in `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `THREADS` | 20 | Worker count: FAMSA/FastTree parallelism, IQ-TREE 3 / ASTRAL threads |
+| `THREADS` | 20 | Worker count: FAMSA/FastTree parallelism, IQ-TREE / ASTRAL threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
-| `DEFAULT_METHOD` | `concat` | `concat`, `astral`, or `both` |
+| `DEFAULT_METHOD` | `astral` | `astral`, `concat`, or `both` |
 | `CONCAT_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for concat method |
-| `ASTRAL_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for astral method |
-| `ELEMENT_TAGS_FILE` | `""` | Path to TSV (ele_id\\ttag) for per-tag filtering |
-| `DRY_RUN` | `False` | Only generate scripts, skip execution |
+| `ASTRAL_BLOCK_GAPS` | `1000,2000` | kb thresholds for astral block clustering |
+| `ELEMENT_TAGS_FILE` | `""` | Path to element_tags.tsv for per-type filtering |
+| `PARTITION` | `False` | Output partition file for IQ-TREE |
+| `DRY_RUN` | `True` | Generate scripts only; use `--submit` to execute |
 
 ## Quick Start
 
-### 1. Validate reads/genome against a k-mer table
-
 ```bash
-# Genome mode (sliding windows)
+# 1. Validate + Assemble
 cnex validate genome.fa --mers mers_table.tsv --type genome -t 16 -o out/
-
-# Reads mode (FASTQ)
-cnex validate reads.fq.gz --mers mers_table.tsv --type fastq -t 16 -o out/
-```
-
-### 2. Assemble contigs
-
-```bash
-# Basic assembly (--trim default on, --repeat-ratio 1.1 default)
 cnex assemble out/ --mers mers_table.tsv -o contigs.fa
 
-# With SNP/INDEL detection
-cnex assemble out/ --mers mers_table.tsv --snp -o contigs.fa
-```
-
-Output: `contigs.fa`, `variants.tsv`, `snp_elements.gfa`
-
-### 3. Phylogeny
-
-```bash
-# Default: concat + IQ-TREE 3
+# 2. Element FASTA → Phylogeny
 python3 src/04.map_contig_to_element.py
-python3 src/05.element_phylo.py
-
-# Or ASTRAL method
-python3 src/05.element_phylo.py --method astral
-
-# Both methods
-python3 src/05.element_phylo.py --method both
-
-# Dry-run: only generate scripts, no execution
-python3 src/05.element_phylo.py --dry-run
+python3 src/05.element_phylo.py              # dry-run (scripts only)
+python3 src/05.element_phylo.py --submit     # execute
 ```
 
 ## Phylogeny Pipeline
 
 ### Methods
 
-| Method | Command | Pipeline |
-|--------|---------|----------|
-| **concat** (default) | `--method concat` | FAMSA → concat_msa → IQ-TREE 3 |
-| **astral** | `--method astral` | FAMSA → FastTree → ASTRAL |
-| **both** | `--method both` | Both methods in one run |
+| Method | Flag | Pipeline |
+|--------|------|----------|
+| **astral** (default) | `--method astral` | FAMSA → block-gap cluster → concat → FastTree → ASTRAL |
+| **concat** | `--method concat` | FAMSA → concat_msa → IQ-TREE 3 |
+| **both** | `--method both` | both in one pass |
 
-### Thresholds and Tags
+### ASTRAL: Block-Gap Clustering
 
-Elements are filtered by aligned length quantiles (P25/P50/P75). Each combination generates:
-- A subdirectory with `run.sh`
-- A top-level `run_all.sh` to execute all
+Elements are clustered by genomic proximity (default gaps 1000kb / 2000kb). Each cluster is concatenated into a super-locus before FastTree inference:
 
 ```
-results/
-├── iqtree/
-│   ├── all/run.sh
-│   ├── all_quantile_25/run.sh
-│   ├── all_quantile_50/run.sh
-│   └── run_all.sh
-├── astral/
-│   ├── all/run.sh
-│   └── run_all.sh
-├── aln/       # alignments (shared)
-└── fasta/     # element FASTAs (from step 04)
+element_tags.tsv: ele_id→(type, chr, start, end)
+    ↓ gap_cluster(max_gap=1000kb)
+{cluster_0: [ele_1, ele_2, ...], cluster_1: [...], ...}
+    ↓ concat_block_alignments + FastTree
+block_0.nwk  block_1.nwk  ...
+    ↓ ASTRAL
+species_tree.nwk
 ```
 
-Optional tag filtering via TSV:
+Output structure:
+
+```
+results/astral/{type}/
+├── block_gap_1000/run.sh
+├── block_gap_2000/run.sh
+└── run_all.sh
+```
+
+### Concat: Length Quantiles
+
+IQ-TREE concatenates all elements, filtered by aligned-length quantiles (P25/P50/P75):
+
+```
+results/iqtree/{type}/
+├── quantile_25/run.sh
+├── quantile_50/run.sh
+├── quantile_75/run.sh
+└── run_all.sh
+```
+
+### Element Tags (Optional)
+
+Generate per-element classification (intron vs intergenic) from GFF:
 
 ```bash
-cp element_tags.example.tsv element_tags.tsv
-# edit element_tags.tsv with your element IDs
-python3 src/05.element_phylo.py --method both
+# Requires GFF3 files named by species in a directory
+python3 utils/classify_elements.py \
+    --msa blocks_10k.fa \
+    --gff-dir gff/ \
+    -o element_tags.tsv
 ```
+
+Then set `ELEMENT_TAGS_FILE = "element_tags.tsv"` in `config.py`, or pass `--element-tags element_tags.tsv` on the CLI.
+
+With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory and independent analysis.
 
 ### Run Modes
 
 | Mode | Behavior |
 |------|----------|
-| **submit** (default) | Generate run.sh → execute immediately |
-| **--dry-run** | Generate run.sh only → `bash run_all.sh` manually |
+| **dry-run** (default) | Generate `run.sh` + `run_all.sh` only; execute via `bash run_all.sh` |
+| **`--submit`** | Generate and execute immediately |
 
-## SNP / INDEL Detection
-
-```bash
-cnex assemble out/ --mers mers_table.tsv --snp -o contigs.fa
-```
-
-Output files:
+## Output
 
 | File | Description |
 |------|-------------|
-| `contigs.fa` | Assembled contigs |
-| `variants.tsv` | SNP/INDEL candidates (ele_id, pos, ref, alt, coverage, frequency) |
+| `results/aln/*.trimmed.aln` | Per-element trimmed alignments |
+| `results/astral/{type}/{gap}/species_tree.nwk` | ASTRAL species tree |
+| `results/iqtree/{type}/{quantile}/supermatrix.fa.treefile` | IQ-TREE tree |
+| `variants.tsv` | SNP/INDEL candidates (from `--snp`) |
 | `snp_elements.gfa` | GFA 1.0 graph with bubble paths |
 
 ## Dependencies
 
-### Build & Runtime
-
-| Tool | Version | Source |
-|------|---------|--------|
-| g++ | 9+ (C++17) | gcc.gnu.org |
-| Python | 3.8+ | python.org |
-| pigz | 2.6+ | bundled in `src/pigz/` |
-| robin-map | — | bundled in `src/robin-map/` |
-
-### Phylogenetic Tools
-
 | Tool | Method | Default path |
 |------|--------|-------------|
-| FAMSA | Both | `famsa` (PATH) |
-| FastTree | **astral** only | `FastTree` (PATH) |
-| ASTRAL (ASTER) | **astral** only | `astral` (PATH or `--astral-bin`) |
-| IQ-TREE 3 | **concat** only | `iqtree3` (PATH or `--iqtree3`) |
+| FAMSA | Both | `famsa` |
+| FastTree | **astral** | `FastTree` |
+| ASTRAL (ASTER) | **astral** | `astral` |
+| IQ-TREE 3 | **concat** | `iqtree3` |
+| bedtools | classification | `bedtools` (for `classify_elements.py`) |
 
 ## Benchmark
-
-Latest results (human genome, 7772 ground truth CNEs):
 
 | Method | Recall | Precision |
 |--------|--------|-----------|
 | **CNEX** | **83.1%** | **98.3%** |
 | MMseqs2 | 88.2% | 98.4% |
 | BLASTN | 89.1% | 98.6% |
-
-## Pipeline Steps
-
-| Step | Description |
-|------|-------------|
-| 00 | `00.filter_msa.py` — Filter MSA blocks |
-| 01 | `mertable` — Build k-mer table |
-| 02 | `validate` — k-mer validation |
-| 03 | `assemble` — De Bruijn assembly |
-| 04 | `04.map_contig_to_element.py` — Group by element |
-| 05 | `05.element_phylo.py` — Phylogeny (IQ-TREE / ASTRAL) |
 
 ## License
 
