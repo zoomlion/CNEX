@@ -211,6 +211,16 @@ def _fasttree_one(args):
     return r.returncode == 0, base_name
 
 
+def _fasttree_cluster(args):
+    fasttree_bin, fasta_path, nwk_path = args
+    if not os.path.isfile(fasta_path):
+        return False, fasta_path
+    cmd = [fasttree_bin, "-nt", "-gtr", "-nosupport"]
+    with open(fasta_path) as inp, open(nwk_path, "w") as out:
+        r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
+    return r.returncode == 0, nwk_path
+
+
 def compute_aligned_lengths(aln_dir, fasta_files):
     """Yield average non-gap length per element (aligned sequences)."""
     for fp in fasta_files:
@@ -382,14 +392,12 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
         cluster_items = [(int(os.path.basename(fp).replace(".fasta", "")), [fp])
                          for fp in keep_fastas]
 
-    # Run FastTree on each cluster
-    ok_count = fail_count = 0
+    # Prepare FastTree work items: (fasta_path, nwk_path) for each cluster
+    work = []
     for block_id, members in cluster_items:
         if block_gap > 0 and tag_coords:
-            # concatenate block alignments
             concat = concat_block_alignments(members, aln_dir)
             if len(concat) < 2:
-                fail_count += 1
                 continue
             base_name = f"{tag_name}_{block_id}"
             fasta_path = os.path.join(out_dir, "nwk", base_name + ".fa")
@@ -397,29 +405,32 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
                 for sp, s in sorted(concat.items()):
                     f.write(f">{sp}\n{s}\n")
         else:
-            # per-element: use keep_fastas member
             fp = (list(members)[0]) if isinstance(members, (set, list)) else members
-            # find the fasta path 
             base_name = os.path.basename(fp).replace(".fasta", "") if isinstance(fp, str) else str(members)
             fasta_path = os.path.join(aln_dir, base_name + ".trimmed.aln")
             if not os.path.isfile(fasta_path):
                 fasta_path = os.path.join(aln_dir, base_name + ".aln")
                 if not os.path.isfile(fasta_path):
-                    fail_count += 1
                     continue
 
         nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
         if os.path.isfile(nwk_path):
-            ok_count += 1
             continue
+        work.append((fasttree_bin, fasta_path, nwk_path))
 
-        cmd = [fasttree_bin, "-nt", "-gtr", "-nosupport"]
-        with open(fasta_path) as inp, open(nwk_path, "w") as out:
-            r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
-        if r.returncode == 0:
-            ok_count += 1
-        else:
-            fail_count += 1
+    # Run FastTree in parallel
+    ok_count = fail_count = 0
+    if threads > 1:
+        with Pool(threads) as p:
+            for ok, _ in p.imap_unordered(_fasttree_cluster, work):
+                if ok: ok_count += 1
+                else: fail_count += 1
+    else:
+        for w in work:
+            ok, _ = _fasttree_cluster(w)
+            if ok: ok_count += 1
+            else: fail_count += 1
+    print(f"  FastTree: {ok_count} OK, {fail_count} FAIL ({tag_name}/{thr_label})")
 
     # collect gene trees
     all_trees = []
@@ -541,13 +552,15 @@ def main():
             base_out = os.path.join(base_dir, "iqtree")
             levels = concat_levels
             quantiles = concat_quantiles
+            method_tag_dict = {"all": None}  # concat: no tag splitting
         else:
             fasttree = os.path.expanduser(args.fasttree)
             astral_bin = os.path.expanduser(args.astral_bin)
             base_out = os.path.join(base_dir, "astral")
             levels = astral_levels
+            method_tag_dict = tag_dict  # astral: use all tags
 
-        for tag_name, tag_ids in sorted(tag_dict.items()):
+        for tag_name, tag_ids in sorted(method_tag_dict.items()):
             tag_files = fasta_files
             if tag_ids is not None:
                 tag_files = [f for f in fasta_files

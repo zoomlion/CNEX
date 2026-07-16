@@ -186,17 +186,25 @@ def main():
         print("All elements -> intergenic")
         types = {eid: "intergenic" for eid, _, _, _ in ele_coords}
 
-    # Phase 5: output
+    # Phase 5: output (skip exon elements)
     print(f"Writing {args.output}...")
+    kept = 0
     with open(args.output, 'w') as f:
         f.write("ele_id\ttype\tchr\tstart\tend\n")
         for eid, ch, st, en in sorted(ele_coords):
             t = types.get(eid, "intergenic")
+            if t == "exon":
+                continue
             f.write(f"{eid}\t{t}\t{ch}\t{st}\t{en}\n")
+            kept += 1
 
-    # Summary
-    cnt = Counter(types.values())
-    print(f"  {sum(cnt.values())} elements classified")
+    # Summary (exon excluded)
+    from collections import Counter
+    cnt = Counter()
+    for t in types.values():
+        if t != "exon":
+            cnt[t] += 1
+    print(f"  {kept} elements (exon removed)")
     for k, v in cnt.most_common():
         print(f"    {k}: {v}")
 
