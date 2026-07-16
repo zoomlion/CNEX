@@ -191,27 +191,6 @@ def _align_one(args):
     return True, fasta_path, None
 
 
-def _fasttree_one(args):
-    fp, aln_dir, out_dir, fasttree_bin = args[:4]
-    base_name = os.path.basename(fp).replace(".fasta", "")
-    nwk_path = os.path.join(out_dir, "nwk", base_name + ".nwk")
-    fasta_input = os.path.join(aln_dir, base_name + ".trimmed.aln")
-    if not os.path.isfile(fasta_input):
-        fasta_input = os.path.join(aln_dir, base_name + ".aln")
-        if not os.path.isfile(fasta_input):
-            return False, base_name
-    with open(fasta_input) as f:
-        seq = "".join(line.strip() for line in f if not line.startswith(">"))[:100]
-    is_nt = all(c in "ACGTacgtNn-" for c in seq) if seq else True
-    cmd = [fasttree_bin]
-    if is_nt:
-        cmd.append("-nt")
-    cmd.extend(["-gtr", "-nosupport"])
-    with open(fasta_input) as inp, open(nwk_path, "w") as out:
-        r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
-    return r.returncode == 0, base_name
-
-
 def _fasttree_cluster(args):
     fasttree_bin, fasta_path, nwk_path = args
     if not os.path.isfile(fasta_path):
