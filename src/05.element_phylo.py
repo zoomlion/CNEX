@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import glob
@@ -481,7 +482,7 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
 def main():
     args = parse_args()
     famsa = os.path.expanduser(args.famsa)
-    if not os.path.isfile(famsa):
+    if not shutil.which(famsa):
         sys.exit(f"FAMSA not found: {famsa}")
 
     print(f"Method:   {args.method}")
@@ -547,7 +548,7 @@ def main():
 
         if m == "concat":
             iqtree3 = os.path.expanduser(args.iqtree3)
-            if not os.path.isfile(iqtree3):
+            if not shutil.which(iqtree3):
                 sys.exit(f"IQ-TREE 3 not found: {iqtree3}")
             base_out = os.path.join(base_dir, "iqtree")
             levels = concat_levels
@@ -555,6 +556,8 @@ def main():
             method_tag_dict = {"all": None}  # concat: no tag splitting
         else:
             fasttree = os.path.expanduser(args.fasttree)
+            if not shutil.which(fasttree):
+                sys.exit(f"FastTree not found: {fasttree}")
             astral_bin = os.path.expanduser(args.astral_bin)
             base_out = os.path.join(base_dir, "astral")
             levels = astral_levels
