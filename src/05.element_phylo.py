@@ -331,23 +331,25 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
         if os.path.isfile(src) and not os.path.isfile(dst):
             os.symlink(os.path.abspath(src), dst)
 
-    # concat_msa.py
-    concat_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "..", "utils", "concat_msa.py")
+    # concat_msa.py (skip if supermatrix.fa already exists)
     supermatrix = os.path.join(out_dir, "supermatrix.fa")
-    partitions = os.path.join(out_dir, "partitions.txt")
-    cmd = ["python3", concat_script, "-i", aln_subdir, "--suffix", ".aln",
-           "--min-occupancy", str(min_occ), "-o", supermatrix]
-    if partition:
-        cmd += ["-p", partitions]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.isfile(supermatrix):
-        print(f"  concat_msa.py failed for {tag_name}/{thr_label}")
-        return
-    # print key lines from concat_msa.py output
-    for line in r.stdout.strip().split('\n'):
-        if any(k in line for k in ('Total species', 'Occupancy', 'Supermatrix', 'Partitions')):
-            print(f"  {line.strip()}")
+    if os.path.isfile(supermatrix):
+        print(f"  supermatrix.fa exists, updating run.sh ({tag_name}/{thr_label})")
+    else:
+        concat_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", "utils", "concat_msa.py")
+        partitions = os.path.join(out_dir, "partitions.txt")
+        cmd = ["python3", concat_script, "-i", aln_subdir, "--suffix", ".aln",
+               "--min-occupancy", str(min_occ), "-o", supermatrix]
+        if partition:
+            cmd += ["-p", partitions]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.isfile(supermatrix):
+            print(f"  concat_msa.py failed for {tag_name}/{thr_label}")
+            return
+        for line in r.stdout.strip().split('\n'):
+            if any(k in line for k in ('Total species', 'Occupancy', 'Supermatrix', 'Partitions')):
+                print(f"  {line.strip()}")
 
     # write run.sh
     script_path = os.path.join(out_dir, "run.sh")
@@ -380,6 +382,21 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     # detect ASTRAL mode
     use_iv = os.path.isfile(astral_bin) if astral_bin else False
     jar_path = astral_jar
+
+    # Resume check: if gene_trees.nwk exists, skip FastTree and just refresh run.sh
+    gene_trees_path = os.path.join(out_dir, "gene_trees.nwk")
+    if os.path.isfile(gene_trees_path):
+        print(f"  gene_trees.nwk exists, updating run.sh ({tag_name}/{thr_label})")
+        # write updated run.sh (same logic as at end of this function)
+        species_tree_path = os.path.join(out_dir, "species_tree.nwk")
+        script_path = os.path.join(out_dir, "run.sh")
+        if use_iv:
+            cmd = f"{astral_bin} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads}"
+        else:
+            cmd = f"java -Xmx8g -jar {jar_path} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} --extraLevel 0"
+        write_script(script_path, [cmd], f"ASTRAL: {tag_name} / {thr_label}")
+        execute_script(script_path, submit)
+        return
 
     nwk_dir = os.path.join(out_dir, "nwk")
     os.makedirs(nwk_dir, exist_ok=True)
