@@ -380,7 +380,7 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
         return
 
     # detect ASTRAL mode
-    use_iv = os.path.isfile(astral_bin) if astral_bin else False
+    use_iv = shutil.which(astral_bin) is not None if astral_bin else False
     jar_path = astral_jar
 
     # Resume check: if gene_trees.nwk exists, skip FastTree and just refresh run.sh
