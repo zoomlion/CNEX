@@ -46,7 +46,6 @@ def parse_args():
     p.add_argument("--astral-jar", default="")
     p.add_argument("--element-tags", default=C.ELEMENT_TAGS_FILE,
                    help="TSV (ele_id\\ttag); empty = no tags")
-    p.add_argument("--concat-length-quantiles", type=str, default=C.CONCAT_LENGTH_QUANTILES)
     p.add_argument("--block-gap", type=str, default=C.ASTRAL_BLOCK_GAPS,
                    help="Comma-separated kb thresholds for astral block clustering (default: config)")
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
@@ -530,12 +529,8 @@ def main():
     tag_dict["all"] = None  # always include full set
 
     # ─── Thresholds ──────────────────────────────────────
-    concat_quantiles = [int(x) for x in args.concat_length_quantiles.split(",") if x.strip()] \
-                       if args.concat_length_quantiles.strip() else []
     astral_block_gaps = [int(x) for x in args.block_gap.split(",") if x.strip()] \
                         if args.block_gap.strip() else []
-
-    concat_levels = [None] + (concat_quantiles if concat_quantiles else [])
     astral_levels = [None] + (astral_block_gaps if astral_block_gaps else [])
 
     # ─── Method-dispatch ─────────────────────────────────
@@ -549,9 +544,8 @@ def main():
             if not shutil.which(iqtree3):
                 sys.exit(f"IQ-TREE 3 not found: {iqtree3}")
             base_out = os.path.join(base_dir, "iqtree")
-            levels = concat_levels
-            quantiles = concat_quantiles
-            method_tag_dict = {"all": None}  # concat: no tag splitting
+            # concat: one tree per tag (all/intergenic/intron), no quantile levels
+            method_tag_dict = tag_dict
         else:
             fasttree = os.path.expanduser(args.fasttree)
             if not shutil.which(fasttree):
@@ -573,38 +567,26 @@ def main():
                 continue
 
             if m == "concat":
-                tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
-                tag_cuts = quantile_cutoffs(tag_lens, concat_quantiles) if concat_quantiles else {}
-            else:
-                tag_cuts = {}
-
-            for level in levels:
-                if m == "concat":
-                    thr_label = f"quantile_{level}" if level is not None else "all"
-                else:
-                    thr_label = f"block_gap_{level}" if level is not None else "all"
-                print(f"\n=== {m.upper()}: {tag_name} / {thr_label} ===")
+                # concat: single run per tag, no level loop
+                thr_label = "all"
+                print(f"\n=== IQTREE: {tag_name} ===")
                 out_dir = os.path.join(base_out, tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
+                sp = run_concat_subset(aln_dir, tag_files, args.min_occupancy,
+                                       out_dir, iqtree3, args.threads, submit,
+                                       tag_name, thr_label, C.PARTITION)
+                if sp:
+                    all_scripts.append(sp)
+                continue
 
-                if level is not None and m == "concat":
-                    cutoff = tag_cuts.get(level, 0)
-                    keep = []
-                    for fp in tag_files:
-                        b = os.path.basename(fp).replace(".fasta", "")
-                        ap = os.path.join(aln_dir, b + ".aln")
-                        if os.path.isfile(ap):
-                            sq = read_fasta(ap)
-                            avg = sum(sum(1 for c in s if c not in '-Nn?') for s in sq.values()) / len(sq)
-                            if avg >= cutoff:
-                                keep.append(fp)
-                    if len(keep) < 3:
-                        print(f"  Skip {tag_name}/{thr_label}: {len(keep)} elements")
-                        continue
-                    print(f"  {tag_name}/{thr_label}: {len(keep)}/{len(tag_files)} elements (≥{cutoff:.0f}bp, P{level})")
-                else:
-                    keep = tag_files
-                    print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
+            # astral: level loop for block-gap thresholds
+            for level in levels:
+                thr_label = f"block_{level}kb" if level is not None else "all"
+                print(f"\n=== ASTRAL: {tag_name} / {thr_label} ===")
+                out_dir = os.path.join(base_out, tag_name, thr_label)
+                os.makedirs(out_dir, exist_ok=True)
+                keep = tag_files
+                print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
 
                 if m == "concat":
                     sp = run_concat_subset(aln_dir, keep, args.min_occupancy,

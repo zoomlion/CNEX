@@ -21,7 +21,7 @@ THREADS = 20                 # global worker count: FAMSA/FastTree parallelism, 
 
 # Phylogeny defaults
 DEFAULT_METHOD = "astral"                    # "concat" or "astral"
-CONCAT_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
+# CONCAT_LENGTH_QUANTILES removed — concat now builds one tree per tag (all/intergenic/intron)
 ASTRAL_BLOCK_GAPS = "1000,2000"       # kb thresholds for astral block clustering; comma-separated
 # GFF_DIR is not configurable here — use --gff-dir with classify_elements.py directly
 ELEMENT_TAGS_FILE = ""                       # path to element_tags.tsv (ele_id\\ttype, etc), empty = no tags
