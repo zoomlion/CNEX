@@ -46,7 +46,8 @@ def parse_args():
     p.add_argument("--element-tags", default=C.ELEMENT_TAGS_FILE,
                    help="TSV (ele_id\\ttag); empty = no tags")
     p.add_argument("--concat-length-quantiles", type=str, default=C.CONCAT_LENGTH_QUANTILES)
-    p.add_argument("--astral-length-quantiles", type=str, default=C.ASTRAL_LENGTH_QUANTILES)
+    p.add_argument("--block-gap", type=str, default=C.ASTRAL_BLOCK_GAPS,
+                   help="Comma-separated kb thresholds for astral block clustering (default: config)")
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
     p.add_argument("--min-occupancy", type=float, default=0.3)
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
@@ -98,23 +99,34 @@ def write_fasta(seqs, path):
 
 
 def read_element_tags(path):
-    """Return {tag_name: set(ele_id_int)}. Also implicitly adds 'all'."""
+    """Return (tag_dict, coord_dict).
+
+    tag_dict:  {type_name: set(ele_id)}  — for tag-based filtering
+    coord_dict: {ele_id: (type, chr, start, end)} — for gap clustering
+
+    Format: ele_id \\t type \\t chr \\t start \\t end
+    """
     tags = {}
+    coords = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('ele_id'):
                 continue
             parts = line.split('\t')
-            if len(parts) < 2:
-                continue
             try:
-                ele = int(parts[0].split('.')[0])
-            except ValueError:
+                ele = int(parts[0])
+            except (ValueError, IndexError):
                 continue
-            tag = parts[1].strip()
-            tags.setdefault(tag, set()).add(ele)
-    return tags
+            if len(parts) >= 2:
+                tag = parts[1].strip()
+                tags.setdefault(tag, set()).add(ele)
+            if len(parts) >= 5:
+                try:
+                    coords[ele] = (parts[1], parts[2], int(parts[3]), int(parts[4]))
+                except ValueError:
+                    pass
+    return tags, coords
 
 
 def filter_species_by_cne_count(fasta_files, min_cne):
@@ -224,6 +236,46 @@ def quantile_cutoffs(values, quantiles):
     return cuts
 
 
+def gap_cluster(ele_ids, coords, max_gap):
+    """Group element IDs by genomic proximity (chr + gap ≤ max_gap)."""
+    items = [(eid, coords[eid][1], coords[eid][2], coords[eid][3]) for eid in ele_ids if eid in coords]
+    if not items:
+        return {0: list(ele_ids)}
+    items.sort(key=lambda x: (x[1], x[2]))
+    clusters = []
+    cur = [items[0][0]]
+    cur_chr = items[0][1]
+    cur_end = items[0][3]
+    for item in items[1:]:
+        eid, ch, st, en = item
+        if ch == cur_chr and st - cur_end <= max_gap:
+            cur.append(eid)
+            cur_end = max(cur_end, en)
+        else:
+            clusters.append(cur)
+            cur = [eid]
+            cur_chr = ch
+            cur_end = en
+    if cur:
+        clusters.append(cur)
+    return {i: members for i, members in enumerate(clusters)}
+
+
+def concat_block_alignments(member_ids, aln_dir):
+    """Concatenate trimmed alignments of multiple elements into one supermatrix."""
+    merged = {}
+    for eid in member_ids:
+        ap = os.path.join(aln_dir, f"{eid}.trimmed.aln")
+        if not os.path.isfile(ap):
+            ap = os.path.join(aln_dir, f"{eid}.aln")
+        if not os.path.isfile(ap):
+            continue
+        sq = read_fasta(ap)
+        for sp, seq in sq.items():
+            merged.setdefault(sp, []).append(seq if seq else "-" * len(seq))
+    return {sp: "".join(seqs) for sp, seqs in merged.items()}
+
+
 def write_script(path, cmds, description=""):
     """Write a run.sh script, return path."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -302,8 +354,13 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
 
 def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
                        astral_bin, astral_jar, astral_threads, min_site_occ,
-                       submit, tag_name, thr_label, threads=1):
-    """FastTree per element (local) + write ASTRAL run script."""
+                       submit, tag_name, thr_label, threads=1,
+                       tag_coords=None, block_gap=0):
+    """ASTRAL pipeline: block-gap cluster → concat → FastTree → ASTRAL.
+
+    If block_gap > 0 and tag_coords is provided, elements are clustered by
+    genomic proximity before concatenation and tree inference.
+    """
     if not keep_fastas:
         return
 
@@ -311,50 +368,79 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     use_iv = os.path.isfile(astral_bin) if astral_bin else False
     jar_path = astral_jar
 
-    # FastTree per element (parallel)
     nwk_dir = os.path.join(out_dir, "nwk")
     os.makedirs(nwk_dir, exist_ok=True)
-    fasttree_skip = False
-    if thr_label != "all":
-        all_nwk = os.path.join(os.path.dirname(out_dir), "all", "nwk")
-        if os.path.isdir(all_nwk):
-            linked = 0
-            for fp in keep_fastas:
-                base = os.path.basename(fp).replace(".fasta", "")
-                src = os.path.join(all_nwk, base + ".nwk")
-                dst = os.path.join(nwk_dir, base + ".nwk")
-                if os.path.isfile(src) and not os.path.isfile(dst):
-                    os.symlink(os.path.abspath(src), dst)
-                    linked += 1
-            print(f"  Symlinked {linked}/{len(keep_fastas)} trees from all/nwk/ ({tag_name}/{thr_label})")
-            if linked > 0:
-                fasttree_skip = True
 
-    if not fasttree_skip:
-        ok_count = fail_count = 0
-        work = [(fp, aln_dir, out_dir, fasttree_bin) for fp in keep_fastas]
-        if threads > 1:
-            with Pool(threads) as p:
-                for ok, _ in p.imap_unordered(_fasttree_one, work):
-                    if ok: ok_count += 1
-                    else: fail_count += 1
+    # Determine clusters: gap cluster or per-element
+    if block_gap > 0 and tag_coords:
+        ele_ids = sorted(int(os.path.basename(fp).replace(".fasta", "")) for fp in keep_fastas)
+        clusters = gap_cluster(ele_ids, tag_coords, block_gap)
+        cluster_items = list(clusters.items())
+        print(f"  Gap clustering ({block_gap}bp): {len(cluster_items)} blocks ({tag_name}/{thr_label})")
+    else:
+        # per-element clustering (each element is its own "cluster")
+        cluster_items = [(int(os.path.basename(fp).replace(".fasta", "")), [fp])
+                         for fp in keep_fastas]
+
+    # Run FastTree on each cluster
+    ok_count = fail_count = 0
+    for block_id, members in cluster_items:
+        if block_gap > 0 and tag_coords:
+            # concatenate block alignments
+            concat = concat_block_alignments(members, aln_dir)
+            if len(concat) < 2:
+                fail_count += 1
+                continue
+            base_name = f"{tag_name}_{block_id}"
+            fasta_path = os.path.join(out_dir, "nwk", base_name + ".fa")
+            with open(fasta_path, 'w') as f:
+                for sp, s in sorted(concat.items()):
+                    f.write(f">{sp}\n{s}\n")
         else:
-            for w in work:
-                ok, _ = _fasttree_one(w)
-                if ok: ok_count += 1
-                else: fail_count += 1
-        print(f"  FastTree: {ok_count} OK, {fail_count} FAIL ({tag_name}/{thr_label})")
+            # per-element: use keep_fastas member
+            fp = (list(members)[0]) if isinstance(members, (set, list)) else members
+            # find the fasta path 
+            base_name = os.path.basename(fp).replace(".fasta", "") if isinstance(fp, str) else str(members)
+            fasta_path = os.path.join(aln_dir, base_name + ".trimmed.aln")
+            if not os.path.isfile(fasta_path):
+                fasta_path = os.path.join(aln_dir, base_name + ".aln")
+                if not os.path.isfile(fasta_path):
+                    fail_count += 1
+                    continue
+
+        nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
+        if os.path.isfile(nwk_path):
+            ok_count += 1
+            continue
+
+        cmd = [fasttree_bin, "-nt", "-gtr", "-nosupport"]
+        with open(fasta_path) as inp, open(nwk_path, "w") as out:
+            r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0:
+            ok_count += 1
+        else:
+            fail_count += 1
 
     # collect gene trees
     all_trees = []
-    for fp in keep_fastas:
-        base_name = os.path.basename(fp).replace(".fasta", "")
-        nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
-        if os.path.isfile(nwk_path):
-            with open(nwk_path) as f:
-                t = f.read().strip()
-                if t:
-                    all_trees.append(t)
+    if block_gap > 0 and tag_coords:
+        for block_id, _ in cluster_items:
+            base_name = f"{tag_name}_{block_id}"
+            nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
+            if os.path.isfile(nwk_path):
+                with open(nwk_path) as f:
+                    t = f.read().strip()
+                    if t:
+                        all_trees.append(t)
+    else:
+        for fp in keep_fastas:
+            base_name = os.path.basename(fp).replace(".fasta", "")
+            nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
+            if os.path.isfile(nwk_path):
+                with open(nwk_path) as f:
+                    t = f.read().strip()
+                    if t:
+                        all_trees.append(t)
     gene_trees_path = os.path.join(out_dir, "gene_trees.nwk")
     with open(gene_trees_path, 'w') as f:
         for t in all_trees:
@@ -422,25 +508,25 @@ def main():
 
     # ─── Tags ────────────────────────────────────────────
     if args.element_tags and os.path.isfile(args.element_tags):
-        tag_dict = read_element_tags(args.element_tags)
+        tag_dict, tag_coords = read_element_tags(args.element_tags)
         print(f"Tags: {len(tag_dict)} groups: {', '.join(sorted(tag_dict))}")
     elif args.element_tags and not os.path.isfile(args.element_tags):
         print(f"  Warning: --element-tags ({args.element_tags}) not found.")
         print(f"  Copy the example:  cp element_tags.example.tsv element_tags.tsv")
         print(f"  Or leave ELEMENT_TAGS_FILE empty in config.py for no tags.")
-        tag_dict = {}
+        tag_dict, tag_coords = {}, {}
     else:
-        tag_dict = {}
+        tag_dict, tag_coords = {}, {}
     tag_dict["all"] = None  # always include full set
 
     # ─── Thresholds ──────────────────────────────────────
     concat_quantiles = [int(x) for x in args.concat_length_quantiles.split(",") if x.strip()] \
                        if args.concat_length_quantiles.strip() else []
-    astral_quantiles = [int(x) for x in args.astral_length_quantiles.split(",") if x.strip()] \
-                       if args.astral_length_quantiles.strip() else []
+    astral_block_gaps = [int(x) for x in args.block_gap.split(",") if x.strip()] \
+                        if args.block_gap.strip() else []
 
     concat_levels = [None] + (concat_quantiles if concat_quantiles else [])
-    astral_levels = [None] + (astral_quantiles if astral_quantiles else [])
+    astral_levels = [None] + (astral_block_gaps if astral_block_gaps else [])
 
     # ─── Method-dispatch ─────────────────────────────────
     methods = ["concat", "astral"] if args.method == "both" else [args.method]
@@ -460,7 +546,6 @@ def main():
             astral_bin = os.path.expanduser(args.astral_bin)
             base_out = os.path.join(base_dir, "astral")
             levels = astral_levels
-            quantiles = astral_quantiles
 
         for tag_name, tag_ids in sorted(tag_dict.items()):
             tag_files = fasta_files
@@ -471,16 +556,22 @@ def main():
                 print(f"  Skip tag '{tag_name}': only {len(tag_files)} elements")
                 continue
 
-            tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
-            tag_cuts = quantile_cutoffs(tag_lens, quantiles) if quantiles else {}
+            if m == "concat":
+                tag_lens = list(compute_aligned_lengths(aln_dir, tag_files))
+                tag_cuts = quantile_cutoffs(tag_lens, concat_quantiles) if concat_quantiles else {}
+            else:
+                tag_cuts = {}
 
             for level in levels:
-                thr_label = f"quantile_{level}" if level is not None else "all"
+                if m == "concat":
+                    thr_label = f"quantile_{level}" if level is not None else "all"
+                else:
+                    thr_label = f"block_gap_{level}" if level is not None else "all"
                 print(f"\n=== {m.upper()}: {tag_name} / {thr_label} ===")
                 out_dir = os.path.join(base_out, tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
 
-                if level is not None:
+                if level is not None and m == "concat":
                     cutoff = tag_cuts.get(level, 0)
                     keep = []
                     for fp in tag_files:
@@ -505,11 +596,12 @@ def main():
                                            tag_name, thr_label,
                                            C.PARTITION)
                 else:
+                    block_gap = level * 1000 if level else 0
                     sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
                                            astral_bin, args.astral_jar,
                                            args.threads, args.min_site_occupancy,
                                            submit, tag_name, thr_label,
-                                           args.threads)
+                                           args.threads, tag_coords, block_gap)
                 if sp:
                     all_scripts.append(sp)
 

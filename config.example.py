@@ -22,7 +22,8 @@ THREADS = 20                 # global worker count: FAMSA/FastTree parallelism, 
 # Phylogeny defaults
 DEFAULT_METHOD = "concat"                    # "concat" or "astral"
 CONCAT_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
-ASTRAL_LENGTH_QUANTILES = "25,50,75"  # comma-separated length quantiles; empty = single run
-ELEMENT_TAGS_FILE = ""                       # path to element_tags.tsv (ele_id\\ttag with header), empty = no tags
+ASTRAL_BLOCK_GAPS = "1000"            # kb thresholds for astral block clustering; empty = single run
+GFF_DIR = ""                           # path to GFF3/*.gff* directory (for classify_elements.py / astral)
+ELEMENT_TAGS_FILE = ""                       # path to element_tags.tsv (ele_id\\ttype, etc), empty = no tags
 PARTITION = False                            # True = output partition file for IQ-TREE
 DRY_RUN = False                              # True = only generate scripts, don't run

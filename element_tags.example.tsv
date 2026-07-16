@@ -1,7 +1,5 @@
-ele_id	tag
-0	intergenic
-1	intron
-2	intergenic
-3	utr
-4	intron
-5	utr
+ele_id	type	chr	start	end
+0	intergenic	NC_057745.1	13380289	13380657
+1	intron	NC_057735.1	1021947	1022069
+2	intergenic	NC_057735.1	457140	457379
+3	intergenic	NC_057727.1	24973417	24973465
