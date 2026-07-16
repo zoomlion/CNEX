@@ -247,29 +247,19 @@ def quantile_cutoffs(values, quantiles):
     return cuts
 
 
-def gap_cluster(ele_ids, coords, max_gap):
-    """Group element IDs by genomic proximity (chr + gap ≤ max_gap)."""
-    items = [(eid, coords[eid][1], coords[eid][2], coords[eid][3]) for eid in ele_ids if eid in coords]
-    if not items:
-        return {0: list(ele_ids)}
-    items.sort(key=lambda x: (x[1], x[2]))
-    clusters = []
-    cur = [items[0][0]]
-    cur_chr = items[0][1]
-    cur_end = items[0][3]
-    for item in items[1:]:
-        eid, ch, st, en = item
-        if ch == cur_chr and st - cur_end <= max_gap:
-            cur.append(eid)
-            cur_end = max(cur_end, en)
-        else:
-            clusters.append(cur)
-            cur = [eid]
-            cur_chr = ch
-            cur_end = en
-    if cur:
-        clusters.append(cur)
-    return {i: members for i, members in enumerate(clusters)}
+def bin_cluster(ele_ids, coords, bin_size):
+    """Assign element IDs to fixed genomic bins of bin_size bp.
+
+    Bins with fewer than 2 elements are discarded.
+    """
+    bins = {}
+    for eid in ele_ids:
+        if eid not in coords:
+            continue
+        _, ch, st, _ = coords[eid]
+        bin_start = (st // bin_size) * bin_size
+        bins.setdefault(f"{ch}_{bin_start}", []).append(eid)
+    return {k: v for k, v in bins.items() if len(v) >= 2}
 
 
 def concat_block_alignments(member_ids, aln_dir):
@@ -382,12 +372,12 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     nwk_dir = os.path.join(out_dir, "nwk")
     os.makedirs(nwk_dir, exist_ok=True)
 
-    # Determine clusters: gap cluster or per-element
+    # Determine bins: fixed-size bins or per-element
     if block_gap > 0 and tag_coords:
         ele_ids = sorted(int(os.path.basename(fp).replace(".fasta", "")) for fp in keep_fastas)
-        clusters = gap_cluster(ele_ids, tag_coords, block_gap)
-        cluster_items = list(clusters.items())
-        print(f"  Gap clustering ({block_gap}bp): {len(cluster_items)} blocks ({tag_name}/{thr_label})")
+        bin_items = bin_cluster(ele_ids, tag_coords, block_gap)
+        cluster_items = list(bin_items.items())
+        print(f"  Bins ({block_gap}bp): {len(cluster_items)} blocks ({tag_name}/{thr_label})")
     else:
         # per-element clustering (each element is its own "cluster")
         cluster_items = [(int(os.path.basename(fp).replace(".fasta", "")), [fp])
