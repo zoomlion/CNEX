@@ -263,8 +263,12 @@ def bin_cluster(ele_ids, coords, bin_size):
 
 
 def concat_block_alignments(member_ids, aln_dir):
-    """Concatenate trimmed alignments of multiple elements into one supermatrix."""
-    merged = {}
+    """Concatenate trimmed alignments of multiple elements into one supermatrix.
+
+    Pads missing species with gaps so all sequences have equal length.
+    """
+    block_alignments = []
+    all_sp = set()
     for eid in member_ids:
         ap = os.path.join(aln_dir, f"{eid}.trimmed.aln")
         if not os.path.isfile(ap):
@@ -272,8 +276,16 @@ def concat_block_alignments(member_ids, aln_dir):
         if not os.path.isfile(ap):
             continue
         sq = read_fasta(ap)
-        for sp, seq in sq.items():
-            merged.setdefault(sp, []).append(seq if seq else "-" * len(seq))
+        block_alignments.append(sq)
+        all_sp.update(sq.keys())
+
+    merged = {sp: [] for sp in all_sp}
+    for sq in block_alignments:
+        alen = len(next(iter(sq.values()))) if sq else 0
+        for sp in all_sp:
+            seq = sq.get(sp, "")
+            merged[sp].append(seq if seq else "-" * alen)
+
     return {sp: "".join(seqs) for sp, seqs in merged.items()}
 
 
