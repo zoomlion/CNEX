@@ -563,7 +563,9 @@ def main():
             astral_bin = os.path.expanduser(args.astral_bin)
             base_out = os.path.join(base_dir, "astral")
             levels = astral_levels
-            method_tag_dict = tag_dict  # astral: use all tags
+            method_tag_dict = {k: v for k, v in tag_dict.items() if k != "all"}
+            if not method_tag_dict:
+                method_tag_dict = {"all": None}  # fallback when no tags
 
         for tag_name, tag_ids in sorted(method_tag_dict.items()):
             tag_files = fasta_files
