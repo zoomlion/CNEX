@@ -529,9 +529,8 @@ def main():
     tag_dict["all"] = None  # always include full set
 
     # ─── Thresholds ──────────────────────────────────────
-    astral_block_gaps = [int(x) for x in args.block_gap.split(",") if x.strip()] \
-                        if args.block_gap.strip() else []
-    astral_levels = [None] + (astral_block_gaps if astral_block_gaps else [])
+    astral_levels = [int(x) for x in args.block_gap.split(",") if x.strip()] \
+                    if args.block_gap.strip() else []
 
     # ─── Method-dispatch ─────────────────────────────────
     methods = ["concat", "astral"] if args.method == "both" else [args.method]
@@ -581,25 +580,16 @@ def main():
 
             # astral: level loop for block-gap thresholds
             for level in levels:
-                thr_label = f"block_{level}kb" if level is not None else "all"
+                thr_label = "all" if level == 0 else f"block_{level}kb"
                 print(f"\n=== ASTRAL: {tag_name} / {thr_label} ===")
                 out_dir = os.path.join(base_out, tag_name, thr_label)
                 os.makedirs(out_dir, exist_ok=True)
-                keep = tag_files
-                print(f"  {tag_name}/{thr_label}: {len(keep)} elements")
-
-                if m == "concat":
-                    sp = run_concat_subset(aln_dir, keep, args.min_occupancy,
-                                           out_dir, iqtree3, args.threads, submit,
-                                           tag_name, thr_label,
-                                           C.PARTITION)
-                else:
-                    block_gap = level * 1000 if level else 0
-                    sp = run_astral_subset(aln_dir, keep, out_dir, fasttree,
-                                           astral_bin, args.astral_jar,
-                                           args.threads, args.min_site_occupancy,
-                                           submit, tag_name, thr_label,
-                                           args.threads, tag_coords, block_gap)
+                block_gap = level * 1000
+                sp = run_astral_subset(aln_dir, tag_files, out_dir, fasttree,
+                                       astral_bin, args.astral_jar,
+                                       args.threads, args.min_site_occupancy,
+                                       submit, tag_name, thr_label,
+                                       args.threads, tag_coords, block_gap)
                 if sp:
                     all_scripts.append(sp)
 
