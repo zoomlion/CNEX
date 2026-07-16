@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Concatenate trimmed MSA alignments into supermatrix FASTA + partition file."""
-import os, sys, glob, argparse
+import os, sys, glob, argparse, re
 from collections import OrderedDict
+
+
+def clean_header(hdr):
+    """Replace special characters with underscores for tool compatibility."""
+    return re.sub(r"[ '():,;]", "_", hdr)
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -47,7 +52,7 @@ def read_fasta(path):
             if line.startswith(">"):
                 if header:
                     seqs[header] = "".join(seq)
-                header = line[1:].split()[0]
+                header = clean_header(line[1:].split()[0])
                 seq = []
             else:
                 seq.append(line)

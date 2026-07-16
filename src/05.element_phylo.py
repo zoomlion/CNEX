@@ -28,7 +28,7 @@ from multiprocessing import Pool
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
 import config as C
-from concat_msa import trim_alignment_by_occupancy, read_fasta
+from concat_msa import trim_alignment_by_occupancy, read_fasta, clean_header
 
 
 # ─── helpers ───────────────────────────────────────────────
@@ -84,7 +84,7 @@ def read_fasta_to_dict(path):
             if s.startswith('>'):
                 if hdr is not None:
                     seqs[hdr] = ''.join(buf)
-                hdr = s[1:]
+                hdr = clean_header(s[1:])
                 buf = []
             else:
                 buf.append(s)
