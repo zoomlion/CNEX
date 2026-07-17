@@ -542,7 +542,10 @@ def main():
                 sys.exit(f"FastTree not found: {fasttree}")
             astral_bin = os.path.expanduser(args.astral_bin)
             base_out = os.path.join(base_dir, "astral")
-            levels = astral_levels
+            if not tag_coords:
+                levels = [0]  # no coordinates → per-element only
+            else:
+                levels = astral_levels
             method_tag_dict = {k: v for k, v in tag_dict.items() if k != "all"}
             if not method_tag_dict:
                 method_tag_dict = {"all": None}  # fallback when no tags
