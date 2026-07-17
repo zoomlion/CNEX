@@ -182,7 +182,7 @@ def _align_one(args):
     # local trim: remove gap-rich columns via trimal
     if min_site_occ > 0:
         trim_path = aln_path.replace(".aln", ".trimmed.aln")
-        subprocess.run(["trimal", "-in", aln_path, "-out", trim_path, "-automated1"],
+        subprocess.run(["trimal", "-in", aln_path, "-out", trim_path, "-gt", "0.8"],
                        capture_output=True)
     return True, fasta_path, None
 
