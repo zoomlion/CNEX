@@ -28,7 +28,7 @@ from multiprocessing import Pool
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils"))
 import config as C
-from concat_msa import trim_alignment_by_occupancy, read_fasta, clean_header
+from concat_msa import read_fasta, clean_header
 
 
 # ─── helpers ───────────────────────────────────────────────
@@ -179,14 +179,11 @@ def _align_one(args):
         return False, fasta_path, "align"
     _flatten_fasta(aln_path)
     os.remove(tmp_fa)
-    # local trim: remove gap-rich columns
+    # local trim: remove gap-rich columns via trimal
     if min_site_occ > 0:
-        sq = read_fasta(aln_path)
-        trimmed = trim_alignment_by_occupancy(sq, min_site_occ)
         trim_path = aln_path.replace(".aln", ".trimmed.aln")
-        with open(trim_path, 'w') as f:
-            for h, s in trimmed.items():
-                f.write(f'>{h}\n{s}\n')
+        subprocess.run(["trimal", "-in", aln_path, "-out", trim_path, "-automated1"],
+                       capture_output=True)
     return True, fasta_path, None
 
 
