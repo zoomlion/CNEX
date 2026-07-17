@@ -247,8 +247,6 @@ def concat_block_alignments(member_ids, aln_dir):
     for eid in member_ids:
         ap = os.path.join(aln_dir, f"{eid}.trimmed.aln")
         if not os.path.isfile(ap):
-            ap = os.path.join(aln_dir, f"{eid}.aln")
-        if not os.path.isfile(ap):
             continue
         sq = read_fasta(ap)
         block_alignments.append(sq)
@@ -300,8 +298,6 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
     for fp in keep_fastas:
         base_name = os.path.basename(fp).replace(".fasta", "")
         src = os.path.join(aln_dir, base_name + ".trimmed.aln")
-        if not os.path.isfile(src):
-            src = os.path.join(aln_dir, base_name + ".aln")
         dst = os.path.join(aln_subdir, base_name + ".aln")
         if os.path.isfile(src) and not os.path.isfile(dst):
             os.symlink(os.path.abspath(src), dst)
@@ -404,9 +400,7 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
             base_name = os.path.basename(fp).replace(".fasta", "") if isinstance(fp, str) else str(members)
             fasta_path = os.path.join(aln_dir, base_name + ".trimmed.aln")
             if not os.path.isfile(fasta_path):
-                fasta_path = os.path.join(aln_dir, base_name + ".aln")
-                if not os.path.isfile(fasta_path):
-                    continue
+                continue
 
         nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
         if os.path.isfile(nwk_path):
