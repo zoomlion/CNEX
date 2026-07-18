@@ -49,7 +49,7 @@ def parse_blocks(fa_path):
             if not line:
                 continue
             m = HEADER_RE.match(line)
-            if m:
+            if m and m.group(1) != "ref":
                 records.append({
                     "species": m.group(1),
                     "chr": m.group(2),
@@ -199,7 +199,6 @@ def main():
             kept += 1
 
     # Summary (exon excluded)
-    from collections import Counter
     cnt = Counter()
     for t in types.values():
         if t != "exon":
