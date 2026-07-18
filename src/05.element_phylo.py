@@ -521,7 +521,7 @@ def main():
                 levels = [0]  # no coordinates → per-element only
             else:
                 levels = astral_levels
-            method_tag_dict = {k: v for k, v in tag_dict.items() if k != "all"}
+            method_tag_dict = tag_dict
             if not method_tag_dict:
                 method_tag_dict = {"all": None}  # fallback when no tags
 
