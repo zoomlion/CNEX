@@ -21,26 +21,6 @@ def parse_args():
 def clean_seq(s):
     return s.replace("\x00", "N").replace(".", "-")
 
-def trim_alignment_by_occupancy(seqs, min_site_occupancy=0.5):
-    """Filter alignment columns by site occupancy.
-
-    Args:
-        seqs: {name: sequence_string} — aligned sequences of equal length.
-        min_site_occupancy: 0–1, fraction of non-gap species required per column.
-
-    Returns:
-        {name: filtered_sequence}
-    """
-    if not seqs or min_site_occupancy <= 0:
-        return seqs
-    names = list(seqs.keys())
-    ncol = len(seqs[names[0]])
-    min_non_gap = max(1, int(len(names) * min_site_occupancy))
-    keep = [j for j in range(ncol)
-            if sum(1 for sp in names if seqs[sp][j] not in '-Nn?') >= min_non_gap]
-    return {sp: ''.join(seqs[sp][j] for j in keep) for sp in names}
-
-
 def read_fasta(path):
     seqs = OrderedDict()
     with open(path) as f:

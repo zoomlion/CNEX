@@ -197,31 +197,6 @@ def _fasttree_cluster(args):
     return r.returncode == 0, nwk_path
 
 
-def compute_aligned_lengths(aln_dir, fasta_files):
-    """Yield average non-gap length per element (aligned sequences)."""
-    for fp in fasta_files:
-        base = os.path.basename(fp).replace(".fasta", "")
-        ap = os.path.join(aln_dir, base + ".aln")
-        if not os.path.isfile(ap):
-            continue
-        sq = read_fasta(ap)
-        if not sq:
-            continue
-        lens = [sum(1 for c in s if c not in '-Nn?') for s in sq.values()]
-        yield sum(lens) / len(lens)
-
-
-def quantile_cutoffs(values, quantiles):
-    """Compute cutoffs for given quantile percentages (0-100)."""
-    sv = sorted(values)
-    n = len(sv)
-    cuts = {}
-    for q in quantiles:
-        idx = max(0, min(n - 1, int(n * q / 100)))
-        cuts[q] = sv[idx]
-    return cuts
-
-
 def bin_cluster(ele_ids, coords, bin_size):
     """Assign element IDs to fixed genomic bins of bin_size bp.
 

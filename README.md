@@ -29,7 +29,6 @@ Key settings in `config.py`:
 | `THREADS` | 20 | Worker count: FAMSA/FastTree parallelism, IQ-TREE / ASTRAL threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
 | `DEFAULT_METHOD` | `astral` | `astral`, `concat`, or `both` |
-| `CONCAT_LENGTH_QUANTILES` | `25,50,75` | Length quantile thresholds for concat method |
 | `ASTRAL_BLOCK_GAPS` | `1000,2000` | kb thresholds for astral block clustering |
 | `ELEMENT_TAGS_FILE` | `""` | Path to element_tags.tsv for per-type filtering |
 | `PARTITION` | `False` | Output partition file for IQ-TREE |
@@ -58,16 +57,16 @@ python3 src/05.element_phylo.py --submit     # execute
 | **concat** | `--method concat` | FAMSA → concat_msa → IQ-TREE 3 |
 | **both** | `--method both` | both in one pass |
 
-### ASTRAL: Block-Gap Clustering
+### ASTRAL: Block-Binning
 
-Elements are clustered by genomic proximity (default gaps 1000kb / 2000kb). Each cluster is concatenated into a super-locus before FastTree inference:
+Elements are grouped into fixed genomic bins (default 1000kb / 2000kb). Each bin is concatenated into a super-locus before FastTree inference. Requires `element_tags.tsv` for coordinates; without it, each element builds an independent gene tree.
 
 ```
 element_tags.tsv: ele_id→(type, chr, start, end)
-    ↓ gap_cluster(max_gap=1000kb)
-{cluster_0: [ele_1, ele_2, ...], cluster_1: [...], ...}
+    ↓ bin_cluster(bin_size=1000kb)
+{chr_0: [ele_1, ...], chr_1000000: [ele_2, ...], ...}
     ↓ concat_block_alignments + FastTree
-block_0.nwk  block_1.nwk  ...
+block_{type}_0.nwk  block_{type}_1.nwk  ...
     ↓ ASTRAL
 species_tree.nwk
 ```
@@ -76,20 +75,18 @@ Output structure:
 
 ```
 results/astral/{type}/
-├── block_gap_1000/run.sh
-├── block_gap_2000/run.sh
+├── block_1000kb/run.sh
+├── block_2000kb/run.sh
 └── run_all.sh
 ```
 
-### Concat: Length Quantiles
+### Concat: Per-Tag Supermatrix
 
-IQ-TREE concatenates all elements, filtered by aligned-length quantiles (P25/P50/P75):
+IQ-TREE builds one supermatrix per tag (all/intergenic/intron), without quantile filtering:
 
 ```
 results/iqtree/{type}/
-├── quantile_25/run.sh
-├── quantile_50/run.sh
-├── quantile_75/run.sh
+├── all/run.sh
 └── run_all.sh
 ```
 
@@ -120,9 +117,9 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 
 | File | Description |
 |------|-------------|
-| `results/aln/*.trimmed.aln` | Per-element trimmed alignments |
-| `results/astral/{type}/{gap}/species_tree.nwk` | ASTRAL species tree |
-| `results/iqtree/{type}/{quantile}/supermatrix.fa.treefile` | IQ-TREE tree |
+| `results/aln/*.trimmed.aln` | Per-element trimmed alignments (trimal) |
+| `results/astral/{type}/{bin}/species_tree.nwk` | ASTRAL species tree |
+| `results/iqtree/{type}/all/supermatrix.fa.treefile` | IQ-TREE tree |
 | `variants.tsv` | SNP/INDEL candidates (from `--snp`) |
 | `snp_elements.gfa` | GFA 1.0 graph with bubble paths |
 
@@ -134,6 +131,7 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 | FastTree | **astral** | `FastTree` |
 | ASTRAL (ASTER) | **astral** | `astral` |
 | IQ-TREE 3 | **concat** | `iqtree3` |
+| trimal | Both | `trimal` (alignment trimming) |
 | bedtools | classification | `bedtools` (for `classify_elements.py`) |
 
 ## Benchmark
