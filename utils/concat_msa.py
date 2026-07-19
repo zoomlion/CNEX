@@ -86,7 +86,7 @@ def main():
             s = seqs.get(sp, "")
             s = clean_seq(s) if s else ""
             supermatrix[sp].append(s if s else "-" * aln_len)
-        partitions.append(f"GTR+G4, {i}={pos}-{pos + aln_len - 1}")
+        partitions.append(f"DNA, {i} = {pos}-{pos + aln_len - 1}")
         pos += aln_len
 
     # Write FASTA

@@ -41,6 +41,7 @@ def parse_args():
     p.add_argument("--famsa", default=C.FAMSA)
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
+    p.add_argument("--iqtree-model", default=C.IQTREE_MODEL)
     p.add_argument("--astral-bin", default=C.ASTRAL)
     p.add_argument("--astral-dir", default="")
     p.add_argument("--astral-jar", default="")
@@ -262,7 +263,7 @@ def execute_script(path, submit):
 
 def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
                       iqtree3, iqtree_threads, submit, tag_name, thr_label,
-                      partition=False):
+                      partition=False, iqtree_model="MFP"):
     """Filter alignments, run concat_msa, write + execute run script."""
     if not keep_fastas:
         return
@@ -279,12 +280,12 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
 
     # concat_msa.py (skip if supermatrix.fa already exists)
     supermatrix = os.path.join(out_dir, "supermatrix.fa")
+    partitions = os.path.join(out_dir, "partitions.txt")
     if os.path.isfile(supermatrix):
         print(f"  supermatrix.fa exists, updating run.sh ({tag_name}/{thr_label})")
     else:
         concat_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "..", "utils", "concat_msa.py")
-        partitions = os.path.join(out_dir, "partitions.txt")
         cmd = ["python3", concat_script, "-i", aln_subdir, "--suffix", ".aln",
                "--min-occupancy", str(min_occ), "-o", supermatrix]
         if partition:
@@ -303,7 +304,7 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
     iq_cmd = f"iqtree3 -s {os.path.basename(supermatrix)}"
     if partition:
         iq_cmd += f" -p {os.path.basename(partitions)}"
-    iq_cmd += f" -m GTR+F+R4 -bb 1000 -nt {n_threads}"
+    iq_cmd += f" -m {iqtree_model} -bb 1000 -nt {n_threads}"
     cmds = [iq_cmd]
     write_script(script_path, cmds,
                  f"IQ-TREE 3: {tag_name} / {thr_label} ({len(keep_fastas)} elements)")
@@ -542,7 +543,8 @@ def main():
                 os.makedirs(out_dir, exist_ok=True)
                 sp = run_concat_subset(aln_dir, tag_files, args.min_occupancy,
                                        out_dir, iqtree3, args.threads, submit,
-                                       tag_name, thr_label, C.PARTITION)
+                                       tag_name, thr_label, C.PARTITION,
+                                       args.iqtree_model)
                 if sp:
                     all_scripts.append(sp)
                 continue
