@@ -600,7 +600,7 @@ def main():
             if not method_tag_dict:
                 method_tag_dict = {"all": None}  # fallback when no tags
 
-        is_species_mode = any(g != "all" for g in groups)
+        is_species_mode = bool(args.species_file and os.path.isfile(args.species_file) and groups)
 
         if is_species_mode:
             # species groups: skip tags, one run per group
