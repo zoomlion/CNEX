@@ -41,7 +41,7 @@ def parse_args():
     p.add_argument("--famsa", default=C.FAMSA)
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
-    p.add_argument("--iqtree-model", default=C.IQTREE_MODEL)
+    p.add_argument("--iqtree-model", default="")
     p.add_argument("--astral-bin", default=C.ASTRAL)
     p.add_argument("--astral-dir", default="")
     p.add_argument("--astral-jar", default="")
