@@ -50,6 +50,8 @@ def parse_args():
     p.add_argument("--block-gap", type=str, default=C.ASTRAL_BLOCK_GAPS,
                    help="Comma-separated kb thresholds for astral block clustering (default: config)")
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
+    p.add_argument("--species-file", default="",
+                   help="File with one species per line; empty = use all")
     p.add_argument("--min-occupancy", type=float, default=0.3)
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
     p.add_argument("-t", "--threads", type=int, default=C.THREADS,
@@ -62,6 +64,33 @@ def parse_args():
     p.add_argument("--dry-run", dest="dry_run", action="store_true",
                    default=C.DRY_RUN, help="Only generate scripts, no execution")
     return p.parse_args()
+
+
+def read_species_groups(path):
+    """Read species file with optional #group_name separators.
+    
+    Returns {group_name: set(species)}.
+    Without any #group line, uses filename stem as the sole group name.
+    """
+    groups = OrderedDict()
+    current = None
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                current = s[1:].strip()
+                groups.setdefault(current, set())
+            elif current is not None:
+                groups[current].add(s)
+    if not groups:
+        # whole file as one group
+        name = os.path.splitext(os.path.basename(path))[0]
+        with open(path) as f:
+            sp = {l.strip() for l in f if l.strip() and not l.startswith("#")}
+        groups[name] = sp
+    return groups
 
 
 def find_fasta_files(elements_dir, max_elements):
@@ -140,6 +169,19 @@ def filter_species_by_cne_count(fasta_files, min_cne):
     if removed:
         print(f"  Species filter: {len(keep)} kept, {removed} removed (< {min_cne} CNEs)")
     return keep
+
+
+def strip_all_gap_columns(seqs):
+    """Remove columns where all sequences have gap characters."""
+    names = list(seqs.keys())
+    seq_list = list(seqs.values())
+    if not seq_list:
+        return seqs
+    alen = len(seq_list[0])
+    keep = [i for i in range(alen) if any(s[i] not in '-.' for s in seq_list)]
+    if len(keep) == alen:
+        return seqs
+    return {n: ''.join(s[j] for j in keep) for n, s in zip(names, seq_list)}
 
 
 def _flatten_fasta(path):
@@ -455,8 +497,8 @@ def main():
     submit = not args.dry_run  # --dry-run inverts submit
 
     base_dir = os.path.dirname(os.path.abspath(args.elements_dir))
-    aln_dir = os.path.join(base_dir, "aln")
-    os.makedirs(aln_dir, exist_ok=True)
+    aln_root = os.path.join(base_dir, "aln", "all")
+    os.makedirs(aln_root, exist_ok=True)
 
     fasta_files = find_fasta_files(args.elements_dir, args.max_elements)
     print(f"Found {len(fasta_files)} element FASTAs")
@@ -465,10 +507,42 @@ def main():
 
     keep_sp = filter_species_by_cne_count(fasta_files, args.min_cne_per_species)
 
+    # ─── Groups ──────────────────────────────────────────
+    groups = OrderedDict()
+    if args.species_file and os.path.isfile(args.species_file):
+        raw_groups = read_species_groups(args.species_file)
+        for gname, gsp in raw_groups.items():
+            gsp &= keep_sp
+            if len(gsp) < 2:
+                print(f"  Skip group '{gname}': only {len(gsp)} species")
+                continue
+            group_aln_dir = os.path.join(base_dir, "aln", gname)
+            os.makedirs(group_aln_dir, exist_ok=True)
+            n_aln = 0
+            for fp in fasta_files:
+                base = os.path.basename(fp).replace(".fasta", "")
+                src = os.path.join(aln_root, base + ".trimmed.aln")
+                if not os.path.isfile(src):
+                    continue
+                seqs = read_fasta(src)
+                seqs = {h: s for h, s in seqs.items() if h in gsp}
+                if len(seqs) < 2:
+                    continue
+                seqs = strip_all_gap_columns(seqs)
+                write_fasta(seqs, os.path.join(group_aln_dir, base + ".trimmed.aln"))
+                n_aln += 1
+            groups[gname] = group_aln_dir
+            print(f"  Group '{gname}': {len(gsp)} species, {n_aln} elements")
+        if not groups:
+            print("  Warning: no valid groups from species file, using all species")
+            groups["all"] = aln_root
+    else:
+        groups["all"] = aln_root
+
     # ─── FAMSA alignment ─────────────────────────────────
     print(f"\n--- Aligning elements (FAMSA) ---")
     t0 = time.time()
-    work = [(f, famsa, args.resume, aln_dir, keep_sp, args.min_site_occupancy) for f in fasta_files]
+    work = [(f, famsa, args.resume, aln_root, keep_sp, args.min_site_occupancy) for f in fasta_files]
     ok_count = fail_count = 0
     if args.threads > 1:
         with Pool(args.threads) as p:
@@ -526,43 +600,75 @@ def main():
             if not method_tag_dict:
                 method_tag_dict = {"all": None}  # fallback when no tags
 
-        for tag_name, tag_ids in sorted(method_tag_dict.items()):
-            tag_files = fasta_files
-            if tag_ids is not None:
-                tag_files = [f for f in fasta_files
-                             if int(os.path.basename(f).replace(".fasta", "").split('.')[0]) in tag_ids]
-            if len(tag_files) < 3:
-                print(f"  Skip tag '{tag_name}': only {len(tag_files)} elements")
-                continue
+        is_species_mode = any(g != "all" for g in groups)
 
-            if m == "concat":
-                # concat: single run per tag, no level loop
-                thr_label = "all"
-                print(f"\n=== IQTREE: {tag_name} ===")
-                out_dir = os.path.join(base_out, tag_name, thr_label)
-                os.makedirs(out_dir, exist_ok=True)
-                sp = run_concat_subset(aln_dir, tag_files, args.min_occupancy,
-                                       out_dir, iqtree3, args.threads, submit,
-                                       tag_name, thr_label, C.PARTITION,
-                                       args.iqtree_model)
-                if sp:
-                    all_scripts.append(sp)
-                continue
+        if is_species_mode:
+            # species groups: skip tags, one run per group
+            iqtree_model = args.iqtree_model or C.IQTREE_MODEL
+            for gname, g_aln_dir in groups.items():
+                if len(fasta_files) < 3:
+                    print(f"  Skip '{gname}': only {len(fasta_files)} elements")
+                    continue
+                if m == "concat":
+                    thr_label = "all"
+                    print(f"\n=== IQTREE: {gname} ===")
+                    out_dir = os.path.join(base_out, gname, thr_label)
+                    os.makedirs(out_dir, exist_ok=True)
+                    sp = run_concat_subset(g_aln_dir, fasta_files, args.min_occupancy,
+                                           out_dir, iqtree3, args.threads, submit,
+                                           gname, thr_label, C.PARTITION,
+                                           iqtree_model)
+                    if sp: all_scripts.append(sp)
+                if m == "astral":
+                    for level in levels:
+                        thr_label = "all" if level == 0 else f"block_{level}kb"
+                        print(f"\n=== ASTRAL: {gname} / {thr_label} ===")
+                        out_dir = os.path.join(base_out, gname, thr_label)
+                        os.makedirs(out_dir, exist_ok=True)
+                        block_gap = level * 1000
+                        sp = run_astral_subset(g_aln_dir, fasta_files, out_dir, fasttree,
+                                               astral_bin, args.astral_jar,
+                                               args.threads, args.min_site_occupancy,
+                                               submit, gname, thr_label,
+                                               args.threads, tag_coords, block_gap)
+                        if sp: all_scripts.append(sp)
+        else:
+            # normal mode: tag loop over element types
+            iqtree_model = args.iqtree_model or C.IQTREE_MODEL_FULL
+            g_aln_dir = groups["all"]
+            for tag_name, tag_ids in sorted(method_tag_dict.items()):
+                tag_files = fasta_files
+                if tag_ids is not None:
+                    tag_files = [f for f in fasta_files
+                                 if int(os.path.basename(f).replace(".fasta", "").split('.')[0]) in tag_ids]
+                if len(tag_files) < 3:
+                    print(f"  Skip tag '{tag_name}': only {len(tag_files)} elements")
+                    continue
 
-            # astral: level loop for block-gap thresholds
-            for level in levels:
-                thr_label = "all" if level == 0 else f"block_{level}kb"
-                print(f"\n=== ASTRAL: {tag_name} / {thr_label} ===")
-                out_dir = os.path.join(base_out, tag_name, thr_label)
-                os.makedirs(out_dir, exist_ok=True)
-                block_gap = level * 1000
-                sp = run_astral_subset(aln_dir, tag_files, out_dir, fasttree,
-                                       astral_bin, args.astral_jar,
-                                       args.threads, args.min_site_occupancy,
-                                       submit, tag_name, thr_label,
-                                       args.threads, tag_coords, block_gap)
-                if sp:
-                    all_scripts.append(sp)
+                if m == "concat":
+                    thr_label = "all"
+                    print(f"\n=== IQTREE: {tag_name} ===")
+                    out_dir = os.path.join(base_out, tag_name, thr_label)
+                    os.makedirs(out_dir, exist_ok=True)
+                    sp = run_concat_subset(g_aln_dir, tag_files, args.min_occupancy,
+                                           out_dir, iqtree3, args.threads, submit,
+                                           tag_name, thr_label, C.PARTITION,
+                                           iqtree_model)
+                    if sp: all_scripts.append(sp)
+                    continue
+
+                for level in levels:
+                    thr_label = "all" if level == 0 else f"block_{level}kb"
+                    print(f"\n=== ASTRAL: {tag_name} / {thr_label} ===")
+                    out_dir = os.path.join(base_out, tag_name, thr_label)
+                    os.makedirs(out_dir, exist_ok=True)
+                    block_gap = level * 1000
+                    sp = run_astral_subset(g_aln_dir, tag_files, out_dir, fasttree,
+                                           astral_bin, args.astral_jar,
+                                           args.threads, args.min_site_occupancy,
+                                           submit, tag_name, thr_label,
+                                           args.threads, tag_coords, block_gap)
+                    if sp: all_scripts.append(sp)
 
         # write run_all.sh
         all_scr_path = os.path.join(base_out, "run_all.sh")
