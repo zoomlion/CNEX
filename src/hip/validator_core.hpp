@@ -63,8 +63,11 @@ inline bool encode_mer_at(const std::string& seq, size_t pos, size_t k, uint32_t
 inline void reverse_complement(const std::string& dna, std::string& out) {
     static const std::array<char, 256> complement = [] {
         std::array<char, 256> table = {};
+        for (auto& v : table) v = 'N';
         table['A'] = 'T'; table['T'] = 'A';
         table['C'] = 'G'; table['G'] = 'C';
+        table['a'] = 't'; table['t'] = 'a';
+        table['c'] = 'g'; table['g'] = 'c';
         table['N'] = 'N'; table['n'] = 'n';
         return table;
     }();

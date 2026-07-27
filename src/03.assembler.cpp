@@ -425,6 +425,9 @@ int main(int argc, char* argv[]) {
                     for (char& c : local_seq) {
                         if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
                     }
+                    for (char& c : local_seq) {
+                        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
+                    }
                     if (r.strand == -1) {
                         thread_local std::string _rc;
                         reverse_complement(local_seq, _rc);
@@ -476,6 +479,9 @@ int main(int argc, char* argv[]) {
                     std::string local_seq = r.seq;
                     for (char& c : local_seq) {
                         if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+                    }
+                    for (char& c : local_seq) {
+                        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
                     }
                     if (r.strand == -1) {
                         thread_local std::string _rc;
