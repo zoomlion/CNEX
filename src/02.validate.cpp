@@ -35,7 +35,7 @@ struct Args {
     std::vector<std::string> reads_files;
     std::string mers_file;
     std::string output_dir = "out";
-    int64_t depth = 200000000;
+    int64_t depth = 0;
     int threads = 4;
     int chunk_size = 10000;
     int window_size = 150;
@@ -456,7 +456,7 @@ int main(int argc, char* argv[]) {
                       << "  --mers <file>         TSV mers table (required)\n"
                       << "  --type genome|fastq   Input type: genome (sliding-window FASTA) or\n"
                       << "                        fastq (reads). Auto-detected if omitted.\n"
-                      << "  --depth <n>           Max reads/pseudo-reads to process (default: 200M)\n"
+                      << "  --depth <n>           Max reads/pseudo-reads to process (default: 0=unlimited)\n"
                       << "  -t, --threads <n>     Number of threads (default: 4)\n"
                       << "  --output_dir <dir>    Output directory (default: out)\n"
                       << "  --chunk_size <n>      Reads per chunk (default: 10000)\n"
@@ -476,8 +476,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Genome mode: process all windows (no depth limit)
-        if (args.input_type == Args::InputType::GENOME) {
+        // No depth limit: process all reads/windows
+        if (args.depth <= 0) {
             args.depth = std::numeric_limits<int64_t>::max();
         }
 

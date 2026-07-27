@@ -87,7 +87,7 @@ ASSEMBLE_DIR = "assemble"
 
 def process_one(genome, mers, base_dir, threads, trim, min_c=7,
                 vote_frac=0.1, vote_ratio=3.0, window_size=None, step_size=None, type_=None, log_dir=None,
-                keep_validate=False):
+                keep_validate=False, depth=None):
     name = genome_name(genome)
     if not name:
         return 0, 1
@@ -120,6 +120,8 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
         val_cmd += ["--window_size", str(window_size)]
     if step_size:
         val_cmd += ["--step_size", str(step_size)]
+    if depth is not None:
+        val_cmd += ["--depth", str(depth)]
     subprocess.run(val_cmd, stdout=log, stderr=log)
 
     asm_out = os.path.join(val_dir, "contigs.fa")
@@ -155,6 +157,8 @@ def cmd_validate(args):
         cmd += ["--window_size", str(args.window_size)]
     if args.step_size:
         cmd += ["--step_size", str(args.step_size)]
+    if args.depth is not None:
+        cmd += ["--depth", str(args.depth)]
     if args.type:
         cmd += ["--type", args.type]
     return run(cmd).returncode
@@ -213,7 +217,8 @@ def cmd_pipeline(args):
             f = pool.submit(process_one, genome, mers, args.output_dir, args.threads, trim,
                             args.min_c, args.vote_frac, args.vote_ratio,
                             args.window_size, args.step_size, args.type, log_dir,
-                            keep_validate=getattr(args, 'keep_validate', False))
+                            keep_validate=getattr(args, 'keep_validate', False),
+                            depth=args.depth)
             futures[f] = name
 
         for f in as_completed(futures):
@@ -241,6 +246,8 @@ def main():
     p_val.add_argument("--min-c", type=int, default=7, help="Min colinear k-mer matches (default: 7)")
     p_val.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
     p_val.add_argument("--vote-ratio", type=float, default=3.0, help="Vote ratio (default: 3.0)")
+    p_val.add_argument("--depth", type=int, default=None,
+                       help="Max reads to process (default: unlimited)")
     p_val.add_argument("--window-size", type=int, help="Genome sliding window size (default: 150)")
     p_val.add_argument("--step-size", type=int, help="Genome sliding window step (default: 25)")
 
@@ -279,6 +286,8 @@ def main():
     p_pipe.add_argument("--min-c", type=int, default=7, help="Min colinear k-mer matches (default: 7)")
     p_pipe.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
     p_pipe.add_argument("--vote-ratio", type=float, default=3.0, help="Vote ratio (default: 3.0)")
+    p_pipe.add_argument("--depth", type=int, default=None,
+                        help="Max reads to process per genome (default: unlimited)")
     p_pipe.add_argument("--keep-validate", action="store_true",
                         help="Keep intermediate validate output (Assemble.*.reads)")
 
