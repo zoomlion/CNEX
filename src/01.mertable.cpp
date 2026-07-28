@@ -202,7 +202,7 @@ int main(int argc, char* argv[]) {
                 }
                 if (!cand.empty()) {
                     std::sort(cand.begin(), cand.end());
-                    ref_out << ">" << (bunch_id + 1) << "\n" << cand[cand.size() * 3 / 4].second << "\n";
+                    ref_out << ">" << bunch_id << "\n" << cand[cand.size() * 3 / 4].second << "\n";
                 }
             }
 

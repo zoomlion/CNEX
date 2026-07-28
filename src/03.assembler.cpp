@@ -596,7 +596,7 @@ int main(int argc, char* argv[]) {
                 if (contig.empty()) continue;
 
                 if (args.trim) {
-                    auto it = cne_refs.find(cur_ele + 1);
+                    auto it = cne_refs.find(cur_ele);
                     if (it != cne_refs.end()) {
                         trim_contig_sw(contig, it->second, mqm, cur_ele);
                     } else {
@@ -693,7 +693,7 @@ int main(int argc, char* argv[]) {
                         std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                         if (!contig.empty()) {
                             if (args.trim) {
-                                auto it = cne_refs.find(cur_ele + 1);
+                                auto it = cne_refs.find(cur_ele);
                                 if (it != cne_refs.end()) {
                                     trim_contig_sw(contig, it->second, mqm, cur_ele);
                                 } else {
@@ -731,7 +731,7 @@ int main(int argc, char* argv[]) {
                     std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                     if (!contig.empty()) {
                         if (args.trim) {
-                            auto it = cne_refs.find(cur_ele + 1);
+                            auto it = cne_refs.find(cur_ele);
                             if (it != cne_refs.end()) {
                                 trim_contig_sw(contig, it->second, mqm, cur_ele);
                             } else {
