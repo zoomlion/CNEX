@@ -12,6 +12,7 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -31,6 +32,7 @@ struct Args {
     double repeat_ratio = 1.2;
     bool output_snp = false;
     bool help_requested = false;
+    std::string cne_ref_path;
 };
 
 struct Read {
@@ -83,6 +85,9 @@ Args parse_args(int argc, char* argv[]) {
             args.repeat_ratio = std::stod(argv[i]);
         } else if (arg == "--snp") {
             args.output_snp = true;
+        } else if (arg == "--cne-ref") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --cne-ref");
+            args.cne_ref_path = argv[i];
         } else if (arg[0] != '-') {
             if (args.input_dir.empty()) args.input_dir = arg;
             else throw std::runtime_error("Unexpected argument: " + arg);
@@ -286,6 +291,123 @@ bool filter_contig(const std::string& seq, const MerQueryManager& mqm, int mer_s
     return confi_id == ele_id;
 }
 
+std::unordered_map<int, std::string> load_cne_refs(const std::string& path) {
+    std::unordered_map<int, std::string> refs;
+    BufferedLineReader r(path);
+    std::string line, seq;
+    int id = 0;
+    while (r.readline(line)) {
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            if (!seq.empty() && id > 0) refs[id] = std::move(seq);
+            seq.clear();
+            id = std::stoi(line.substr(1));
+        } else {
+            seq.append(line);
+        }
+    }
+    if (!seq.empty() && id > 0) refs[id] = std::move(seq);
+    std::cerr << "  Loaded " << refs.size() << " cne refs\n";
+    return refs;
+}
+
+void sw_align(const std::string& ref, const std::string& seq,
+              int& r_start, int& r_end, int& score) {
+    int m = (int)ref.size(), n = (int)seq.size();
+    const int match_score = 5, mismatch_score = -4;
+    const int gap_open = 15, gap_extend = 1;
+
+    std::vector<std::vector<int>> M(m + 1, std::vector<int>(n + 1, 0));
+    std::vector<std::vector<int>> Ix(m + 1, std::vector<int>(n + 1, 0));
+    std::vector<std::vector<int>> Iy(m + 1, std::vector<int>(n + 1, 0));
+
+    score = 0;
+    int max_i = 0, max_j = 0;
+
+    for (int i = 1; i <= m; ++i) {
+        for (int j = 1; j <= n; ++j) {
+            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
+            M[i][j] = std::max({M[i - 1][j - 1] + d, Ix[i - 1][j - 1] + d,
+                                Iy[i - 1][j - 1] + d, 0});
+            Ix[i][j] = std::max({M[i - 1][j] - gap_open, Ix[i - 1][j] - gap_extend, 0});
+            Iy[i][j] = std::max({M[i][j - 1] - gap_open, Iy[i][j - 1] - gap_extend, 0});
+            int cur = std::max({M[i][j], Ix[i][j], Iy[i][j]});
+            if (cur > score) { score = cur; max_i = i; max_j = j; }
+        }
+    }
+    if (score == 0) { r_start = 0; r_end = n; return; }
+
+    // Traceback from (max_i, max_j) to find start position in seq
+    int i = max_i, j = max_j;
+    int cur = std::max({M[i][j], Ix[i][j], Iy[i][j]});
+    while (i > 0 && j > 0 && cur > 0) {
+        if (cur == M[i][j]) {
+            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
+            int prev = std::max({M[i - 1][j - 1], Ix[i - 1][j - 1], Iy[i - 1][j - 1]});
+            if (M[i][j] == prev + d) cur = M[i - 1][j - 1];
+            else cur = std::max({M[i - 1][j - 1], Ix[i - 1][j - 1], Iy[i - 1][j - 1]});
+            --i; --j;
+        } else if (cur == Ix[i][j]) {
+            cur = Ix[i - 1][j];
+            --i;
+        } else {
+            cur = Iy[i][j - 1];
+            --j;
+        }
+        if (cur <= 0) break;
+    }
+    r_start = j;
+    r_end = max_j;
+}
+
+void trim_contig_sw(std::string& seq, const std::string& ref,
+                    const MerQueryManager& mqm, int ele_id) {
+    if (seq.size() < 26 || ref.empty()) return;
+    int mer_size = mqm.get_mer_size();
+    int n = static_cast<int>(seq.size()) - mer_size + 1;
+
+    // Phase 1: 13-mer扫描确认核心区
+    int first_hit = -1, last_hit = -1;
+    for (int i = 0; i < n; ++i) {
+        try {
+            auto code = dna_encoder(seq.substr(i, 13));
+            auto it = mqm.compressed_mer_query.find(code);
+            if (it != mqm.compressed_mer_query.end() && it->second.first == ele_id) {
+                if (first_hit < 0) first_hit = i;
+                last_hit = i;
+            }
+        } catch (...) { continue; }
+    }
+    if (first_hit < 0) return;
+
+    // Phase 2: SW 扩展边界
+    const int extend = 100;
+    int L = std::max(0, first_hit - extend);
+    int R = std::min((int)seq.size(), last_hit + mer_size + extend);
+    if (R - L < 20) return;
+
+    std::string candidate = seq.substr(L, R - L);
+    int r_start, r_end, score;
+    sw_align(ref, candidate, r_start, r_end, score);
+    if (score == 0) return;
+
+    int sw_start = L + r_start;
+    int sw_end = L + r_end + 1;
+
+    // 保底下界：只扩展，不内缩
+    int old_start = first_hit - 6;
+    int old_end = last_hit + mer_size + 6;
+    int new_start = std::min(sw_start, old_start);
+    int new_end = std::max(sw_end, old_end);
+
+    new_start = std::max(0, new_start);
+    new_end = std::min((int)seq.size(), new_end);
+
+    if (new_end - new_start < 20) return;
+    seq = seq.substr(new_start, new_end - new_start);
+}
+
+
 int main(int argc, char* argv[]) {
     try {
         Args args = parse_args(argc, argv);
@@ -304,7 +426,8 @@ int main(int argc, char* argv[]) {
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
-                      << "  --snp                 Scan for candidate SNPs from validated reads\n";
+                       << "  --snp                 Scan for candidate SNPs from validated reads\n"
+                       << "  --cne-ref <file>      CNE reference FASTA for SW-based trimming (ref.fa)\n";
             return 1;
         }
 
@@ -313,6 +436,13 @@ int main(int argc, char* argv[]) {
         mqm.load_from_file(args.mers_file);
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
+
+        // Load CNE refs for SW-based trimming
+        std::unordered_map<int, std::string> cne_refs;
+        if (!args.cne_ref_path.empty()) {
+            std::cerr << "Loading CNE refs from " << args.cne_ref_path << " ...\n";
+            cne_refs = load_cne_refs(args.cne_ref_path);
+        }
 
         // Phase 1: Read all Assemble.*.reads files
         std::vector<Read> all_reads;
@@ -465,7 +595,14 @@ int main(int argc, char* argv[]) {
                 std::string contig = debruijn_assemble(reads, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                 if (contig.empty()) continue;
 
-                if (args.trim) trim_contig(contig, mqm, cur_ele);
+                if (args.trim) {
+                    auto it = cne_refs.find(cur_ele + 1);
+                    if (it != cne_refs.end()) {
+                        trim_contig_sw(contig, it->second, mqm, cur_ele);
+                    } else {
+                        trim_contig(contig, mqm, cur_ele);
+                    }
+                }
                 if (contig.size() < 20) continue;
 
                 results.emplace_back(std::to_string(cur_ele), contig);
@@ -555,7 +692,14 @@ int main(int argc, char* argv[]) {
 
                         std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                         if (!contig.empty()) {
-                            if (args.trim) trim_contig(contig, mqm, cur_ele);
+                            if (args.trim) {
+                                auto it = cne_refs.find(cur_ele + 1);
+                                if (it != cne_refs.end()) {
+                                    trim_contig_sw(contig, it->second, mqm, cur_ele);
+                                } else {
+                                    trim_contig(contig, mqm, cur_ele);
+                                }
+                            }
                             if (contig.size() >= 20) {
                                 int sc = score_contig(contig, mqm, cur_ele);
                                 char s = cluster[0].first.strand == 1 ? '+' : '-';
@@ -586,7 +730,14 @@ int main(int argc, char* argv[]) {
 
                     std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
                     if (!contig.empty()) {
-                        if (args.trim) trim_contig(contig, mqm, cur_ele);
+                        if (args.trim) {
+                            auto it = cne_refs.find(cur_ele + 1);
+                            if (it != cne_refs.end()) {
+                                trim_contig_sw(contig, it->second, mqm, cur_ele);
+                            } else {
+                                trim_contig(contig, mqm, cur_ele);
+                            }
+                        }
                         if (contig.size() >= 20) {
                             int sc = score_contig(contig, mqm, cur_ele);
                             char s = cluster[0].first.strand == 1 ? '+' : '-';
