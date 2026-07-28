@@ -179,7 +179,7 @@ def cmd_assemble(args):
         cmd += ["--max-reads", str(args.max_reads)]
     if args.max_loci_gap:
         cmd += ["--max-loci-gap", str(args.max_loci_gap)]
-    if not args.no_trim:
+    if args.trim:
         cmd.append("--trim")
     if args.snp:
         cmd.append("--snp")
@@ -203,7 +203,7 @@ def cmd_pipeline(args):
         subprocess.run([MERTABLE,
                         filtered, "-k", "13", "-c", "4", "-o", mers])
 
-    trim = not args.no_trim
+    trim = getattr(args, 'trim', False)
 
     n = len(genomes)
     print(f"Processing {n} genome{'s' if n != 1 else ''} ({args.jobs} jobs, {args.threads} threads each)...")
@@ -262,8 +262,8 @@ def main():
     p_asm.add_argument("--max-reads", type=int, default=200, help="Max reads per element/locus (default: 200)")
     p_asm.add_argument("--max-loci-gap", type=int, default=5000,
                        help="Max gap for locus clustering in genome mode (default: 5000)")
-    p_asm.add_argument("--no-trim", action="store_true", dest="no_trim",
-                       help="Disable contig trimming (trimming enabled by default)")
+    p_asm.add_argument("--trim", action="store_true",
+                       help="Trim contigs to confident region (default: off)")
     p_asm.add_argument("--snp", action="store_true",
                        help="Scan for candidate SNPs from validated reads")
 
@@ -277,8 +277,8 @@ def main():
     p_pipe.add_argument("-t", "--threads", type=int, default=8, help="Threads per genome (default: 8)")
     p_pipe.add_argument("-j", "--jobs", type=int, default=4, help="Parallel genomes (default: 4)")
     p_pipe.add_argument("-o", "--output-dir", default="out", help="Output root directory (default: out)")
-    p_pipe.add_argument("--no-trim", action="store_true", dest="no_trim",
-                        help="Disable contig trimming")
+    p_pipe.add_argument("--trim", action="store_true",
+                        help="Trim contigs to confident region (default: off)")
     p_pipe.add_argument("--type", choices=["genome", "fastq"],
                         help="Input type (auto-detected if omitted)")
     p_pipe.add_argument("--window-size", type=int, help="Sliding window size (default: 150)")

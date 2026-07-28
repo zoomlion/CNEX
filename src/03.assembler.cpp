@@ -26,7 +26,7 @@ struct Args {
     int min_count = 2;
     int max_reads = 200;
     int max_loci_gap = 5000;
-    bool trim = true;
+    bool trim = false;
     bool trim_set = false;
     bool no_trim_set = false;
     double repeat_ratio = 1.2;
@@ -423,7 +423,7 @@ int main(int argc, char* argv[]) {
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
-                      << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
+                      << "  --trim                Trim contigs to confident k-mer region (default: off)\n"
                       << "  --no-trim             Disable trimming\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
                        << "  --snp                 Scan for candidate SNPs from validated reads\n"
