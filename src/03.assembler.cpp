@@ -21,7 +21,7 @@ struct Args {
     std::string input_dir;
     std::string mers_file;
     std::string output = "assembled.fasta";
-    int kmer = 21;
+    int kmer = 19;
     int min_c = 3;
     int min_count = 2;
     int max_reads = 200;
@@ -418,7 +418,7 @@ int main(int argc, char* argv[]) {
                       << "\nOptions:\n"
                       << "  --mers <file>         Mers table (required)\n"
                       << "  -o, --output <file>   Output FASTA (default: assembled.fasta)\n"
-                      << "  -k, --kmer <n>        K-mer length (default: 21)\n"
+                      << "  -k, --kmer <n>        K-mer length (default: 19)\n"
                       << "  --min-c <n>           Min k-mer matches for validation (default: 3)\n"
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
