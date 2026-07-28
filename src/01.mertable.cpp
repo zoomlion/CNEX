@@ -166,11 +166,22 @@ int main(int argc, char* argv[]) {
         auto bunches = read_bunches(args.msa_file);
         std::cerr << "  Total bunches: " << bunches.size() << "\n";
 
+        // Open ref.fa output
+        std::ofstream ref_out;
+        {
+            auto pos = args.output.rfind('/');
+            std::string ref_path = (pos != std::string::npos)
+                ? args.output.substr(0, pos + 1) + "ref.fa" : "ref.fa";
+            ref_out.open(ref_path);
+            if (ref_out.is_open())
+                std::cerr << "  Writing ref sequences to " << ref_path << "\n";
+        }
+
         TableMer mertable(args.k);
         mertable.set_min_entropy(args.min_entropy);
 
         for (size_t bunch_id = 0; bunch_id < bunches.size(); ++bunch_id) {
-            if (bunch_id % 100 == 0)
+            if (bunch_id % 1000 == 0)
                 std::cerr << "\r  Processing bunch " << (bunch_id + 1) << "/" << bunches.size();
             auto fas = bunch2fas(bunches[bunch_id]);
             // Count real species (excluding ref)
@@ -179,6 +190,21 @@ int main(int argc, char* argv[]) {
                 if (header.size() < 3 || header.substr(0, 3) != "ref") real_species++;
             }
             if (real_species < args.min_c) continue;
+
+            // Write ref sequence: median-length non-ref species, de-gapped
+            if (ref_out.is_open()) {
+                std::vector<std::pair<size_t, std::string>> cand;
+                for (const auto& [hdr, seq] : fas) {
+                    if (hdr.size() >= 3 && hdr.substr(0, 3) == "ref") continue;
+                    std::string raw;
+                    for (char c : seq) if (c != '-') raw.push_back(c);
+                    cand.emplace_back(raw.size(), std::move(raw));
+                }
+                if (!cand.empty()) {
+                    std::sort(cand.begin(), cand.end());
+                    ref_out << ">" << (bunch_id + 1) << "\n" << cand[cand.size() / 2].second << "\n";
+                }
+            }
 
             // Track (mer -> (bunch_id, loci)) pairs
             std::unordered_map<std::string, std::vector<std::pair<int, int>>> local_affi;
