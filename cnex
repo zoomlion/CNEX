@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CNEX — Conserved Non-coding Element Discovery Pipeline."""
-import argparse, glob, os, shutil, subprocess, sys, time
+import argparse, glob, os, shutil, signal, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config as C
@@ -11,6 +11,30 @@ PIGZ     = C.PIGZ
 MERTABLE = C.MERTABLE
 
 GENOME_EXTS = (".fa", ".fa.gz", ".fasta", ".fasta.gz", ".fna", ".fna.gz")
+
+# ── ssd-dir cache: global state + signal cleanup ──
+_ACTIVE_PROCS = set()
+_SSD_DIR = None
+
+
+def _on_signal(signum, frame):
+    for p in list(_ACTIVE_PROCS):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    if _SSD_DIR:
+        shutil.rmtree(_SSD_DIR, ignore_errors=True)
+    os._exit(128 + signum)
+
+
+def _run(cmd, log):
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+    _ACTIVE_PROCS.add(proc)
+    try:
+        return proc.wait()
+    finally:
+        _ACTIVE_PROCS.discard(proc)
 
 
 def run(cmd, **kwargs):
@@ -87,7 +111,7 @@ ASSEMBLE_DIR = "assemble"
 
 def process_one(genome, mers, base_dir, threads, trim, min_c=7,
                 vote_frac=0.1, vote_ratio=3.0, window_size=None, step_size=None, type_=None, log_dir=None,
-                keep_validate=False, depth=None, cne_ref=None):
+                keep_validate=False, depth=None, cne_ref=None, ssd_dir=None):
     name = genome_name(genome)
     if not name:
         return 0, 1
@@ -111,18 +135,48 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
         if not fastqs:
             log.close()
             return 0, 1
-        val_cmd += fastqs
+        if ssd_dir:
+            # Cache reads on fast storage (e.g. /dev/shm); remove right after validate
+            tmp = os.path.join(ssd_dir, name)
+            os.makedirs(tmp, exist_ok=True)
+            try:
+                for fq in fastqs:
+                    shutil.copy2(fq, os.path.join(tmp, os.path.basename(fq)))
+                val_cmd += sorted(glob.glob(os.path.join(tmp, "*.fastq*")) +
+                                  glob.glob(os.path.join(tmp, "*.fq*")))
+            except OSError:
+                # cache failed (space etc.) -> fallback to original paths
+                val_cmd += fastqs
+            val_cmd += ["--type", type_]
+            if window_size:
+                val_cmd += ["--window_size", str(window_size)]
+            if step_size:
+                val_cmd += ["--step_size", str(step_size)]
+            if depth is not None:
+                val_cmd += ["--depth", str(depth)]
+            rc_val = _run(val_cmd, log)
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            val_cmd += fastqs
+            val_cmd += ["--type", type_]
+            if window_size:
+                val_cmd += ["--window_size", str(window_size)]
+            if step_size:
+                val_cmd += ["--step_size", str(step_size)]
+            if depth is not None:
+                val_cmd += ["--depth", str(depth)]
+            rc_val = _run(val_cmd, log)
     else:
         val_cmd += [genome]
-    if type_:
-        val_cmd += ["--type", type_]
-    if window_size:
-        val_cmd += ["--window_size", str(window_size)]
-    if step_size:
-        val_cmd += ["--step_size", str(step_size)]
-    if depth is not None:
-        val_cmd += ["--depth", str(depth)]
-    subprocess.run(val_cmd, stdout=log, stderr=log)
+        if type_:
+            val_cmd += ["--type", type_]
+        if window_size:
+            val_cmd += ["--window_size", str(window_size)]
+        if step_size:
+            val_cmd += ["--step_size", str(step_size)]
+        if depth is not None:
+            val_cmd += ["--depth", str(depth)]
+        rc_val = _run(val_cmd, log)
 
     asm_out = os.path.join(val_dir, "contigs.fa")
     asm_cmd = [ASSEMBLE, val_dir + "/", "--mers", mers, "-o", asm_out]
@@ -130,7 +184,7 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
         asm_cmd.append("--trim")
     if cne_ref:
         asm_cmd += ["--cne-ref", cne_ref]
-    result = subprocess.run(asm_cmd, stdout=log, stderr=log)
+    result_rc = _run(asm_cmd, log)
     log.close()
 
     if not keep_validate:
@@ -141,7 +195,7 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
     if os.path.exists(asm_out):
         with open(asm_out) as f:
             contigs = sum(1 for line in f if line.startswith(">"))
-    return contigs, result.returncode
+    return contigs, result_rc
 
 
 def cmd_validate(args):
@@ -213,6 +267,17 @@ def cmd_pipeline(args):
 
     trim = getattr(args, 'trim', False)
 
+    # ── ssd-dir cache init: clear stale dirs + register signal handlers ──
+    global _SSD_DIR
+    if getattr(args, 'ssd_dir', None):
+        _SSD_DIR = os.path.abspath(args.ssd_dir)
+        os.makedirs(_SSD_DIR, exist_ok=True)
+        for stale in glob.glob(os.path.join(_SSD_DIR, "*")):
+            shutil.rmtree(stale, ignore_errors=True)
+        signal.signal(signal.SIGINT, _on_signal)
+        signal.signal(signal.SIGTERM, _on_signal)
+        print(f"ssd-dir cache enabled: {_SSD_DIR}")
+
     n = len(genomes)
     print(f"Processing {n} genome{'s' if n != 1 else ''} ({args.jobs} jobs, {args.threads} threads each)...")
     log_dir = os.path.join(args.output_dir, "logs")
@@ -226,7 +291,7 @@ def cmd_pipeline(args):
                             args.min_c, args.vote_frac, args.vote_ratio,
                             args.window_size, args.step_size, args.type, log_dir,
                             keep_validate=getattr(args, 'keep_validate', False),
-                            depth=args.depth, cne_ref=cne_ref)
+                            depth=args.depth, cne_ref=cne_ref, ssd_dir=_SSD_DIR)
             futures[f] = name
 
         for f in as_completed(futures):
@@ -298,6 +363,8 @@ def main():
                         help="Max reads to process per genome (default: unlimited)")
     p_pipe.add_argument("--keep-validate", action="store_true",
                         help="Keep intermediate validate output (Assemble.*.reads)")
+    p_pipe.add_argument("--ssd-dir", default=None,
+                        help="Cache dir for reads (e.g. /dev/shm/cnex); copy reads there before validate")
 
     # ─── setup ───
     p_setup = sub.add_parser("setup", help="Check dependencies and build instructions")
