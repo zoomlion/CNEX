@@ -216,8 +216,15 @@ def _align_one(args):
         return False, fasta_path, "too_few_species"
     tmp_fa = fasta_path.replace('.fasta', '_filtered.fasta')
     write_fasta(seqs, tmp_fa)
-    cmd = [famsa_bin, "-t", "1", tmp_fa, aln_path]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # aligner: mafft (stdout->file, no extra files) or famsa (in/out args)
+    if os.path.basename(famsa_bin).startswith("mafft"):
+        with open(aln_path, "w") as out:
+            r = subprocess.run([famsa_bin, "--globalpair", "--maxiterate", "1000",
+                                "--quiet", "--thread", "1", tmp_fa],
+                               stdout=out, stderr=subprocess.PIPE, text=True)
+    else:
+        cmd = [famsa_bin, "-t", "1", tmp_fa, aln_path]
+        r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return False, fasta_path, "align"
     _flatten_fasta(aln_path)
