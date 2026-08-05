@@ -234,7 +234,7 @@ def _fasttree_cluster(args):
     fasttree_bin, fasta_path, nwk_path = args
     if not os.path.isfile(fasta_path):
         return False, fasta_path
-    cmd = [fasttree_bin, "-nt", "-gtr", "-nosupport"]
+    cmd = [fasttree_bin, "-nt", "-gtr", "-gamma", "-spr", "4", "-mlacc", "2", "-slownni", "-boot", "1000"]
     with open(fasta_path) as inp, open(nwk_path, "w") as out:
         r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
     return r.returncode == 0, nwk_path
@@ -380,7 +380,11 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
         species_tree_path = os.path.join(out_dir, "species_tree.nwk")
         script_path = os.path.join(out_dir, "run.sh")
         if use_iv:
-            cmd = f"{astral_bin} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads} -u 2"
+            wastral_bin = shutil.which("wastral")
+            if wastral_bin:
+                cmd = f"wastral -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads}"
+            else:
+                cmd = f"{astral_bin} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads} -u 2"
         else:
             cmd = f"java -Xmx8g -jar {jar_path} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} --extraLevel 0"
         write_script(script_path, [cmd], f"ASTRAL: {tag_name} / {thr_label}")
@@ -473,7 +477,11 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
     species_tree_path = os.path.join(out_dir, "species_tree.nwk")
     script_path = os.path.join(out_dir, "run.sh")
     if use_iv:
-        cmd = f"{astral_bin} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads} -u 2"
+        wastral_bin = shutil.which("wastral")
+        if wastral_bin:
+            cmd = f"wastral -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads}"
+        else:
+            cmd = f"{astral_bin} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} -t {astral_threads} -u 2"
     else:
         cmd = f"java -Xmx8g -jar {jar_path} -i {os.path.basename(gene_trees_path)} -o {os.path.basename(species_tree_path)} --extraLevel 0"
     cmds = [cmd]
