@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 05: Per-element alignment (FAMSA) + phylogeny.
+Step 05: Per-element alignment (MAFFT) + phylogeny.
 
 Methods:
   --method concat (default): align → concat_msa → script → IQ-TREE 3
@@ -34,11 +34,11 @@ from concat_msa import read_fasta, clean_header
 # ─── helpers ───────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Element phylogeny: FAMSA + concat/IQ-TREE or ASTRAL")
+    p = argparse.ArgumentParser(description="Element phylogeny: MAFFT + concat/IQ-TREE or ASTRAL")
     p.add_argument("--elements-dir", default="results/fasta",
                    help="Directory with per-element FASTAs")
     p.add_argument("--method", default=C.DEFAULT_METHOD, choices=["concat", "astral", "both"])
-    p.add_argument("--famsa", default=C.FAMSA)
+    p.add_argument("--famsa", default=C.MAFFT)
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
     p.add_argument("--iqtree-model", default="")
@@ -55,7 +55,7 @@ def parse_args():
     p.add_argument("--min-occupancy", type=float, default=0.3)
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
     p.add_argument("-t", "--threads", type=int, default=C.THREADS,
-                   help="Worker count: FAMSA/FastTree parallelism, IQ-TREE/ASTRAL threads")
+                   help="Worker count: MAFFT/FastTree parallelism, IQ-TREE/ASTRAL threads")
     p.add_argument("--max-elements", type=int, default=100)
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no-resume", action="store_false", dest="resume")
@@ -504,7 +504,7 @@ def main():
     args = parse_args()
     famsa = os.path.expanduser(args.famsa)
     if not shutil.which(famsa):
-        sys.exit(f"FAMSA not found: {famsa}")
+        sys.exit(f"Aligner not found: {famsa}")
 
     print(f"Method:   {args.method}")
     print(f"Dry-run:  {args.dry_run}")
@@ -554,8 +554,8 @@ def main():
     else:
         groups["all"] = aln_root
 
-    # ─── FAMSA alignment ─────────────────────────────────
-    print(f"\n--- Aligning elements (FAMSA) ---")
+    # ─── Alignment (MAFFT) ───────────────────────────────────
+    print(f"\n--- Aligning elements (MAFFT) ---")
     t0 = time.time()
     work = [(f, famsa, args.resume, aln_root, keep_sp, args.min_site_occupancy) for f in fasta_files]
     ok_count = fail_count = 0

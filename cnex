@@ -88,10 +88,16 @@ def check_binaries():
 
 def tree_deps():
     return [
-        ("FAMSA",     C.FAMSA,
-         "https://github.com/refresh-bio/FAMSA"),
+        ("MAFFT",     C.MAFFT,
+         "https://mafft.cbrc.jp/alignment/software/"),
         ("FastTree",  C.FastTree,
          "http://www.microbesonline.org/fasttree/"),
+        ("IQ-TREE",   C.IQTREE3,
+         "https://github.com/iqtree/iqtree2"),
+        ("trimal",    C.TRIMAL,
+         "http://trimal.cgenomics.org/"),
+        ("wASTRAL",   "wastral",
+         "https://github.com/chaoszhang/ASTER"),
         ("ASTRAL IV", C.ASTRAL,
          "https://github.com/chaoszhang/ASTER"),
         ("ASTRAL III","",

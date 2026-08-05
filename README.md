@@ -5,7 +5,7 @@ Fast identification of conserved non-coding elements (CNEs) from whole-genome se
 - **Ultra-fast sliding-window genome mode** (~3 min for human genome at 6X, 16 threads)
 - **k-mer guided assembly** — De Bruijn graph with element-specific k-mer prior
 - **SNP/INDEL detection** via De Bruijn bubble scanning
-- **Phylogeny pipeline** — astral (default) with block-gap clustering, or concat/IQ-TREE 3
+- **Phylogeny pipeline** — wASTRAL/ASTRAL (default) with block-gap clustering, or concat/IQ-TREE 3
 
 ## Install
 
@@ -26,7 +26,7 @@ Key settings in `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `THREADS` | 20 | Worker count: FAMSA/FastTree parallelism, IQ-TREE / ASTRAL threads |
+| `THREADS` | 20 | Worker count: MAFFT/FastTree parallelism, IQ-TREE / ASTRAL threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
 | `DEFAULT_METHOD` | `astral` | `astral`, `concat`, or `both` |
 | `ASTRAL_BLOCK_GAPS` | `1000,2000` | kb thresholds for astral block clustering |
@@ -53,8 +53,8 @@ python3 src/05.element_phylo.py --submit     # execute
 
 | Method | Flag | Pipeline |
 |--------|------|----------|
-| **astral** (default) | `--method astral` | FAMSA → block-gap cluster → concat → FastTree → ASTRAL |
-| **concat** | `--method concat` | FAMSA → concat_msa → IQ-TREE 3 |
+| **astral** (default) | `--method astral` | MAFFT → block-gap cluster → concat → FastTree → wASTRAL/ASTRAL |
+| **concat** | `--method concat` | MAFFT → concat_msa → IQ-TREE 3 |
 | **both** | `--method both` | both in one pass |
 
 ### ASTRAL: Block-Binning
@@ -127,8 +127,9 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 
 | Tool | Method | Default path |
 |------|--------|-------------|
-| FAMSA | Both | `famsa` |
-| FastTree | **astral** | `FastTree` |
+| MAFFT | Both | `mafft` (default aligner, G-INS-i: `--globalpair --maxiterate 1000`) |
+| FastTree | **astral** | `FastTree` (`-gtr -gamma -spr 4 -mlacc 2 -slownni -boot 1000`) |
+| wASTRAL | **astral** | `wastral` (preferred; falls back to ASTRAL if absent) |
 | ASTRAL (ASTER) | **astral** | `astral` |
 | IQ-TREE 3 | **concat** | `iqtree3` |
 | trimal | Both | `trimal` (alignment trimming) |

@@ -10,7 +10,8 @@ MERTABLE = os.path.join(ROOT, "bin", "mertable")
 PIGZ     = os.path.join(ROOT, "src", "pigz", "pigz")
 
 # External tools (customize per machine — use name in PATH or full path)
-FAMSA    = "famsa"
+MAFFT    = "mafft"    # default aligner (G-INS-i: --globalpair --maxiterate 1000)
+TRIMAL   = "trimal"
 FastTree = "FastTree"
 ASTRAL   = "astral"
 IQTREE3      = "iqtree3"
@@ -19,7 +20,7 @@ IQTREE_MODEL_FULL = "GTR+F+G4"   # model for full species run (large set, fast)
 
 # Pipeline thresholds
 MIN_CNE_PER_SPECIES = 100
-THREADS = 20                 # global worker count: FAMSA/FastTree parallelism, IQ-TREE/ASTRAL threads
+THREADS = 20                 # global worker count: MAFFT/FastTree parallelism, IQ-TREE/ASTRAL threads
 
 # Phylogeny defaults
 DEFAULT_METHOD = "concat"                    # "concat" or "astral"
