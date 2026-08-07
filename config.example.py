@@ -16,7 +16,7 @@ FastTree = "FastTree"
 ASTRAL   = "astral"
 IQTREE3      = "iqtree3"
 IQTREE_MODEL      = "MFP"         # model when --species-file is used (small set, model search)
-IQTREE_MODEL_FULL = "GTR+F+G4"   # model for full species run (large set, fast)
+IQTREE_MODEL_FULL = "GTR+F+R4"   # model for full species run (large set, fast, FreeRate)
 
 # Pipeline thresholds
 MIN_CNE_PER_SPECIES = 100
