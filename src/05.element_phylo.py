@@ -43,6 +43,9 @@ def parse_args():
     p.add_argument("--mafft-mode", default=C.MAFFT_MODE,
                    choices=["ginsi", "auto", "fftn2"],
                    help="MAFFT mode: ginsi (high precision), auto (default), fftn2 (fastest)")
+    p.add_argument("--species-whitelist", default="",
+                   help="Optional file listing species to use for tree building "
+                        "(FastTree/concat filter); empty = all species")
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
     p.add_argument("--iqtree-model", default="")
@@ -243,12 +246,24 @@ def _align_one(args):
 
 
 def _fasttree_cluster(args):
-    fasttree_bin, fasta_path, nwk_path = args
+    fasttree_bin, fasta_path, nwk_path, whitelist = args
     if not os.path.isfile(fasta_path):
         return False, fasta_path
+    inp_path = fasta_path
+    # optional: filter to whitelist species before tree building
+    if whitelist:
+        seqs = read_fasta_to_dict(fasta_path)
+        seqs = {h: s for h, s in seqs.items() if h in whitelist}
+        if len(seqs) < 4:
+            return False, fasta_path
+        tmp = fasta_path + ".whitelist.fa"
+        write_fasta(seqs, tmp)
+        inp_path = tmp
     cmd = [fasttree_bin, "-nt", "-gtr", "-gamma", "-spr", "4", "-mlacc", "2", "-slownni", "-boot", "1000"]
-    with open(fasta_path) as inp, open(nwk_path, "w") as out:
+    with open(inp_path) as inp, open(nwk_path, "w") as out:
         r = subprocess.run(cmd, stdin=inp, stdout=out, stderr=subprocess.PIPE, text=True)
+    if whitelist and os.path.exists(inp_path + ".whitelist.fa"):
+        os.remove(inp_path + ".whitelist.fa")
     return r.returncode == 0, nwk_path
 
 
@@ -317,8 +332,10 @@ def execute_script(path, submit):
 
 def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
                       iqtree3, iqtree_threads, submit, tag_name, thr_label,
-                      partition=False, iqtree_model="MFP"):
-    """Filter alignments, run concat_msa, write + execute run script."""
+                      partition=False, iqtree_model="MFP", whitelist=None):
+    """Filter alignments, run concat_msa, write + execute run script.
+    whitelist: optional set of species; supermatrix rows filtered to these.
+    """
     if not keep_fastas:
         return
     aln_subdir = os.path.join(out_dir, "aln_filtered")
@@ -352,6 +369,13 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
             if any(k in line for k in ('Total species', 'Occupancy', 'Supermatrix', 'Partitions')):
                 print(f"  {line.strip()}")
 
+    # optional: filter supermatrix rows to whitelist species
+    if whitelist and os.path.isfile(supermatrix):
+        seqs = read_fasta_to_dict(supermatrix)
+        seqs = {h: s for h, s in seqs.items() if h in whitelist}
+        write_fasta(seqs, supermatrix)
+        print(f"  Whitelist filter: supermatrix -> {len(seqs)} species")
+
     # write run.sh
     script_path = os.path.join(out_dir, "run.sh")
     n_threads = iqtree_threads
@@ -371,11 +395,12 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
 def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
                        astral_bin, astral_jar, astral_threads, min_site_occ,
                        submit, tag_name, thr_label, threads=1,
-                       tag_coords=None, block_gap=0):
+                       tag_coords=None, block_gap=0, whitelist=None):
     """ASTRAL pipeline: block-gap cluster → concat → FastTree → ASTRAL.
 
     If block_gap > 0 and tag_coords is provided, elements are clustered by
     genomic proximity before concatenation and tree inference.
+    whitelist: optional set of species; only these are used in FastTree trees.
     """
     if not keep_fastas:
         return
@@ -439,7 +464,7 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
         nwk_path = os.path.join(nwk_dir, base_name + ".nwk")
         if os.path.isfile(nwk_path):
             continue
-        work.append((fasttree_bin, fasta_path, nwk_path))
+        work.append((fasttree_bin, fasta_path, nwk_path, whitelist))
 
     # Run FastTree in parallel
     ok_count = fail_count = 0
@@ -511,6 +536,10 @@ def main():
     if not shutil.which(aligner):
         sys.exit(f"Aligner not found: {aligner}")
     mafft_mode = args.mafft_mode
+    species_whitelist = None
+    if args.species_whitelist:
+        species_whitelist = {l.strip() for l in open(args.species_whitelist) if l.strip()}
+        print(f"Species whitelist: {len(species_whitelist)} species")
 
     print(f"Method:   {args.method}")
     print(f"Dry-run:  {args.dry_run}")
@@ -638,7 +667,7 @@ def main():
                     sp = run_concat_subset(g_aln_dir, fasta_files, args.min_occupancy,
                                            out_dir, iqtree3, args.threads, submit,
                                            gname, thr_label, C.PARTITION,
-                                           iqtree_model)
+                                           iqtree_model, species_whitelist)
                     if sp: all_scripts.append(sp)
                 if m == "astral":
                     for level in levels:
@@ -651,7 +680,8 @@ def main():
                                                astral_bin, args.astral_jar,
                                                args.threads, args.min_site_occupancy,
                                                submit, gname, thr_label,
-                                               args.threads, tag_coords, block_gap)
+                                               args.threads, tag_coords, block_gap,
+                                               species_whitelist)
                         if sp: all_scripts.append(sp)
         else:
             # normal mode: tag loop over element types
@@ -674,7 +704,7 @@ def main():
                     sp = run_concat_subset(g_aln_dir, tag_files, args.min_occupancy,
                                            out_dir, iqtree3, args.threads, submit,
                                            tag_name, thr_label, C.PARTITION,
-                                           iqtree_model)
+                                           iqtree_model, species_whitelist)
                     if sp: all_scripts.append(sp)
                     continue
 
@@ -688,7 +718,8 @@ def main():
                                            astral_bin, args.astral_jar,
                                            args.threads, args.min_site_occupancy,
                                            submit, tag_name, thr_label,
-                                           args.threads, tag_coords, block_gap)
+                                           args.threads, tag_coords, block_gap,
+                                           species_whitelist)
                     if sp: all_scripts.append(sp)
 
         # write run_all.sh
