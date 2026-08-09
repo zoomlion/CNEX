@@ -38,7 +38,11 @@ def parse_args():
     p.add_argument("--elements-dir", default="results/fasta",
                    help="Directory with per-element FASTAs")
     p.add_argument("--method", default=C.DEFAULT_METHOD, choices=["concat", "astral", "both"])
-    p.add_argument("--famsa", default=C.MAFFT)
+    p.add_argument("--aligner", default=C.MAFFT,
+                   help="Aligner binary (MAFFT only; FAMSA removed, protein-oriented)")
+    p.add_argument("--mafft-mode", default=C.MAFFT_MODE,
+                   choices=["ginsi", "auto", "fftn2"],
+                   help="MAFFT mode: ginsi (high precision), auto (default), fftn2 (fastest)")
     p.add_argument("--fasttree", default=C.FastTree)
     p.add_argument("--iqtree3", default=C.IQTREE3)
     p.add_argument("--iqtree-model", default="")
@@ -204,7 +208,7 @@ def _flatten_fasta(path):
 
 
 def _align_one(args):
-    fasta_path, famsa_bin, resume, aln_dir, keep_sp, min_site_occ = args
+    fasta_path, aligner_bin, mafft_mode, resume, aln_dir, keep_sp, min_site_occ = args
     base = os.path.basename(fasta_path).replace(".fasta", "")
     aln_path = os.path.join(aln_dir, base + ".aln")
     if resume and os.path.isfile(aln_path):
@@ -216,15 +220,16 @@ def _align_one(args):
         return False, fasta_path, "too_few_species"
     tmp_fa = fasta_path.replace('.fasta', '_filtered.fasta')
     write_fasta(seqs, tmp_fa)
-    # aligner: mafft (stdout->file, no extra files) or famsa (in/out args)
-    if os.path.basename(famsa_bin).startswith("mafft"):
-        with open(aln_path, "w") as out:
-            r = subprocess.run([famsa_bin, "--globalpair", "--maxiterate", "1000",
-                                "--quiet", "--thread", "1", tmp_fa],
-                               stdout=out, stderr=subprocess.PIPE, text=True)
+    # MAFFT (DNA aligner); mode: ginsi | auto | fftn2
+    if mafft_mode == "ginsi":
+        mafft_args = ["--globalpair", "--maxiterate", "1000"]
+    elif mafft_mode == "fftn2":
+        mafft_args = ["--retree", "2"]
     else:
-        cmd = [famsa_bin, "-t", "1", tmp_fa, aln_path]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        mafft_args = ["--auto"]
+    with open(aln_path, "w") as out:
+        r = subprocess.run([aligner_bin] + mafft_args + ["--quiet", "--thread", "1", tmp_fa],
+                           stdout=out, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         return False, fasta_path, "align"
     _flatten_fasta(aln_path)
@@ -502,9 +507,10 @@ def run_astral_subset(aln_dir, keep_fastas, out_dir, fasttree_bin,
 
 def main():
     args = parse_args()
-    famsa = os.path.expanduser(args.famsa)
-    if not shutil.which(famsa):
-        sys.exit(f"Aligner not found: {famsa}")
+    aligner = os.path.expanduser(args.aligner)
+    if not shutil.which(aligner):
+        sys.exit(f"Aligner not found: {aligner}")
+    mafft_mode = args.mafft_mode
 
     print(f"Method:   {args.method}")
     print(f"Dry-run:  {args.dry_run}")
@@ -557,7 +563,7 @@ def main():
     # ─── Alignment (MAFFT) ───────────────────────────────────
     print(f"\n--- Aligning elements (MAFFT) ---")
     t0 = time.time()
-    work = [(f, famsa, args.resume, aln_root, keep_sp, args.min_site_occupancy) for f in fasta_files]
+    work = [(f, aligner, mafft_mode, args.resume, aln_root, keep_sp, args.min_site_occupancy) for f in fasta_files]
     ok_count = fail_count = 0
     if args.threads > 1:
         with Pool(args.threads) as p:

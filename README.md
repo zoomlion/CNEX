@@ -127,7 +127,7 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 
 | Tool | Method | Default path |
 |------|--------|-------------|
-| MAFFT | Both | `mafft` (default aligner, G-INS-i: `--globalpair --maxiterate 1000`) |
+| MAFFT | Both | `mafft` (default aligner; `--mafft-mode`: ginsi high-precision / auto default / fftn2 fastest) |
 | FastTree | **astral** | `FastTree` (`-gtr -gamma -spr 4 -mlacc 2 -slownni -boot 1000`) |
 | wASTRAL | **astral** | `wastral` (preferred; falls back to ASTRAL if absent) |
 | ASTRAL (ASTER) | **astral** | `astral` |

@@ -10,7 +10,8 @@ MERTABLE = os.path.join(ROOT, "bin", "mertable")
 PIGZ     = os.path.join(ROOT, "src", "pigz", "pigz")
 
 # External tools (customize per machine — use name in PATH or full path)
-MAFFT    = "mafft"    # default aligner (G-INS-i: --globalpair --maxiterate 1000)
+MAFFT    = "mafft"    # default aligner (DNA; G-INS-i or --auto)
+MAFFT_MODE = "auto"   # ginsi(high precision, --globalpair --maxiterate 1000) | auto(default) | fftn2(fastest)
 TRIMAL   = "trimal"
 FastTree = "FastTree"
 ASTRAL   = "astral"
