@@ -59,7 +59,12 @@ def parse_args():
     p.add_argument("--min-cne-per-species", type=int, default=C.MIN_CNE_PER_SPECIES)
     p.add_argument("--species-file", default="",
                    help="File with one species per line; empty = use all")
-    p.add_argument("--min-occupancy", type=float, default=0.3)
+    p.add_argument("--concat-cov", type=int, default=75,
+                   help="Min %% species coverage per element for concat supermatrix "
+                        "(default: 75; 0 = no filter). Only affects supermatrix building, "
+                        "independent of ASTRAL --min-site-occupancy")
+    p.add_argument("--concat-tool", choices=["iqtree", "raxml", "both"], default="both",
+                   help="Which ML tool(s) to write into concat run.sh (default: both)")
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
     p.add_argument("-t", "--threads", type=int, default=C.THREADS,
                    help="Worker count: MAFFT/FastTree parallelism, IQ-TREE/ASTRAL threads")
@@ -332,9 +337,11 @@ def execute_script(path, submit):
 
 def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
                       iqtree3, iqtree_threads, submit, tag_name, thr_label,
-                      partition=False, iqtree_model="MFP", whitelist=None):
+                      partition=False, iqtree_model="MFP", whitelist=None,
+                      concat_tool="both"):
     """Filter alignments, run concat_msa, write + execute run script.
     whitelist: optional set of species; supermatrix rows filtered to these.
+    concat_tool: 'iqtree' | 'raxml' | 'both' — which ML command(s) in run.sh.
     """
     if not keep_fastas:
         return
@@ -376,16 +383,36 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
         write_fasta(seqs, supermatrix)
         print(f"  Whitelist filter: supermatrix -> {len(seqs)} species")
 
-    # write run.sh
+    # write run.sh (IQ-TREE and/or raxml-ng)
     script_path = os.path.join(out_dir, "run.sh")
     n_threads = iqtree_threads
-    iq_cmd = f"iqtree3 -s {os.path.basename(supermatrix)}"
-    if partition:
-        iq_cmd += f" -p {os.path.basename(partitions)}"
-    iq_cmd += f" -m {iqtree_model} -bb 1000 -nt {n_threads}"
-    cmds = [iq_cmd]
+    cmds = []
+    tools = []
+    if concat_tool in ("iqtree", "both"):
+        iq_cmd = f"iqtree3 -s {os.path.basename(supermatrix)}"
+        if partition:
+            iq_cmd += f" -p {os.path.basename(partitions)}"
+        iq_cmd += f" -m {iqtree_model} -bb 1000 -nt {n_threads}"
+        cmds.append(iq_cmd)
+        tools.append("IQ-TREE")
+    if concat_tool in ("raxml", "both"):
+        rx_model = "--model GTR+R4"
+        if partition and os.path.isfile(partitions):
+            raxml_pt = os.path.join(out_dir, "partitions.raxml.txt")
+            with open(partitions) as f_in, open(raxml_pt, "w") as f_out:
+                for line in f_in:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        f_out.write(f"GTR+R4, {line}\n")
+            rx_model = f"--model {os.path.basename(raxml_pt)}"
+        rx_cmd = (f"raxml-ng --all --msa {os.path.basename(supermatrix)} "
+                  f"{rx_model} --tree pars{{10}} --bs-trees 200 "
+                  f"--threads {n_threads} --seed 42")
+        cmds.append(rx_cmd)
+        tools.append("RAxML-NG")
     write_script(script_path, cmds,
-                 f"IQ-TREE 3: {tag_name} / {thr_label} ({len(keep_fastas)} elements)")
+                 f"CONCAT: {tag_name} / {thr_label} ({len(keep_fastas)} elements) | "
+                 f"{' + '.join(tools)}")
     execute_script(script_path, submit)
     return script_path
 
@@ -662,13 +689,17 @@ def main():
                 if m == "concat":
                     thr_label = "all"
                     print(f"\n=== IQTREE: {gname} ===")
-                    out_dir = os.path.join(base_out, gname, thr_label)
-                    os.makedirs(out_dir, exist_ok=True)
-                    sp = run_concat_subset(g_aln_dir, fasta_files, args.min_occupancy,
-                                           out_dir, iqtree3, args.threads, submit,
-                                           gname, thr_label, C.PARTITION,
-                                           iqtree_model, species_whitelist)
-                    if sp: all_scripts.append(sp)
+                    covs = [0, args.concat_cov] if args.concat_cov > 0 else [0]
+                    for cov in covs:
+                        suffix = "full" if cov == 0 else f"cov{cov}"
+                        out_dir = os.path.join(base_out, gname, thr_label, suffix)
+                        os.makedirs(out_dir, exist_ok=True)
+                        sp = run_concat_subset(g_aln_dir, fasta_files, cov / 100.0,
+                                               out_dir, iqtree3, args.threads, submit,
+                                               gname, thr_label, C.PARTITION,
+                                               iqtree_model, species_whitelist,
+                                               args.concat_tool)
+                        if sp: all_scripts.append(sp)
                 if m == "astral":
                     for level in levels:
                         thr_label = "all" if level == 0 else f"block_{level}kb"
@@ -699,13 +730,17 @@ def main():
                 if m == "concat":
                     thr_label = "all"
                     print(f"\n=== IQTREE: {tag_name} ===")
-                    out_dir = os.path.join(base_out, tag_name, thr_label)
-                    os.makedirs(out_dir, exist_ok=True)
-                    sp = run_concat_subset(g_aln_dir, tag_files, args.min_occupancy,
-                                           out_dir, iqtree3, args.threads, submit,
-                                           tag_name, thr_label, C.PARTITION,
-                                           iqtree_model, species_whitelist)
-                    if sp: all_scripts.append(sp)
+                    covs = [0, args.concat_cov] if args.concat_cov > 0 else [0]
+                    for cov in covs:
+                        suffix = "full" if cov == 0 else f"cov{cov}"
+                        out_dir = os.path.join(base_out, tag_name, thr_label, suffix)
+                        os.makedirs(out_dir, exist_ok=True)
+                        sp = run_concat_subset(g_aln_dir, tag_files, cov / 100.0,
+                                               out_dir, iqtree3, args.threads, submit,
+                                               tag_name, thr_label, C.PARTITION,
+                                               iqtree_model, species_whitelist,
+                                               args.concat_tool)
+                        if sp: all_scripts.append(sp)
                     continue
 
                 for level in levels:
