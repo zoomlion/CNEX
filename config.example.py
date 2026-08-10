@@ -18,6 +18,8 @@ ASTRAL   = "astral"
 IQTREE3      = "iqtree3"
 IQTREE_MODEL      = "MFP"         # model when --species-file is used (small set, model search)
 IQTREE_MODEL_FULL = "GTR+F+R4"   # model for full species run (large set, fast, FreeRate)
+RAXML_MODEL = "GTR+R4"   # raxml-ng single model (unpartitioned; fast cross-validation)
+RAXML_BS    = 200        # raxml-ng bootstrap replicates
 
 # Pipeline thresholds
 MIN_CNE_PER_SPECIES = 100

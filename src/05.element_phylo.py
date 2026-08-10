@@ -65,6 +65,10 @@ def parse_args():
                         "independent of ASTRAL --min-site-occupancy")
     p.add_argument("--concat-tool", choices=["iqtree", "raxml", "both"], default="both",
                    help="Which ML tool(s) to write into concat run.sh (default: both)")
+    p.add_argument("--raxml-model", default=C.RAXML_MODEL,
+                   help="raxml-ng single model (unpartitioned; default: GTR+R4)")
+    p.add_argument("--raxml-bs", type=int, default=C.RAXML_BS,
+                   help="raxml-ng bootstrap replicates (default: config)")
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
     p.add_argument("-t", "--threads", type=int, default=C.THREADS,
                    help="Worker count: MAFFT/FastTree parallelism, IQ-TREE/ASTRAL threads")
@@ -338,10 +342,11 @@ def execute_script(path, submit):
 def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
                       iqtree3, iqtree_threads, submit, tag_name, thr_label,
                       partition=False, iqtree_model="MFP", whitelist=None,
-                      concat_tool="both"):
+                      concat_tool="both", raxml_model="GTR+R4", raxml_bs=200):
     """Filter alignments, run concat_msa, write + execute run script.
     whitelist: optional set of species; supermatrix rows filtered to these.
     concat_tool: 'iqtree' | 'raxml' | 'both' — which ML command(s) in run.sh.
+    raxml-ng runs a single unpartitioned model (fast cross-validation); IQ-TREE keeps -p partitions.
     """
     if not keep_fastas:
         return
@@ -392,22 +397,13 @@ def run_concat_subset(aln_dir, keep_fastas, min_occ, out_dir,
         iq_cmd = f"iqtree3 -s {os.path.basename(supermatrix)}"
         if partition:
             iq_cmd += f" -p {os.path.basename(partitions)}"
-        iq_cmd += f" -m {iqtree_model} -bb 1000 -nt {n_threads}"
+        iq_cmd += f" -m {iqtree_model} -bb 1000 -nt {n_threads} --prefix iqtree"
         cmds.append(iq_cmd)
         tools.append("IQ-TREE")
     if concat_tool in ("raxml", "both"):
-        rx_model = "--model GTR+R4"
-        if partition and os.path.isfile(partitions):
-            raxml_pt = os.path.join(out_dir, "partitions.raxml.txt")
-            with open(partitions) as f_in, open(raxml_pt, "w") as f_out:
-                for line in f_in:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        f_out.write(f"GTR+R4, {line}\n")
-            rx_model = f"--model {os.path.basename(raxml_pt)}"
         rx_cmd = (f"raxml-ng --all --msa {os.path.basename(supermatrix)} "
-                  f"{rx_model} --tree pars{{10}} --bs-trees 200 "
-                  f"--threads {n_threads} --seed 42")
+                  f"--model {raxml_model} --tree pars{{10}} --bs-trees {raxml_bs} "
+                  f"--threads {n_threads} --seed 42 --prefix raxml")
         cmds.append(rx_cmd)
         tools.append("RAxML-NG")
     write_script(script_path, cmds,
@@ -698,7 +694,8 @@ def main():
                                                out_dir, iqtree3, args.threads, submit,
                                                gname, thr_label, C.PARTITION,
                                                iqtree_model, species_whitelist,
-                                               args.concat_tool)
+                                               args.concat_tool, args.raxml_model,
+                                               args.raxml_bs)
                         if sp: all_scripts.append(sp)
                 if m == "astral":
                     for level in levels:
@@ -739,7 +736,8 @@ def main():
                                                out_dir, iqtree3, args.threads, submit,
                                                tag_name, thr_label, C.PARTITION,
                                                iqtree_model, species_whitelist,
-                                               args.concat_tool)
+                                               args.concat_tool, args.raxml_model,
+                                               args.raxml_bs)
                         if sp: all_scripts.append(sp)
                     continue
 
