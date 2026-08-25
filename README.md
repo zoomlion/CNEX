@@ -5,7 +5,7 @@ Fast identification of conserved non-coding elements (CNEs) from whole-genome se
 - **Ultra-fast sliding-window genome mode** (~3 min for human genome at 6X, 16 threads)
 - **k-mer guided assembly** — De Bruijn graph with element-specific k-mer prior
 - **SNP/INDEL detection** via De Bruijn bubble scanning
-- **Phylogeny pipeline** — concat (default) with IQ-TREE 3 / RAXML-NG, or wASTRAL/ASTRAL with block-gap clustering
+- **Phylogeny pipeline** — concat with IQ-TREE 3 / RAXML-NG
 
 ## Install
 
@@ -22,14 +22,16 @@ cnex setup
 cp config.example.py config.py
 ```
 
+`config.py` is a local file (git-ignored); `config.example.py` holds the tracked
+defaults.
+
 Key settings in `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `THREADS` | 20 | Worker count: MAFFT/FastTree parallelism, IQ-TREE / RAXML-NG / ASTRAL threads |
+| `THREADS` | 20 | Worker count: MAFFT parallelism, IQ-TREE / RAXML-NG threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
 | `DEFAULT_METHOD` | `concat` | `concat`, `astral`, or `both` |
-| `ASTRAL_BLOCK_GAPS` | `1000,2000` | kb thresholds for astral block clustering |
 | `MAFFT_MODE` | `auto` | MAFFT mode: `ginsi` (high precision) / `auto` / `fftn2` (fastest) |
 | `IQTREE_MODEL` | `MFP` | IQ-TREE model when `--species-file` is used (small set, model search) |
 | `IQTREE_MODEL_FULL` | `GTR+F+R4` | IQ-TREE model for the full species run (large set, FreeRate) |
@@ -42,53 +44,43 @@ Key settings in `config.py`:
 ## Quick Start
 
 ```bash
-# 1. Validate + Assemble
-cnex validate genome.fa --mers mers_table.tsv --type genome -t 16 -o out/
-cnex assemble out/ --mers mers_table.tsv -o contigs.fa
+# 1. Multi-species: validate + assemble
+#    --cne builds the k-mer table from a reference CNE MSA; alternatively
+#    pass an existing table with --mers mers_table.tsv
+cnex pipeline genomes/ --cne blocks_10k.fa -t 16 -j 8 -o results --trim
 
-# 2. Element FASTA → Phylogeny
-python3 src/04.map_contig_to_element.py
-python3 src/05.element_phylo.py              # dry-run (scripts only)
-python3 src/05.element_phylo.py --submit     # execute
+# 2. Group per-species contigs into per-element multi-species FASTAs
+#    (--max-elements 0 = all elements; the default processes only the first 100)
+python3 src/04.map_contig_to_element.py --max-elements 0 --parallel 8
+
+# 3. Align + build trees
+python3 src/05.element_phylo.py --max-elements 0            # dry-run: write run.sh scripts
+python3 src/05.element_phylo.py --max-elements 0 --submit   # execute
+```
+
+For a single genome instead of a whole set:
+
+```bash
+cnex validate genome.fa --mers mers_table.tsv -t 16 -o out/
+cnex assemble out/ --mers mers_table.tsv -o contigs.fa
 ```
 
 ## Phylogeny Pipeline
 
-### Methods
-
-| Method | Flag | Pipeline |
-|--------|------|----------|
-| **concat** (default) | `--method concat` | MAFFT → concat_msa → IQ-TREE 3 + RAXML-NG |
-| **astral** | `--method astral` | MAFFT → block-gap cluster → concat → FastTree → wASTRAL/ASTRAL |
-| **both** | `--method both` | both in one pass |
-
-Both methods accept `--species-whitelist FILE` (one species per line) to restrict tree
-building to a subset of species; empty = use all species.
-
-### ASTRAL: Block-Binning
-
-Elements are grouped into fixed genomic bins (default 1000kb / 2000kb). Each bin is concatenated into a super-locus before FastTree inference. Requires `element_tags.tsv` for coordinates; without it, each element builds an independent gene tree.
+### Workflow
 
 ```
-element_tags.tsv: ele_id→(type, chr, start, end)
-    ↓ bin_cluster(bin_size=1000kb)
-{chr_0: [ele_1, ...], chr_1000000: [ele_2, ...], ...}
-    ↓ concat_block_alignments + FastTree
-block_{type}_0.nwk  block_{type}_1.nwk  ...
-    ↓ ASTRAL
-species_tree.nwk
+per-element FASTA
+    → MAFFT              (one MSA per element,  results/aln/all/)
+    → trimal             (drop gap-rich columns → *.trimmed.aln)
+    → concat_msa         (supermatrix per tag: all / intergenic / intron)
+    → IQ-TREE 3 + RAXML-NG
 ```
 
-Output structure:
+`--species-whitelist FILE` (one species per line) restricts tree building to a
+subset of species; empty = use all species.
 
-```
-results/astral/{type}/
-├── block_1000kb/run.sh
-├── block_2000kb/run.sh
-└── run_all.sh
-```
-
-### Concat: Per-Tag Supermatrix
+### Per-Tag Supermatrix
 
 One supermatrix per tag (all/intergenic/intron), built without quantile filtering.
 Per-element species-coverage filtering (`--concat-cov`, default 75) keeps only
@@ -111,19 +103,22 @@ results/iqtree/{type}/
 
 ### Element Tags (Optional)
 
-Generate per-element classification (intron vs intergenic) from GFF:
+Classify elements as intron vs intergenic (elements overlapping exons are dropped):
 
 ```bash
-# Requires GFF3 files named by species in a directory
+# --gff-dir is optional: GFF3 files named by species (*.gff3, .gz ok)
 python3 utils/classify_elements.py \
     --msa blocks_10k.fa \
     --gff-dir gff/ \
     -o element_tags.tsv
 ```
 
-Then set `ELEMENT_TAGS_FILE = "element_tags.tsv"` in `config.py`, or pass `--element-tags element_tags.tsv` on the CLI.
+Without `--gff-dir` (or if no GFF matches), every element is labeled
+`intergenic`. Then set `ELEMENT_TAGS_FILE = "element_tags.tsv"` in `config.py`,
+or pass `--element-tags element_tags.tsv` on the CLI.
 
-With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory and independent analysis.
+With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory
+and an independent supermatrix.
 
 ### Run Modes
 
@@ -137,7 +132,6 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 | File | Description |
 |------|-------------|
 | `results/aln/*.trimmed.aln` | Per-element trimmed alignments (trimal) |
-| `results/astral/{type}/{bin}/species_tree.nwk` | ASTRAL species tree |
 | `results/iqtree/{type}/all/full/iqtree.treefile` | IQ-TREE tree (prefix `iqtree.`) |
 | `results/iqtree/{type}/all/full/raxml.raxml.bestTree` | RAXML-NG tree (prefix `raxml.`) |
 | `variants.tsv` | SNP/INDEL candidates (from `--snp`) |
@@ -147,22 +141,17 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 
 | Tool | Method | Default path |
 |------|--------|-------------|
-| MAFFT | Both | `mafft` (default aligner; `--mafft-mode`: ginsi high-precision / auto default / fftn2 fastest) |
-| FastTree | **astral** | `FastTree` (`-gtr -gamma -spr 4 -mlacc 2 -slownni -boot 1000`) |
-| wASTRAL | **astral** | `wastral` (preferred; falls back to ASTRAL if absent) |
-| ASTRAL (ASTER) | **astral** | `astral` |
-| IQ-TREE 3 | **concat** | `iqtree3` |
-| RAXML-NG | **concat** | `raxml-ng` (single unpartitioned model; `--raxml-model` GTR+R4, `--raxml-bs` 200; https://github.com/amkozlov/raxml-ng) |
-| trimal | Both | `trimal` (alignment trimming) |
+| MAFFT | phylogeny | `mafft` (aligner; `--mafft-mode`: ginsi high-precision / auto default / fftn2 fastest) |
+| IQ-TREE 3 | phylogeny | `iqtree3` |
+| RAXML-NG | phylogeny | `raxml-ng` (single unpartitioned model; `--raxml-model` GTR+R4, `--raxml-bs` 200; https://github.com/amkozlov/raxml-ng) |
+| trimal | phylogeny | `trimal` (alignment trimming) |
 | bedtools | classification | `bedtools` (for `classify_elements.py`) |
 
 ## Benchmark
 
-| Method | Recall | Precision |
-|--------|--------|-----------|
-| **CNEX** | **83.1%** | **98.3%** |
-| MMseqs2 | 88.2% | 98.4% |
-| BLASTN | 89.1% | 98.6% |
+Genome mode processes the human genome in ~3 min (16 threads). The full
+benchmark (sensitivity and timing against MMseqs2 / BLASTN) lives in
+`benchmark/` — see `benchmark/README.md`.
 
 ## License
 
