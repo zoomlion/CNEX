@@ -94,6 +94,8 @@ def tree_deps():
          "http://www.microbesonline.org/fasttree/"),
         ("IQ-TREE",   C.IQTREE3,
          "https://github.com/iqtree/iqtree2"),
+        ("RAXML-NG",  "raxml-ng",
+         "https://github.com/amkozlov/raxml-ng"),
         ("trimal",    C.TRIMAL,
          "http://trimal.cgenomics.org/"),
         ("wASTRAL",   "wastral",

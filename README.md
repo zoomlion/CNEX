@@ -5,7 +5,7 @@ Fast identification of conserved non-coding elements (CNEs) from whole-genome se
 - **Ultra-fast sliding-window genome mode** (~3 min for human genome at 6X, 16 threads)
 - **k-mer guided assembly** — De Bruijn graph with element-specific k-mer prior
 - **SNP/INDEL detection** via De Bruijn bubble scanning
-- **Phylogeny pipeline** — wASTRAL/ASTRAL (default) with block-gap clustering, or concat/IQ-TREE 3
+- **Phylogeny pipeline** — concat (default) with IQ-TREE 3 / RAXML-NG, or wASTRAL/ASTRAL with block-gap clustering
 
 ## Install
 
@@ -26,12 +26,17 @@ Key settings in `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `THREADS` | 20 | Worker count: MAFFT/FastTree parallelism, IQ-TREE / ASTRAL threads |
+| `THREADS` | 20 | Worker count: MAFFT/FastTree parallelism, IQ-TREE / RAXML-NG / ASTRAL threads |
 | `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
-| `DEFAULT_METHOD` | `astral` | `astral`, `concat`, or `both` |
+| `DEFAULT_METHOD` | `concat` | `concat`, `astral`, or `both` |
 | `ASTRAL_BLOCK_GAPS` | `1000,2000` | kb thresholds for astral block clustering |
+| `MAFFT_MODE` | `auto` | MAFFT mode: `ginsi` (high precision) / `auto` / `fftn2` (fastest) |
+| `IQTREE_MODEL` | `MFP` | IQ-TREE model when `--species-file` is used (small set, model search) |
+| `IQTREE_MODEL_FULL` | `GTR+F+R4` | IQ-TREE model for the full species run (large set, FreeRate) |
+| `RAXML_MODEL` | `GTR+R4` | RAXML-NG single model (unpartitioned) |
+| `RAXML_BS` | 200 | RAXML-NG bootstrap replicates |
 | `ELEMENT_TAGS_FILE` | `""` | Path to element_tags.tsv for per-type filtering |
-| `PARTITION` | `False` | Output partition file for IQ-TREE |
+| `PARTITION` | `True` | Output partition file for IQ-TREE |
 | `DRY_RUN` | `True` | Generate scripts only; use `--submit` to execute |
 
 ## Quick Start
@@ -53,9 +58,12 @@ python3 src/05.element_phylo.py --submit     # execute
 
 | Method | Flag | Pipeline |
 |--------|------|----------|
-| **astral** (default) | `--method astral` | MAFFT → block-gap cluster → concat → FastTree → wASTRAL/ASTRAL |
-| **concat** | `--method concat` | MAFFT → concat_msa → IQ-TREE 3 |
+| **concat** (default) | `--method concat` | MAFFT → concat_msa → IQ-TREE 3 + RAXML-NG |
+| **astral** | `--method astral` | MAFFT → block-gap cluster → concat → FastTree → wASTRAL/ASTRAL |
 | **both** | `--method both` | both in one pass |
+
+Both methods accept `--species-whitelist FILE` (one species per line) to restrict tree
+building to a subset of species; empty = use all species.
 
 ### ASTRAL: Block-Binning
 
@@ -82,11 +90,22 @@ results/astral/{type}/
 
 ### Concat: Per-Tag Supermatrix
 
-IQ-TREE builds one supermatrix per tag (all/intergenic/intron), without quantile filtering:
+One supermatrix per tag (all/intergenic/intron), built without quantile filtering.
+Per-element species-coverage filtering (`--concat-cov`, default 75) keeps only
+elements present in ≥75% of species; `--concat-cov 0` disables the filter. Each
+tag emits a `full/` supermatrix and (when the filter is on) a `cov75/` one:
+
+- `--concat-tool` (default `both`): write IQ-TREE 3 and/or RAXML-NG commands into
+  `run.sh`. IQ-TREE keeps `-p` partitions with model selection (`MFP`, or
+  `GTR+F+R4` for large sets); RAXML-NG runs one unpartitioned model
+  (`--raxml-model`, default `GTR+R4`) with `--raxml-bs` bootstrap replicates
+  (default 200).
+- Tree outputs are prefixed per tool: `iqtree.*` / `raxml.*`.
 
 ```
 results/iqtree/{type}/
-├── all/run.sh
+├── all/full/run.sh      # full supermatrix
+├── all/cov75/run.sh     # coverage-filtered supermatrix
 └── run_all.sh
 ```
 
@@ -119,7 +138,8 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 |------|-------------|
 | `results/aln/*.trimmed.aln` | Per-element trimmed alignments (trimal) |
 | `results/astral/{type}/{bin}/species_tree.nwk` | ASTRAL species tree |
-| `results/iqtree/{type}/all/supermatrix.fa.treefile` | IQ-TREE tree |
+| `results/iqtree/{type}/all/full/iqtree.treefile` | IQ-TREE tree (prefix `iqtree.`) |
+| `results/iqtree/{type}/all/full/raxml.raxml.bestTree` | RAXML-NG tree (prefix `raxml.`) |
 | `variants.tsv` | SNP/INDEL candidates (from `--snp`) |
 | `snp_elements.gfa` | GFA 1.0 graph with bubble paths |
 
@@ -132,6 +152,7 @@ With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory a
 | wASTRAL | **astral** | `wastral` (preferred; falls back to ASTRAL if absent) |
 | ASTRAL (ASTER) | **astral** | `astral` |
 | IQ-TREE 3 | **concat** | `iqtree3` |
+| RAXML-NG | **concat** | `raxml-ng` (single unpartitioned model; `--raxml-model` GTR+R4, `--raxml-bs` 200; https://github.com/amkozlov/raxml-ng) |
 | trimal | Both | `trimal` (alignment trimming) |
 | bedtools | classification | `bedtools` (for `classify_elements.py`) |
 
