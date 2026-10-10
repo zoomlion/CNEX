@@ -54,6 +54,8 @@ struct Read {
     std::string seq_id;
     std::string seq;
     std::string qua;
+    bool is_fasta = false;
+    int offset = 0;
 };
 
 // Thread-safe chunk queue with backpressure (max_size chunks in memory)
@@ -246,43 +248,40 @@ void reader_thread(const std::vector<std::string>& files,
             std::string line;
             std::vector<Read> chunk;
             chunk.reserve(chunk_size);
+            size_t chunk_bases = 0;
+            const size_t PIECE = 1u << 20;   // split big contigs into ~1MB overlapping pieces
 
-            std::string _sid_buf;
-            char _num[16];
+            auto push_piece = [&](const std::string& piece, int offset, size_t total) {
+                Read read;
+                read.seq_id = seq_id;
+                read.seq = piece;
+                read.is_fasta = true;
+                read.offset = offset;
+                (void)total;
+                chunk_bases += piece.size();
+                chunk.push_back(std::move(read));
+                count++;
+                if (static_cast<int>(chunk.size()) >= chunk_size || chunk_bases >= (4u << 20)) {
+                    flush_chunk(chunk);
+                    chunk_bases = 0;
+                }
+            };
+
             auto flush_sequence = [&]() {
                 if (seq_id.empty() || seq.empty() || count >= depth) return;
-                int seq_len = static_cast<int>(seq.size());
-                for (int start = 0; start < seq_len && count < depth; start += step_size) {
-                    int end = start + window_size;
-                    if (end > seq_len) end = seq_len;
-                    if (end - start < window_size) break;
-                    std::string_view sv(seq.data() + start, end - start);
-                    bool has_upper = false;
-                    for (char c : sv) {
-                        if (c >= 'A' && c <= 'Z') { has_upper = true; break; }
-                    }
-                    if (!has_upper) continue;
-                    _sid_buf.clear();
-                    _sid_buf += seq_id;
-                    _sid_buf += ':';
-                    auto rc = std::to_chars(_num, _num + 15, start + 1);
-                    _sid_buf.append(_num, rc.ptr - _num);
-                    _sid_buf += '-';
-                    rc = std::to_chars(_num, _num + 15, end);
-                    _sid_buf.append(_num, rc.ptr - _num);
-                    Read read;
-                    read.seq_id = _sid_buf;
-                    read.seq = std::string(sv);
-                    for (char& c : read.seq) {
-                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-                    }
-                    read.qua.clear();
-                    chunk.push_back(std::move(read));
-                    count++;
-                    if (static_cast<int>(chunk.size()) >= chunk_size) {
-                        flush_chunk(chunk);
+                const size_t L = seq.size();
+                if (L <= PIECE) {
+                    push_piece(seq, 0, L);
+                } else {
+                    const size_t overlap = static_cast<size_t>(window_size - 1);
+                    for (size_t off = 0; off < L; ) {
+                        size_t plen = std::min(PIECE, L - off);
+                        push_piece(seq.substr(off, plen), static_cast<int>(off), L);
+                        if (off + plen >= L) break;
+                        off += plen - overlap;
                     }
                 }
+                seq.clear();
             };
 
             while (reader.readline(line) && count < depth) {
@@ -314,6 +313,7 @@ void reader_thread(const std::vector<std::string>& files,
 void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                    int mer_size, int min_c, int max_diff, int min_span,
                    double vote_frac, double vote_ratio,
+                   int window_size, int step_size,
                    const std::string& output_dir,
                    std::atomic<int64_t>& processed) {
     std::string output_file = output_dir + "/Assemble." + std::to_string(thread_id) + ".reads";
@@ -338,16 +338,49 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
     std::vector<Read> chunk;
     while (queue.pop(chunk)) {
         for (const auto& read : chunk) {
-            auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, min_c, max_diff, min_span, -1, vote_frac, vote_ratio);
-            if (confi_id > -1) {
-                int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
-                                 "%s\t%d\t%d\t%s\n",
-                                 read.seq_id.c_str(), strand, confi_id, read.seq.c_str());
-                if (n > 0) {
-                    out_pos += static_cast<size_t>(n);
-                }
-                if (out_pos > OUT_BUF_SIZE * 0.8) {
-                    flush_buffer();
+            if (read.is_fasta) {
+                const std::string& contig = read.seq_id;
+                const int base_offset = read.offset;
+                const size_t margin = static_cast<size_t>(window_size) + 256;
+                validate_sequence_segmented(
+                    read.seq, mqm, window_size, step_size,
+                    min_c, max_diff, min_span, vote_frac, vote_ratio,
+                    base_offset,
+                    [&](int start, int strand, int confi_id) {
+                        std::string sid;
+                        sid.reserve(contig.size() + 24);
+                        sid += contig;
+                        sid += ':';
+                        char num[16];
+                        auto rc = std::to_chars(num, num + 15, base_offset + start + 1);
+                        sid.append(num, rc.ptr - num);
+                        sid += '-';
+                        rc = std::to_chars(num, num + 15, base_offset + start + window_size);
+                        sid.append(num, rc.ptr - num);
+                        std::string wseq(read.seq, start, window_size);
+                        for (char& c : wseq) {
+                            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+                        }
+                        if (out_pos + margin >= OUT_BUF_SIZE) flush_buffer();
+                        int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                                         "%s\t%d\t%d\t%s\n",
+                                         sid.c_str(), strand, confi_id, wseq.c_str());
+                        if (n > 0) out_pos += static_cast<size_t>(n);
+                        if (out_pos > OUT_BUF_SIZE * 0.8) flush_buffer();
+                    });
+            } else {
+                auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, min_c, max_diff, min_span, -1, vote_frac, vote_ratio);
+                if (confi_id > -1) {
+                    if (out_pos + 512 >= OUT_BUF_SIZE) flush_buffer();
+                    int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                                     "%s\t%d\t%d\t%s\n",
+                                     read.seq_id.c_str(), strand, confi_id, read.seq.c_str());
+                    if (n > 0) {
+                        out_pos += static_cast<size_t>(n);
+                    }
+                    if (out_pos > OUT_BUF_SIZE * 0.8) {
+                        flush_buffer();
+                    }
                 }
             }
         }
@@ -504,7 +537,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Pipeline: workers start first, then reader streams in chunks
-        ChunkQueue queue;
+        ChunkQueue queue(16);
         std::atomic<int64_t> processed{0};
         std::atomic<int64_t> total_reads{0};
         std::vector<std::thread> workers;
@@ -514,6 +547,7 @@ int main(int argc, char* argv[]) {
                                  std::cref(mqm), mer_size,
                                  args.min_c, args.max_diff, args.min_span,
                                  args.vote_frac, args.vote_ratio,
+                                 args.window_size, args.step_size,
                                  std::cref(args.output_dir),
                                  std::ref(processed));
         }

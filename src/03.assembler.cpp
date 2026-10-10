@@ -192,7 +192,7 @@ int score_contig(const std::string& seq, const MerQueryManager& mqm, int ele_id)
         try {
             auto code = dna_encoder(seq.substr(i, mer_size));
             auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && it->second.first == ele_id) {
+            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
                 ++sc;
             }
         } catch (...) {
@@ -214,7 +214,7 @@ std::unordered_map<std::string, int> build_node_scores(
             try {
                 auto code = dna_encoder(node.substr(i, mer_size));
                 auto it = mqm.compressed_mer_query.find(code);
-                if (it != mqm.compressed_mer_query.end() && it->second.first == ele_id) {
+                if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
                     ++score;
                 }
             } catch (...) {
@@ -263,7 +263,7 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
         try {
             auto code = dna_encoder(seq.substr(i, 13));
             auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && it->second.first == ele_id) {
+            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
                 if (first_hit < 0) first_hit = i;
                 last_hit = i;
             }
@@ -372,7 +372,7 @@ void trim_contig_sw(std::string& seq, const std::string& ref,
         try {
             auto code = dna_encoder(seq.substr(i, 13));
             auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && it->second.first == ele_id) {
+            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
                 if (first_hit < 0) first_hit = i;
                 last_hit = i;
             }
@@ -572,7 +572,7 @@ int main(int argc, char* argv[]) {
                             uint32_t code;
                             if (encode_mer_at(local_seq, k, ms, code)) {
                                 auto it = mqm.compressed_mer_query.find(code);
-                                if (it != mqm.compressed_mer_query.end() && it->second.first == cur_ele) {
+                                if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, cur_ele)) {
                                     ++total;
                                     seen.insert(code);
                                 }
@@ -634,7 +634,7 @@ int main(int argc, char* argv[]) {
                             uint32_t code;
                             if (encode_mer_at(local_seq, k, ms, code)) {
                                 auto it = mqm.compressed_mer_query.find(code);
-                                if (it != mqm.compressed_mer_query.end() && it->second.first == cur_ele) {
+                                if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, cur_ele)) {
                                     ++total;
                                     seen.insert(code);
                                 }

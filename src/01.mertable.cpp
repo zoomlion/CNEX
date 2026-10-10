@@ -14,6 +14,7 @@ struct Args {
     int k = 13;
     int min_c = 4;
     float min_entropy = 1.2f;
+    int max_assign = 5;
     std::string output = "mers_table.tsv";
     bool help_requested = false;
 };
@@ -35,6 +36,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--min-entropy") {
             if (++i >= argc) throw std::runtime_error("Missing value for --min-entropy");
             args.min_entropy = std::stof(argv[i]);
+        } else if (arg == "-a" || arg == "--max-assign") {
+            if (++i >= argc) throw std::runtime_error("Missing value for -a");
+            args.max_assign = std::stoi(argv[i]);
         } else if (arg == "-o" || arg == "--output") {
             if (++i >= argc) throw std::runtime_error("Missing value for -o");
             args.output = argv[i];
@@ -154,6 +158,8 @@ int main(int argc, char* argv[]) {
                       << "\nOptions:\n"
                       << "  -k, --mer-size <n>    K-mer size (default: 13)\n"
                       << "  -c, --min-c <n>       Minimum species count (default: 4)\n"
+                      << "  -a, --max-assign <n>  Max (element, locus) assignments per k-mer;\n"
+                      << "                        k-mers with more assignments are dropped as repeats (default: 5)\n"
                       << "  --min-entropy <f>     Minimum k-mer entropy (default: 1.2)\n"
                       << "  -o, --output <file>    Output TSV (default: mers_table.tsv)\n";
             return 1;
@@ -179,6 +185,7 @@ int main(int argc, char* argv[]) {
 
         TableMer mertable(args.k);
         mertable.set_min_entropy(args.min_entropy);
+        mertable.set_max_assign(args.max_assign);
 
         for (size_t bunch_id = 0; bunch_id < bunches.size(); ++bunch_id) {
             if (bunch_id % 1000 == 0)

@@ -27,8 +27,12 @@ inline float mer_entropy(const std::string& seq) {
 
 class TableMer {
 public:
-    tsl::robin_map<uint32_t, std::vector<std::pair<int, int>>> merTable;
-    tsl::robin_map<uint32_t, int> merCounter;
+    struct MerAssign {
+        int bunch_id;
+        int loci;
+        int count;
+    };
+    tsl::robin_map<uint32_t, std::vector<MerAssign>> merTable;
     static uint8_t base_to_int(char c) {
         switch (c) {
             case 'A': return 0b00;
@@ -40,11 +44,13 @@ public:
     }
     size_t k;
     float min_entropy;
+    int max_assign = 5;
 
     TableMer(size_t input_k = 13, float input_min_entropy = 1.4f)
         : k(input_k), min_entropy(input_min_entropy) {}
 
     void set_min_entropy(float v) { min_entropy = v; }
+    void set_max_assign(int v) { max_assign = v; }
 
     uint32_t mer2int(const std::string& mer) const {
         uint32_t result = 0;
@@ -70,35 +76,25 @@ public:
     void add(const std::string& dna, int bunch_id, int loci, int local_count) {
         if (mer_entropy(dna) < min_entropy) return;
         uint32_t key = mer2int(dna);
-        auto it = merTable.find(key);
-        if (it == merTable.end()) {
-            merCounter[key] = local_count;
-            merTable[key] = {{bunch_id, loci}};
-        } else {
-            if (local_count > merCounter[key]) {
-                merCounter[key] = local_count;
-                merTable[key] = {{bunch_id, loci}};
-            } else if (local_count == merCounter[key]) {
-                merTable[key].push_back({bunch_id, loci});
+        auto& assigns = merTable[key];
+        for (auto& a : assigns) {
+            if (a.bunch_id == bunch_id && a.loci == loci) {
+                if (local_count > a.count) a.count = local_count;
+                return;
             }
         }
+        assigns.push_back({bunch_id, loci, local_count});
     }
 
-    std::tuple<int, int, int> get(uint32_t key) const {
-        auto it = merTable.find(key);
-        if (it == merTable.end() || it->second.empty()) return {-1, -1, 0};
-        std::mt19937 generator(42);
-        std::uniform_int_distribution<int> dist(0, static_cast<int>(it->second.size()) - 1);
-        auto p = it->second[dist(generator)];
-        auto cnt = merCounter.find(key);
-        return {p.first, p.second, cnt != merCounter.end() ? cnt->second : 0};
-    }
-
-    void dump(const std::string& filename) const {
+    void dump(const std::string& filename) {
         std::ofstream out(filename);
-        for (const auto& [key, _] : merTable) {
-            auto [bunch_id, loci, count] = get(key);
-            out << int2mer(key) << "\t" << bunch_id << "\t" << loci << "\t" << count << "\n";
+        for (const auto& [key, assigns] : merTable) {
+            // A k-mer with too many loci/elements is a repeat signal: drop it entirely
+            if (static_cast<int>(assigns.size()) > max_assign) continue;
+            std::string mer = int2mer(key);
+            for (const auto& a : assigns) {
+                out << mer << "\t" << a.bunch_id << "\t" << a.loci << "\t" << a.count << "\n";
+            }
         }
     }
 
