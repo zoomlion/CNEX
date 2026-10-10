@@ -41,7 +41,11 @@ assemble
 mertable
 
 # Benchmark
-benchmark/
+benchmark/*
+!benchmark/*.py
+!benchmark/*.sh
+!benchmark/Makefile
+!benchmark/README.md
 ipynb/
 most-cons-cne.fa
 most-cons-cne.filtered.fa
