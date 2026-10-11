@@ -117,9 +117,9 @@ def check_tree_deps():
 
 ASSEMBLE_DIR = "assemble"
 
-def process_one(genome, mers, base_dir, threads, trim, min_c=7,
-                vote_frac=0.1, vote_ratio=3.0, window_size=None, step_size=None, type_=None, log_dir=None,
-                keep_validate=False, depth=None, cne_ref=None, ssd_dir=None):
+def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.1,
+                window_size=None, step_size=None, type_=None, log_dir=None,
+                keep_validate=False, depth=None, cne_ref=None, ssd_dir=None, tiers=None):
     name = genome_name(genome)
     if not name:
         return 0, 1
@@ -136,7 +136,9 @@ def process_one(genome, mers, base_dir, threads, trim, min_c=7,
 
     val_cmd = [VALIDATE, "--mers", mers, "-t", str(threads),
                "--output_dir", val_dir, "--pigz", PIGZ,
-               "--min-c", str(min_c), "--vote-frac", str(vote_frac), "--vote-ratio", str(vote_ratio)]
+               "--vote-frac", str(vote_frac)]
+    if tiers:
+        val_cmd += ["--tiers", tiers]
     if os.path.isdir(genome) and type_ == "fastq":
         fastqs = sorted(glob.glob(os.path.join(genome, "*.fastq*")) +
                         glob.glob(os.path.join(genome, "*.fq*")))
@@ -213,10 +215,10 @@ def cmd_validate(args):
         "-t", str(args.threads),
         "--output_dir", args.output_dir,
         "--pigz", PIGZ,
-        "--min-c", str(args.min_c),
         "--vote-frac", str(args.vote_frac),
-        "--vote-ratio", str(args.vote_ratio),
     ]
+    if getattr(args, 'tiers', None):
+        cmd += ["--tiers", args.tiers]
     if args.window_size:
         cmd += ["--window_size", str(args.window_size)]
     if args.step_size:
@@ -296,10 +298,11 @@ def cmd_pipeline(args):
         for genome in genomes:
             name = genome_name(genome)
             f = pool.submit(process_one, genome, mers, args.output_dir, args.threads, trim,
-                            args.min_c, args.vote_frac, args.vote_ratio,
+                            args.vote_frac,
                             args.window_size, args.step_size, args.type, log_dir,
                             keep_validate=getattr(args, 'keep_validate', False),
-                            depth=args.depth, cne_ref=cne_ref, ssd_dir=_SSD_DIR)
+                            depth=args.depth, cne_ref=cne_ref, ssd_dir=_SSD_DIR,
+                            tiers=getattr(args, 'tiers', None))
             futures[f] = name
 
         for f in as_completed(futures):
@@ -324,9 +327,10 @@ def main():
     p_val.add_argument("-o", "--output-dir", default="out", help="Output directory (default: out)")
     p_val.add_argument("--type", choices=["genome", "fastq"],
                        help="Input type (auto-detected if omitted)")
-    p_val.add_argument("--min-c", type=int, default=7, help="Min colinear k-mer matches (default: 7)")
     p_val.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
-    p_val.add_argument("--vote-ratio", type=float, default=3.0, help="Vote ratio (default: 3.0)")
+    p_val.add_argument("--tiers", default=None,
+                       help='Extra OR gate rows, space-separated (e.g. "1.5,12,40 1.2,15,50"), '
+                            'appended on top of T1+T2')
     p_val.add_argument("--depth", type=int, default=None,
                        help="Max reads to process (default: unlimited)")
     p_val.add_argument("--window-size", type=int, help="Genome sliding window size (default: 150)")
@@ -364,9 +368,10 @@ def main():
                         help="Input type (auto-detected if omitted)")
     p_pipe.add_argument("--window-size", type=int, help="Sliding window size (default: 150)")
     p_pipe.add_argument("--step-size", type=int, help="Sliding window step (default: 25)")
-    p_pipe.add_argument("--min-c", type=int, default=7, help="Min colinear k-mer matches (default: 7)")
     p_pipe.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
-    p_pipe.add_argument("--vote-ratio", type=float, default=3.0, help="Vote ratio (default: 3.0)")
+    p_pipe.add_argument("--tiers", default=None,
+                        help='Extra OR gate rows, space-separated (e.g. "1.5,12,40 1.2,15,50"), '
+                             'appended on top of T1+T2')
     p_pipe.add_argument("--depth", type=int, default=None,
                         help="Max reads to process per genome (default: unlimited)")
     p_pipe.add_argument("--keep-validate", action="store_true",
