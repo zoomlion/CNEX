@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -28,6 +29,10 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+// Built-in T2 row, OR-combined with T1: recall-preserving on the benchmark
+// while keeping precision >= 99% (see gate matrix design).
+constexpr GateTier kDefaultT2{2.0, 10, 30};
 
 struct Args {
     enum class InputType { AUTO, GENOME, FASTQ };
@@ -46,6 +51,8 @@ struct Args {
     int min_span = 25;
     double vote_frac = 0.1;
     double vote_ratio = 3.0;
+    // Extra gate rows (nullopt = default T2, empty = disabled).
+    std::optional<std::vector<GateTier>> extra_tiers;
     bool help_requested = false;
     InputType input_type = InputType::AUTO;
 };
@@ -311,11 +318,10 @@ void reader_thread(const std::vector<std::string>& files,
 // ─── Worker thread ───
 
 void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
-                   int mer_size, int min_c, int max_diff, int min_span,
-                   double vote_frac, double vote_ratio,
-                   int window_size, int step_size,
+                   int mer_size, const ValidatorConfig& cfg,
                    const std::string& output_dir,
                    std::atomic<int64_t>& processed) {
+    const int window_size = cfg.window_size;
     std::string output_file = output_dir + "/Assemble." + std::to_string(thread_id) + ".reads";
     FILE* fp = fopen(output_file.c_str(), "a");
     if (!fp) {
@@ -343,9 +349,7 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                 const int base_offset = read.offset;
                 const size_t margin = static_cast<size_t>(window_size) + 256;
                 validate_sequence_segmented(
-                    read.seq, mqm, window_size, step_size,
-                    min_c, max_diff, min_span, vote_frac, vote_ratio,
-                    base_offset,
+                    read.seq, mqm, base_offset, cfg,
                     [&](int start, int strand, int confi_id) {
                         std::string sid;
                         sid.reserve(contig.size() + 24);
@@ -369,7 +373,7 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                         if (out_pos > OUT_BUF_SIZE * 0.8) flush_buffer();
                     });
             } else {
-                auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, min_c, max_diff, min_span, -1, vote_frac, vote_ratio);
+                auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, -1, cfg);
                 if (confi_id > -1) {
                     if (out_pos + 512 >= OUT_BUF_SIZE) flush_buffer();
                     int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
@@ -412,6 +416,19 @@ void progress_monitor(std::atomic<int64_t>& processed, int64_t total) {
 }
 
 // ─── Command-line parsing ───
+
+static GateTier parse_gate_tier(const std::string& spec) {
+    size_t p1 = spec.find(',');
+    if (p1 == std::string::npos)
+        throw std::runtime_error("--gate-tier expects vote_ratio,min_c[,min_span]");
+    size_t p2 = spec.find(',', p1 + 1);
+    GateTier tier;
+    tier.vote_ratio = std::stod(spec.substr(0, p1));
+    tier.min_c = std::stoi(spec.substr(p1 + 1,
+        (p2 == std::string::npos) ? std::string::npos : p2 - p1 - 1));
+    tier.min_span = (p2 == std::string::npos) ? 0 : std::stoi(spec.substr(p2 + 1));
+    return tier;
+}
 
 Args parse_args(int argc, char* argv[]) {
     Args args;
@@ -466,6 +483,12 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--vote-ratio") {
             if (++i >= argc) throw std::runtime_error("Missing value for --vote-ratio");
             args.vote_ratio = std::stod(argv[i]);
+        } else if (arg == "--gate-tier") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --gate-tier");
+            if (!args.extra_tiers) args.extra_tiers.emplace();
+            args.extra_tiers->push_back(parse_gate_tier(argv[i]));
+        } else if (arg == "--no-gate-tier") {
+            args.extra_tiers = std::vector<GateTier>{};
         } else if (arg[0] != '-') {
             args.reads_files.push_back(arg);
         } else {
@@ -474,6 +497,45 @@ Args parse_args(int argc, char* argv[]) {
         ++i;
     }
     return args;
+}
+
+// ─── Gate matrix ───
+
+constexpr size_t kMaxGateTiers = 6;
+
+// T1 comes from the legacy flags; extra rows (T2, ...) are OR-combined with it.
+static ValidatorConfig build_validator_config(const Args& args) {
+    ValidatorConfig cfg;
+    cfg.window_size = args.window_size;
+    cfg.step_size = args.step_size;
+    cfg.vote_frac = args.vote_frac;
+    cfg.max_diff = args.max_diff;
+    cfg.tiers.clear();
+    cfg.tiers.push_back(GateTier{args.vote_ratio, args.min_c, args.min_span});
+    std::vector<GateTier> extras = args.extra_tiers.value_or(
+        std::vector<GateTier>{kDefaultT2});
+    for (const auto& tier : extras) {
+        GateTier t = tier;
+        if (t.min_span <= 0) t.min_span = args.min_span;
+        cfg.tiers.push_back(t);
+    }
+    if (cfg.tiers.size() > kMaxGateTiers) {
+        throw std::runtime_error("Too many gate tiers (max 6)");
+    }
+    // Sort extras by vote_ratio descending, then enforce monotonicity: a lower
+    // vote_ratio must not lower the required chain length.
+    std::sort(cfg.tiers.begin() + 1, cfg.tiers.end(),
+              [](const GateTier& a, const GateTier& b) {
+                  return a.vote_ratio > b.vote_ratio;
+              });
+    for (size_t t = 1; t < cfg.tiers.size(); ++t) {
+        if (cfg.tiers[t].vote_ratio < cfg.tiers[t - 1].vote_ratio &&
+            cfg.tiers[t].min_c < cfg.tiers[t - 1].min_c) {
+            throw std::runtime_error(
+                "gate tiers must be monotone: lower vote_ratio requires >= min_c");
+        }
+    }
+    return cfg;
 }
 
 // ─── Main ───
@@ -500,7 +562,10 @@ int main(int argc, char* argv[]) {
                       << "  --max-diff <n>        max gap diff tolerance (default: 2)\n"
                       << "  --min-span <n>        min read span covered (default: 25)\n"
                       << "  --vote-frac <f>       min fraction of k-mers for top CNE vote (default: 0.1)\n"
-                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 3.0)\n";
+                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 3.0)\n"
+                      << "  --gate-tier <rv,mc[,ms]>  extra OR gate row (T2+), repeatable (max 6 total)\n"
+                      << "                        (default T2: 2.0,10,30)\n"
+                      << "  --no-gate-tier        disable the built-in T2 row (legacy)\n";
             return 1;
         }
 
@@ -513,6 +578,9 @@ int main(int argc, char* argv[]) {
         if (args.depth <= 0) {
             args.depth = std::numeric_limits<int64_t>::max();
         }
+
+        // Validate CLI-derived gate matrix before touching disk or loading data
+        ValidatorConfig cfg = build_validator_config(args);
 
         // Load mers table
         std::cerr << "Loading mers table from " << args.mers_file << " ...\n";
@@ -545,9 +613,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < args.threads; ++i) {
             workers.emplace_back(worker_thread, i, std::ref(queue),
                                  std::cref(mqm), mer_size,
-                                 args.min_c, args.max_diff, args.min_span,
-                                 args.vote_frac, args.vote_ratio,
-                                 args.window_size, args.step_size,
+                                 std::cref(cfg),
                                  std::cref(args.output_dir),
                                  std::ref(processed));
         }

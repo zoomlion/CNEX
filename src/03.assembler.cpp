@@ -330,7 +330,9 @@ bool filter_contig(const std::string& seq, const MerQueryManager& mqm, int mer_s
                    int ele_id, int min_c)
 {
     if ((int)seq.size() < mer_size + min_c) return true;
-    auto [confi_id, _] = validate_read(seq, mqm, mer_size, min_c);
+    ValidatorConfig cfg;
+    cfg.tiers[0].min_c = min_c;
+    auto [confi_id, _] = validate_read(seq, mqm, mer_size, -1, cfg);
     return confi_id == ele_id;
 }
 

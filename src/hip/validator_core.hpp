@@ -82,12 +82,19 @@ inline void reverse_complement(const std::string& dna, std::string& out) {
 
 
 
-inline int findFrequentWithMap(const std::vector<int>& nums, double vote_frac=0.1, double vote_ratio=3.0) {
-    if (nums.empty()) return -1;
+struct VoteTally {
+    int best_id = -1;
+    int best_cnt = 0;
+    int second_cnt = 0;
+    int n = 0;
+};
 
-    int n = static_cast<int>(nums.size());
+// O(m) tally with epoch stamps: element ids are bounded, no sort/clear per window.
+inline VoteTally tally_votes(const std::vector<int>& nums) {
+    VoteTally r;
+    r.n = static_cast<int>(nums.size());
+    if (nums.empty()) return r;
 
-    // O(m) tally with epoch stamps: element ids are bounded, no sort/clear per window.
     thread_local std::vector<unsigned> stamps;
     thread_local std::vector<int> counts;
     thread_local std::vector<int> seen;
@@ -114,25 +121,72 @@ inline int findFrequentWithMap(const std::vector<int>& nums, double vote_frac=0.
         }
     }
 
-    int best_id = -1;
-    int best_cnt = 0;
-    int second_cnt = 0;
     for (int id : seen) {
         int c = counts[id];
-        if (c > best_cnt) {
-            second_cnt = best_cnt;
-            best_cnt = c;
-            best_id = id;
-        } else if (c > second_cnt) {
-            second_cnt = c;
+        if (c > r.best_cnt) {
+            r.second_cnt = r.best_cnt;
+            r.best_cnt = c;
+            r.best_id = id;
+        } else if (c > r.second_cnt) {
+            r.second_cnt = c;
         }
     }
+    return r;
+}
 
-    float threshold = static_cast<float>(n) * static_cast<float>(vote_frac);
-    if (best_cnt > threshold && best_cnt >= static_cast<int>(vote_ratio * second_cnt)) {
-        return best_id;
+// Gate matrix: T1 = legacy defaults (from the flags); T2, T3, ... are extra
+// OR-combined rows. A window is accepted when ANY row passes. Rows share one
+// tally and one chain evaluation per window.
+struct GateTier {
+    double vote_ratio = 3.0;
+    int min_c = 7;
+    int min_span = 25;
+};
+
+struct ValidatorConfig {
+    int window_size = 150;
+    int step_size = 25;
+    double vote_frac = 0.1;
+    int max_diff = 2;
+    std::vector<GateTier> tiers = {GateTier{}};   // T1 OR T2 ...
+};
+
+// chain_fn(best_id) -> (passing, span); invoked at most once per window.
+template <typename ChainFn>
+inline bool gate_pass(const VoteTally& t, const ValidatorConfig& cfg, ChainFn&& chain_fn,
+                      int& passing_out, int& span_out) {
+    passing_out = 0;
+    span_out = 0;
+    if (t.best_id < 0 || cfg.tiers.empty()) return false;
+
+    float threshold = static_cast<float>(t.n) * static_cast<float>(cfg.vote_frac);
+    if (t.best_cnt <= threshold) return false;
+
+    // Integer truncation matches the historical T1 semantics; keep it even
+    // for fractional ratios (e.g. 1.5) to avoid changing accepted windows.
+    auto ratio_ok = [&](const GateTier& tier) {
+        return t.best_cnt >= static_cast<int>(tier.vote_ratio * t.second_cnt);
+    };
+
+    bool any_ratio = false;
+    for (const auto& tier : cfg.tiers) {
+        if (ratio_ok(tier)) {
+            any_ratio = true;
+            break;
+        }
     }
-    return -1;
+    if (!any_ratio) return false;
+
+    auto cs = chain_fn(t.best_id);
+    passing_out = cs.first;
+    span_out = cs.second;
+
+    for (const auto& tier : cfg.tiers) {
+        if (ratio_ok(tier) && passing_out >= tier.min_c && span_out >= tier.min_span) {
+            return true;
+        }
+    }
+    return false;
 }
 
 
@@ -241,18 +295,12 @@ inline std::pair<int, int> validate_read(
     const std::string& seq,
     const MerQueryManager& compressed_mer_query,
     int mer_size,
-    int min_c = 7,
-    int max_diff = 2,
-    int min_span = 25,
     int target_ele_id = -1,
-    double vote_frac = 0.1,
-    double vote_ratio = 3.0)
+    const ValidatorConfig& cfg = ValidatorConfig{})
 {
     thread_local std::vector<int> match_ids;
     thread_local std::vector<int> match_starts;
     thread_local std::vector<int> match_loci;
-    thread_local std::vector<int> seq_positions;
-    thread_local std::vector<int> loci_positions;
 
     auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
         match_ids.clear();
@@ -312,35 +360,27 @@ inline std::pair<int, int> validate_read(
 
         if (match_ids.empty()) return {-1, 0};
 
-        // ─── Vote + filtered check ───
-        int confi_id = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
-        if (confi_id == -1) return {-1, 0};
+        // ─── Vote + gate matrix (T1 OR T2 ...) ───
+        VoteTally tally = tally_votes(match_ids);
 
-        seq_positions.clear();
-        loci_positions.clear();
-        size_t n = match_ids.size();
-        for (size_t i = 0; i < n; ++i) {
-            if (match_ids[i] == confi_id) {
-                seq_positions.push_back(match_starts[i]);
-                loci_positions.push_back(match_loci[i]);
+        auto chain_of = [&](int confi_id) -> std::pair<int, int> {
+            int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
+            for (size_t i = 0; i < match_ids.size(); ++i) {
+                if (match_ids[i] != confi_id) continue;
+                int x = match_starts[i];
+                int l = match_loci[i];
+                if (first < 0) first = x;
+                else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
+                prev_x = x; prev_l = l; last = x; ++m;
             }
-        }
+            if (m == 0) return {0, 0};
+            return {passing, last - first + mer_size};
+        };
 
-        size_t m = seq_positions.size();
-        int passing = 0;
-        for (size_t i = 1; i < m; ++i) {
-            int gap_read = seq_positions[i] - seq_positions[i - 1];
-            int gap_loci = loci_positions[i] - loci_positions[i - 1];
-            if (std::abs(gap_read - gap_loci) <= max_diff)
-                passing++;
-        }
+        int passing = 0, span = 0;
+        if (!gate_pass(tally, cfg, chain_of, passing, span)) return {-1, 0};
 
-        int span = seq_positions.back() - seq_positions.front() + mer_size;
-
-        if (passing >= min_c && span >= min_span)
-            return {confi_id, static_cast<int>(n)};
-
-        return {-1, 0};
+        return {tally.best_id, static_cast<int>(tally.n)};
     };
 
     auto [forward_id, forward_count] = validate_chain(seq);
@@ -384,20 +424,15 @@ template <typename Emit>
 inline void validate_sequence_segmented(
     const std::string& seq,
     const MerQueryManager& mqm,
-    int window_size,
-    int step_size,
-    int min_c,
-    int max_diff,
-    int min_span,
-    double vote_frac,
-    double vote_ratio,
     int start_offset,
+    const ValidatorConfig& cfg,
     Emit&& emit)
 {
     const int k = mqm.mer_size;
+    const int window_size = cfg.window_size;
+    const int step_size = std::max(1, cfg.step_size);
     const int L = static_cast<int>(seq.size());
     if (k <= 0 || L < window_size) return;
-    if (step_size < 1) step_size = 1;
     const int nspan = window_size - k + 1;   // k-mer start positions per window
     if (nspan <= 0) return;
 
@@ -418,20 +453,18 @@ inline void validate_sequence_segmented(
     thread_local std::vector<int> match_starts;
     thread_local std::vector<int> match_loci;
 
-    auto chain_pass = [&](int confi_id, int& match_count) -> bool {
-        match_count = static_cast<int>(match_ids.size());
+    auto chain_stats = [&](int confi_id) -> std::pair<int, int> {
         int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
         for (size_t idx = 0; idx < match_ids.size(); ++idx) {
             if (match_ids[idx] != confi_id) continue;
             int x = match_starts[idx];
             int l = match_loci[idx];
             if (first < 0) first = x;
-            else if (std::abs((x - prev_x) - (l - prev_l)) <= max_diff) ++passing;
+            else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
             prev_x = x; prev_l = l; last = x; ++m;
         }
-        if (m == 0) return false;
-        int span = last - first + k;
-        return passing >= min_c && span >= min_span;
+        if (m == 0) return {0, 0};
+        return {passing, last - first + k};
     };
 
     const int seg_stride = SEG - (window_size - 1);
@@ -508,10 +541,12 @@ inline void validate_sequence_segmented(
             int fwd_id = -1, fwd_count = 0;
             bool fwd_ok = false;
             if (!match_ids.empty()) {
-                int confi = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
-                if (confi != -1 && chain_pass(confi, fwd_count)) {
+                VoteTally t = tally_votes(match_ids);
+                int passing = 0, span = 0;
+                if (gate_pass(t, cfg, chain_stats, passing, span)) {
                     fwd_ok = true;
-                    fwd_id = confi;
+                    fwd_id = t.best_id;
+                    fwd_count = t.n;
                 }
             }
 
@@ -532,10 +567,12 @@ inline void validate_sequence_segmented(
             int rev_id = -1, rev_count = 0;
             bool rev_ok = false;
             if (!match_ids.empty()) {
-                int confi = findFrequentWithMap(match_ids, vote_frac, vote_ratio);
-                if (confi != -1 && chain_pass(confi, rev_count)) {
+                VoteTally t = tally_votes(match_ids);
+                int passing = 0, span = 0;
+                if (gate_pass(t, cfg, chain_stats, passing, span)) {
                     rev_ok = true;
-                    rev_id = confi;
+                    rev_id = t.best_id;
+                    rev_count = t.n;
                 }
             }
 
