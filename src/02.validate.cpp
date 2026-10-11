@@ -21,7 +21,6 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
-#include <optional>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -30,9 +29,10 @@
 
 namespace fs = std::filesystem;
 
-// Built-in T2 row, OR-combined with T1: recall-preserving on the benchmark
-// while keeping precision >= 99% (see gate matrix design).
-constexpr GateTier kDefaultT2{2.0, 10, 30};
+// Fixed gate rows: T1 is the legacy row, T2 the built-in extra row. Both are
+// always active and OR-combined; --tiers rows are appended on top.
+constexpr GateTier kT1{3.0, 7, 25};
+constexpr GateTier kT2{2.0, 10, 30};
 
 struct Args {
     enum class InputType { AUTO, GENOME, FASTQ };
@@ -46,13 +46,10 @@ struct Args {
     int window_size = 150;
     int step_size = 25;
     std::string pigz_path = "pigz/pigz";
-    int min_c = 7;
     int max_diff = 2;
-    int min_span = 25;
     double vote_frac = 0.1;
-    double vote_ratio = 3.0;
-    // Extra gate rows (nullopt = default T2, empty = disabled).
-    std::optional<std::vector<GateTier>> extra_tiers;
+    // Extra gate rows from --tiers (appended on top of T1 and T2).
+    std::vector<GateTier> extra_tiers;
     bool help_requested = false;
     InputType input_type = InputType::AUTO;
 };
@@ -417,17 +414,39 @@ void progress_monitor(std::atomic<int64_t>& processed, int64_t total) {
 
 // ─── Command-line parsing ───
 
-static GateTier parse_gate_tier(const std::string& spec) {
+static GateTier parse_gate_row(const std::string& spec) {
     size_t p1 = spec.find(',');
     if (p1 == std::string::npos)
-        throw std::runtime_error("--gate-tier expects vote_ratio,min_c[,min_span]");
+        throw std::runtime_error("invalid spec '" + spec + "' (expect rv,mc[,ms])");
     size_t p2 = spec.find(',', p1 + 1);
     GateTier tier;
-    tier.vote_ratio = std::stod(spec.substr(0, p1));
-    tier.min_c = std::stoi(spec.substr(p1 + 1,
-        (p2 == std::string::npos) ? std::string::npos : p2 - p1 - 1));
-    tier.min_span = (p2 == std::string::npos) ? 0 : std::stoi(spec.substr(p2 + 1));
+    try {
+        tier.vote_ratio = std::stod(spec.substr(0, p1));
+        tier.min_c = std::stoi(spec.substr(p1 + 1,
+            (p2 == std::string::npos) ? std::string::npos : p2 - p1 - 1));
+        tier.min_span = (p2 == std::string::npos) ? 25 : std::stoi(spec.substr(p2 + 1));
+    } catch (const std::exception&) {
+        throw std::runtime_error("invalid spec '" + spec + "' (expect rv,mc[,ms])");
+    }
+    if (tier.vote_ratio <= 0 || tier.min_c <= 0 || tier.min_span <= 0)
+        throw std::runtime_error("invalid spec '" + spec + "' (expect rv,mc[,ms])");
     return tier;
+}
+
+// Parse a space-separated list of rows, each "rv,mc[,ms]".
+static std::vector<GateTier> parse_tiers(const std::string& spec) {
+    std::vector<GateTier> out;
+    size_t i = 0;
+    while (i < spec.size()) {
+        while (i < spec.size() && (spec[i] == ' ' || spec[i] == '\t')) ++i;
+        size_t j = i;
+        while (j < spec.size() && spec[j] != ' ' && spec[j] != '\t') ++j;
+        if (j > i) out.push_back(parse_gate_row(spec.substr(i, j - i)));
+        i = j;
+    }
+    if (out.empty())
+        throw std::runtime_error("--tiers: empty tier list");
+    return out;
 }
 
 Args parse_args(int argc, char* argv[]) {
@@ -468,28 +487,24 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--pigz") {
             if (++i >= argc) throw std::runtime_error("Missing value for --pigz");
             args.pigz_path = argv[i];
-        } else if (arg == "--min-c") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --min-c");
-            args.min_c = std::stoi(argv[i]);
         } else if (arg == "--max-diff") {
             if (++i >= argc) throw std::runtime_error("Missing value for --max-diff");
             args.max_diff = std::stoi(argv[i]);
-        } else if (arg == "--min-span") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --min-span");
-            args.min_span = std::stoi(argv[i]);
         } else if (arg == "--vote-frac") {
             if (++i >= argc) throw std::runtime_error("Missing value for --vote-frac");
             args.vote_frac = std::stod(argv[i]);
-        } else if (arg == "--vote-ratio") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --vote-ratio");
-            args.vote_ratio = std::stod(argv[i]);
-        } else if (arg == "--gate-tier") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --gate-tier");
-            if (!args.extra_tiers) args.extra_tiers.emplace();
-            args.extra_tiers->push_back(parse_gate_tier(argv[i]));
-        } else if (arg == "--no-gate-tier") {
-            args.extra_tiers = std::vector<GateTier>{};
+        } else if (arg == "--tiers") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --tiers");
+            for (auto& t : parse_tiers(argv[i])) args.extra_tiers.push_back(t);
         } else if (arg[0] != '-') {
+            // Heuristic: an unquoted --tiers list arrives as extra tokens such
+            // as "1.5,12,40" and would silently be treated as input files.
+            if (arg.find(',') != std::string::npos &&
+                arg.find_first_not_of("0123456789.,") == std::string::npos) {
+                throw std::runtime_error(
+                    "unexpected argument '" + arg +
+                    "' - quote the whole --tiers list (e.g. --tiers \"2.0,10,30 1.5,12,40\")");
+            }
             args.reads_files.push_back(arg);
         } else {
             throw std::runtime_error("Unknown option: " + arg);
@@ -503,7 +518,7 @@ Args parse_args(int argc, char* argv[]) {
 
 constexpr size_t kMaxGateTiers = 6;
 
-// T1 comes from the legacy flags; extra rows (T2, ...) are OR-combined with it.
+// T1 and T2 are always active; --tiers rows are appended on top of them.
 static ValidatorConfig build_validator_config(const Args& args) {
     ValidatorConfig cfg;
     cfg.window_size = args.window_size;
@@ -511,19 +526,16 @@ static ValidatorConfig build_validator_config(const Args& args) {
     cfg.vote_frac = args.vote_frac;
     cfg.max_diff = args.max_diff;
     cfg.tiers.clear();
-    cfg.tiers.push_back(GateTier{args.vote_ratio, args.min_c, args.min_span});
-    std::vector<GateTier> extras = args.extra_tiers.value_or(
-        std::vector<GateTier>{kDefaultT2});
-    for (const auto& tier : extras) {
-        GateTier t = tier;
-        if (t.min_span <= 0) t.min_span = args.min_span;
-        cfg.tiers.push_back(t);
+    cfg.tiers.push_back(kT1);
+    cfg.tiers.push_back(kT2);
+    for (const auto& tier : args.extra_tiers) {
+        cfg.tiers.push_back(tier);
     }
     if (cfg.tiers.size() > kMaxGateTiers) {
-        throw std::runtime_error("Too many gate tiers (max 6)");
+        throw std::runtime_error("too many gate rows: T1 + T2 + --tiers must be <= 6");
     }
-    // Sort extras by vote_ratio descending, then enforce monotonicity: a lower
-    // vote_ratio must not lower the required chain length.
+    // Sort extra rows by vote_ratio descending, then enforce monotonicity: a
+    // lower vote_ratio must not lower the required chain length.
     std::sort(cfg.tiers.begin() + 1, cfg.tiers.end(),
               [](const GateTier& a, const GateTier& b) {
                   return a.vote_ratio > b.vote_ratio;
@@ -532,7 +544,7 @@ static ValidatorConfig build_validator_config(const Args& args) {
         if (cfg.tiers[t].vote_ratio < cfg.tiers[t - 1].vote_ratio &&
             cfg.tiers[t].min_c < cfg.tiers[t - 1].min_c) {
             throw std::runtime_error(
-                "gate tiers must be monotone: lower vote_ratio requires >= min_c");
+                "gate rows must be monotone: lower vote_ratio requires >= min_c");
         }
     }
     return cfg;
@@ -558,14 +570,16 @@ int main(int argc, char* argv[]) {
                       << "  --window_size <n>     Genome sliding window size (default: 150)\n"
                       << "  --step_size <n>       Genome sliding window step (default: 25, ~6X coverage)\n"
                       << "  --pigz <path>         pigz binary path (default: pigz/pigz)\n"
-                      << "  --min-c <n>           min passing adjacent pairs (default: 7)\n"
-                      << "  --max-diff <n>        max gap diff tolerance (default: 2)\n"
-                      << "  --min-span <n>        min read span covered (default: 25)\n"
-                      << "  --vote-frac <f>       min fraction of k-mers for top CNE vote (default: 0.1)\n"
-                      << "  --vote-ratio <r>      min ratio of 1st/2nd CNE votes (default: 3.0)\n"
-                      << "  --gate-tier <rv,mc[,ms]>  extra OR gate row (T2+), repeatable (max 6 total)\n"
-                      << "                        (default T2: 2.0,10,30)\n"
-                      << "  --no-gate-tier        disable the built-in T2 row (legacy)\n";
+                      << "  --max-diff <n>        chain gap tolerance, all rows (default: 2)\n"
+                      << "  --vote-frac <f>       min fraction of k-mers for top CNE vote, all rows\n"
+                      << "                        (default: 0.1)\n"
+                      << "  --tiers \"<rv,mc[,ms]> <rv,mc[,ms]> ...\"\n"
+                      << "                        space-separated extra OR gate rows appended on top\n"
+                      << "                        of the fixed T1 (3.0,7,25) and T2 (2.0,10,30) rows;\n"
+                      << "                        quote the whole list. ms defaults to 25. Rows are\n"
+                      << "                        sorted by vote_ratio (desc); a row with lower\n"
+                      << "                        vote_ratio must not have a lower min_c than the row\n"
+                      << "                        above. Max 6 rows in total.\n";
             return 1;
         }
 
