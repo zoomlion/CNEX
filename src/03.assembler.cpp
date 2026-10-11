@@ -211,15 +211,12 @@ ContigScore score_contig(const std::string& seq, const MerQueryManager& mqm, int
     int mer_size = mqm.get_mer_size();
     tsl::robin_set<uint32_t> seen;
     for (size_t i = 0; i + mer_size <= seq.size(); ++i) {
-        try {
-            auto code = dna_encoder(seq.substr(i, mer_size));
-            auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-                ++sc.hits;
-                seen.insert(code);
-            }
-        } catch (...) {
-            continue;
+        uint32_t code;
+        if (!encode_mer_at(seq, i, mer_size, code)) continue;
+        auto it = mqm.compressed_mer_query.find(code);
+        if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
+            ++sc.hits;
+            seen.insert(code);
         }
     }
     sc.distinct = static_cast<int>(seen.size());
@@ -235,14 +232,11 @@ std::unordered_map<std::string, int> build_node_scores(
         if (node.size() < (size_t)mer_size) continue;
         int score = 0;
         for (size_t i = 0; i + mer_size <= node.size(); ++i) {
-            try {
-                auto code = dna_encoder(node.substr(i, mer_size));
-                auto it = mqm.compressed_mer_query.find(code);
-                if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-                    ++score;
-                }
-            } catch (...) {
-                continue;
+            uint32_t code;
+            if (!encode_mer_at(node, i, mer_size, code)) continue;
+            auto it = mqm.compressed_mer_query.find(code);
+            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
+                ++score;
             }
         }
         if (score > 0) {
@@ -258,7 +252,8 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
                                std::ofstream* gfa_out = nullptr,
                                bool debug = false)
 {
-    auto [graph, kmer_counts, e_counts] = de_bruijn_graph(reads, k, min_count);
+    auto [graph, kmer_counts, e_counts] =
+        de_bruijn_graph(reads, k, min_count, gfa_out != nullptr, snp_out != nullptr);
     if (graph.empty()) return "";
 
     std::unordered_map<std::string, int> node_scores;
@@ -303,15 +298,12 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
 
     int first_hit = -1, last_hit = -1;
     for (int i = 0; i < n; ++i) {
-        try {
-            auto code = dna_encoder(seq.substr(i, 13));
-            auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-                if (first_hit < 0) first_hit = i;
-                last_hit = i;
-            }
-        } catch (...) {
-            continue;
+        uint32_t code;
+        if (!encode_mer_at(seq, static_cast<size_t>(i), 13, code)) continue;
+        auto it = mqm.compressed_mer_query.find(code);
+        if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
+            if (first_hit < 0) first_hit = i;
+            last_hit = i;
         }
     }
 
@@ -466,11 +458,16 @@ static void process_genome_element(
     std::vector<GenomeResult>& out)
 {
     const int cur_ele = all_reads[begin].ele_id;
-    std::vector<std::pair<Read, std::string>> ele_reads;
-    ele_reads.reserve(args.max_reads);
-    int cnt = 0;
+    struct EleRead {
+        Read read;
+        std::string seq;
+        int seen = 0;   // distinct element mers in the read
+        int pos = 0;    // matched element-mer positions in the read
+    };
+    std::vector<EleRead> ele_reads;
+    ele_reads.reserve(end - begin);
     size_t idx = begin;
-    while (idx < end && cnt < args.max_reads) {
+    while (idx < end) {
         const auto& r = all_reads[idx];
         std::string local_seq = r.seq;
         for (char& c : local_seq) {
@@ -484,9 +481,11 @@ static void process_genome_element(
             reverse_complement(local_seq, _rc);
             local_seq = _rc;
         }
-        // Repeat ratio check for genome mode
+        // Repeat ratio check for genome mode; the distinct element-mer count
+        // doubles as a per-read score bound for branch-and-bound below.
         {
-            tsl::robin_set<uint32_t> seen;
+            thread_local tsl::robin_set<uint32_t> seen;
+            seen.clear();
             int total = 0;
             int ms = mqm.get_mer_size();
             for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
@@ -502,31 +501,30 @@ static void process_genome_element(
             double ratio = (double)total / std::max(1, (int)seen.size());
             if (ratio > args.repeat_ratio) {
                 ++idx;
-                ++cnt;
                 continue;
             }
+            ele_reads.push_back(EleRead{r, std::move(local_seq),
+                                        static_cast<int>(seen.size()), total});
         }
-        ele_reads.emplace_back(r, std::move(local_seq));
         ++idx;
-        ++cnt;
     }
     if (ele_reads.empty()) return;
 
     // Cluster by locus
     std::sort(ele_reads.begin(), ele_reads.end(),
-        [](const auto& a, const auto& b) {
-            if (a.first.chr != b.first.chr) return a.first.chr < b.first.chr;
-            if (a.first.strand != b.first.strand) return a.first.strand > b.first.strand;
-            return a.first.start < b.first.start;
+        [](const EleRead& a, const EleRead& b) {
+            if (a.read.chr != b.read.chr) return a.read.chr < b.read.chr;
+            if (a.read.strand != b.read.strand) return a.read.strand > b.read.strand;
+            return a.read.start < b.read.start;
         });
 
     std::string best_did;
     std::string best_seq;
     double best_score = -1.0;
+    size_t best_pos = 0;
 
     auto consider = [&](std::string contig, int cluster_start,
-                        const std::pair<Read, std::string>& first_r,
-                        const std::pair<Read, std::string>& last_r) {
+                        const EleRead& first_r, const EleRead& last_r, size_t pos) {
         if (contig.empty()) return;
         if (args.trim) {
             auto it = cne_refs.find(cur_ele);
@@ -541,62 +539,109 @@ static void process_genome_element(
         bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
             static_cast<double>(sc.hits) / sc.distinct > 2.0;
         if (repeat_chimera) return;
-        char s = first_r.first.strand == 1 ? '+' : '-';
+        char s = first_r.read.strand == 1 ? '+' : '-';
         std::string did = std::to_string(cur_ele) + "." +
-            first_r.first.chr + ":" +
+            first_r.read.chr + ":" +
             std::to_string(cluster_start) + "-" +
-            std::to_string(last_r.first.end) + "(" + s + ")";
-        if (best_did.empty() || sc.hits > best_score) {
+            std::to_string(last_r.read.end) + "(" + s + ")";
+        if (best_did.empty() || sc.hits > best_score ||
+            (sc.hits == best_score && pos < best_pos)) {
             best_did = std::move(did);
             best_seq = std::move(contig);
             best_score = static_cast<double>(sc.hits);
+            best_pos = pos;
         }
     };
 
-    // Per-locus assembly
-    std::vector<std::pair<Read, std::string>> cluster;
-    int cluster_start = ele_reads[0].first.start;
+    // Sample one cluster's reads down to the per-locus budget.
+    auto sample_cluster = [&](const std::vector<EleRead>& er, size_t cb, size_t ce) {
+        size_t n_reads = ce - cb;
+        std::vector<std::string> seqs;
+        seqs.reserve(std::min<size_t>(n_reads, args.max_reads));
+        if ((int)n_reads <= args.max_reads) {
+            for (size_t k = cb; k < ce; ++k) seqs.push_back(er[k].seq);
+            return seqs;
+        }
+        int n = args.max_reads;
+        for (int i = 0; i < n; ++i) {
+            size_t j = (n == 1)
+                ? 0
+                : static_cast<size_t>((double)i * (n_reads - 1) / (n - 1) + 0.5);
+            seqs.push_back(er[cb + j].seq);
+        }
+        return seqs;
+    };
 
-    for (size_t j = 0; j < ele_reads.size(); ++j) {
-        const auto& r = ele_reads[j];
-        bool new_cluster = false;
-        if (!cluster.empty()) {
-            int gap = r.first.start - cluster.back().first.end;
+    // Cluster ranges with a cheap, valid score upper bound. A contig's hits
+    // are bounded by its length (span - 12); the repeat guard also rejects any
+    // contig with hits >= 10 and hits/distinct > 2, so accepted contigs have
+    // hits <= max(9, 2 * distinct), and distinct mers cannot exceed the sum of
+    // per-read distinct element mers in the cluster.
+    struct ClusterRange {
+        size_t begin, end;
+        int ub;
+        int span;
+        size_t pos;   // positional (legacy) order, used for tie-breaks
+    };
+    std::vector<ClusterRange> ranges;
+    size_t cb = 0;
+    for (size_t j = 1; j <= ele_reads.size(); ++j) {
+        bool cut = (j == ele_reads.size());
+        if (!cut) {
+            int gap = ele_reads[j].read.start - ele_reads[j - 1].read.end;
             if (gap > args.max_loci_gap ||
-                r.first.chr != cluster.back().first.chr ||
-                r.first.strand != cluster.back().first.strand)
-            {
-                new_cluster = true;
+                ele_reads[j].read.chr != ele_reads[j - 1].read.chr ||
+                ele_reads[j].read.strand != ele_reads[j - 1].read.strand) {
+                cut = true;
             }
         }
-
-        if (new_cluster) {
-            std::vector<std::string> reads_for_graph;
-            reads_for_graph.reserve(cluster.size());
-            for (const auto& c : cluster) {
-                reads_for_graph.push_back(c.second);
+        if (cut) {
+            long long sum_seen = 0, sum_pos = 0;
+            for (size_t k = cb; k < j; ++k) {
+                sum_seen += ele_reads[k].seen;
+                sum_pos += ele_reads[k].pos;
             }
-            std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count,
-                                                   mqm, cur_ele, nullptr, nullptr,
-                                                   args.debug_eles.count(cur_ele) > 0);
-            consider(std::move(contig), cluster_start, cluster.front(), cluster.back());
-            cluster.clear();
-            cluster_start = r.first.start;
+            int span = ele_reads[j - 1].read.end - ele_reads[cb].read.start;
+            long long guard_ub = std::max<long long>(9, 2 * sum_seen);
+            long long ub = std::min<long long>(
+                guard_ub, std::min<long long>(sum_pos, std::max(0, span - 12)));
+            ranges.push_back(ClusterRange{cb, j, static_cast<int>(ub), span, ranges.size()});
+            cb = j;
         }
-        cluster.push_back(r);
     }
 
-    // Last cluster
-    if (!cluster.empty()) {
-        std::vector<std::string> reads_for_graph;
-        reads_for_graph.reserve(cluster.size());
-        for (const auto& c : cluster) {
-            reads_for_graph.push_back(c.second);
-        }
+    // Branch and bound: assemble by descending upper bound and stop once the
+    // bound can no longer match the best score. Clusters whose bound equals the
+    // current best can only tie it, so they are deferred and later examined in
+    // legacy positional order (on equal hits the earliest locus wins, exactly
+    // like the exhaustive positional scan).
+    std::sort(ranges.begin(), ranges.end(),
+              [](const ClusterRange& a, const ClusterRange& b) { return a.ub > b.ub; });
+    bool debug_ele = args.debug_eles.count(cur_ele) > 0;
+    auto try_range = [&](const ClusterRange& cr) {
+        std::vector<std::string> reads_for_graph = sample_cluster(ele_reads, cr.begin, cr.end);
         std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count,
-                                               mqm, cur_ele, nullptr, nullptr,
-                                               args.debug_eles.count(cur_ele) > 0);
-        consider(std::move(contig), cluster_start, cluster.front(), cluster.back());
+                                               mqm, cur_ele, nullptr, nullptr, debug_ele);
+        consider(std::move(contig), ele_reads[cr.begin].read.start,
+                 ele_reads[cr.begin], ele_reads[cr.end - 1], cr.pos);
+    };
+
+    std::vector<const ClusterRange*> ties;
+    for (const auto& cr : ranges) {
+        if (static_cast<double>(cr.ub) < best_score) break;
+        if (cr.span < 20) continue;
+        if (static_cast<double>(cr.ub) == best_score) {
+            ties.push_back(&cr);
+            continue;
+        }
+        try_range(cr);
+    }
+    std::sort(ties.begin(), ties.end(),
+              [](const ClusterRange* a, const ClusterRange* b) { return a->pos < b->pos; });
+    for (const ClusterRange* cr : ties) {
+        if (cr->pos >= best_pos) break;
+        if (static_cast<double>(cr->ub) < best_score) continue;
+        try_range(*cr);
     }
 
     if (!best_did.empty()) {
@@ -759,7 +804,8 @@ int main(int argc, char* argv[]) {
                     }
                     // Repeat ratio check
                     {
-                        tsl::robin_set<uint32_t> seen;
+                        thread_local tsl::robin_set<uint32_t> seen;
+                        seen.clear();
                         int total = 0;
                         int ms = mqm.get_mer_size();
                         for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
