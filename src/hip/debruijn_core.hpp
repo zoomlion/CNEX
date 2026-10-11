@@ -1,5 +1,6 @@
 #pragma once
 #include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -173,6 +174,8 @@ inline std::vector<std::string> greedy_trace(
 ) {
     std::vector<std::string> path;
     std::string current = start;
+    tsl::robin_set<std::string> visited;
+    visited.insert(current);
 
     while (true) {
         path.push_back(current);
@@ -186,6 +189,7 @@ inline std::vector<std::string> greedy_trace(
         int best_dist = -1;
         int best_score = -1;
         for (const auto& neighbor : it->second) {
+            if (visited.count(neighbor)) continue;
             auto dit = start_dists.find(neighbor);
             if (dit == start_dists.end()) continue;
             int dist = static_cast<int>(dit->second);
@@ -202,6 +206,7 @@ inline std::vector<std::string> greedy_trace(
         }
         if (best_next.empty()) break;
         current = best_next;
+        visited.insert(current);
     }
     return path;
 }
