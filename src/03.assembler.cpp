@@ -184,21 +184,28 @@ bool parse_genome_id(const std::string& seq_id, GenomePos& pos) {
     return false;
 }
 
-int score_contig(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
-    int sc = 0;
-    int k = mqm.get_mer_size();
+struct ContigScore {
+    int hits = 0;            // raw matched positions
+    int distinct = 0;        // distinct matched mers
+};
+
+ContigScore score_contig(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
+    ContigScore sc;
     int mer_size = mqm.get_mer_size();
+    tsl::robin_set<uint32_t> seen;
     for (size_t i = 0; i + mer_size <= seq.size(); ++i) {
         try {
             auto code = dna_encoder(seq.substr(i, mer_size));
             auto it = mqm.compressed_mer_query.find(code);
             if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-                ++sc;
+                ++sc.hits;
+                seen.insert(code);
             }
         } catch (...) {
             continue;
         }
     }
+    sc.distinct = static_cast<int>(seen.size());
     return sc;
 }
 
@@ -523,7 +530,7 @@ int main(int argc, char* argv[]) {
 
         // Phase 3: Group and assemble
         std::vector<std::pair<std::string, std::string>> results;
-        struct BestEntry { std::string display_id; std::string seq; int score; };
+        struct BestEntry { std::string display_id; std::string seq; double score; };
         std::map<int, BestEntry> best;
 
         // Open SNP output if requested (reads mode only)
@@ -701,15 +708,19 @@ int main(int argc, char* argv[]) {
                                 }
                             }
                             if (contig.size() >= 20) {
-                                int sc = score_contig(contig, mqm, cur_ele);
-                                char s = cluster[0].first.strand == 1 ? '+' : '-';
-                                std::string did = std::to_string(cur_ele) + "." +
-                                    cluster[0].first.chr + ":" +
-                                    std::to_string(cluster_start) + "-" +
-                                    std::to_string(cluster.back().first.end) + "(" + s + ")";
-                                auto it = best.find(cur_ele);
-                                if (it == best.end() || sc > it->second.score) {
-                                    best[cur_ele] = BestEntry{did, contig, sc};
+                                ContigScore sc = score_contig(contig, mqm, cur_ele);
+                                bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
+                                    static_cast<double>(sc.hits) / sc.distinct > 2.0;
+                                if (!repeat_chimera) {
+                                    char s = cluster[0].first.strand == 1 ? '+' : '-';
+                                    std::string did = std::to_string(cur_ele) + "." +
+                                        cluster[0].first.chr + ":" +
+                                        std::to_string(cluster_start) + "-" +
+                                        std::to_string(cluster.back().first.end) + "(" + s + ")";
+                                    auto it = best.find(cur_ele);
+                                    if (it == best.end() || sc.hits > it->second.score) {
+                                        best[cur_ele] = BestEntry{did, contig, static_cast<double>(sc.hits)};
+                                    }
                                 }
                             }
                         }
@@ -739,15 +750,19 @@ int main(int argc, char* argv[]) {
                             }
                         }
                         if (contig.size() >= 20) {
-                            int sc = score_contig(contig, mqm, cur_ele);
-                            char s = cluster[0].first.strand == 1 ? '+' : '-';
-                            std::string did = std::to_string(cur_ele) + "." +
-                                cluster[0].first.chr + ":" +
-                                std::to_string(cluster_start) + "-" +
-                                std::to_string(cluster.back().first.end) + "(" + s + ")";
-                            auto it = best.find(cur_ele);
-                            if (it == best.end() || sc > it->second.score) {
-                                best[cur_ele] = BestEntry{did, contig, sc};
+                            ContigScore sc = score_contig(contig, mqm, cur_ele);
+                            bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
+                                static_cast<double>(sc.hits) / sc.distinct > 2.0;
+                            if (!repeat_chimera) {
+                                char s = cluster[0].first.strand == 1 ? '+' : '-';
+                                std::string did = std::to_string(cur_ele) + "." +
+                                    cluster[0].first.chr + ":" +
+                                    std::to_string(cluster_start) + "-" +
+                                    std::to_string(cluster.back().first.end) + "(" + s + ")";
+                                auto it = best.find(cur_ele);
+                                if (it == best.end() || sc.hits > it->second.score) {
+                                    best[cur_ele] = BestEntry{did, contig, static_cast<double>(sc.hits)};
+                                }
                             }
                         }
                     }
