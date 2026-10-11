@@ -3,6 +3,7 @@
 
 #include <tsl/robin_set.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +28,7 @@ struct Args {
     int min_count = 2;
     int max_reads = 200;
     int max_loci_gap = 5000;
+    int threads = 4;
     tsl::robin_set<int> debug_eles;
     bool trim = true;
     bool trim_set = false;
@@ -75,6 +78,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--max-loci-gap") {
             if (++i >= argc) throw std::runtime_error("Missing value for --max-loci-gap");
             args.max_loci_gap = std::stoi(argv[i]);
+        } else if (arg == "-t" || arg == "--threads") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --threads");
+            args.threads = std::stoi(argv[i]);
         } else if (arg == "--debug-ele") {
             if (++i >= argc) throw std::runtime_error("Missing value for --debug-ele");
             std::string list = argv[i];
@@ -445,6 +451,157 @@ void trim_contig_sw(std::string& seq, const std::string& ref,
 }
 
 
+struct GenomeResult {
+    int ele_id;
+    std::string display_id;
+    std::string seq;
+};
+
+static void process_genome_element(
+    const std::vector<Read>& all_reads, size_t begin, size_t end,
+    const Args& args, const MerQueryManager& mqm,
+    const std::unordered_map<int, std::string>& cne_refs,
+    std::vector<GenomeResult>& out)
+{
+    const int cur_ele = all_reads[begin].ele_id;
+    std::vector<std::pair<Read, std::string>> ele_reads;
+    ele_reads.reserve(args.max_reads);
+    int cnt = 0;
+    size_t idx = begin;
+    while (idx < end && cnt < args.max_reads) {
+        const auto& r = all_reads[idx];
+        std::string local_seq = r.seq;
+        for (char& c : local_seq) {
+            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+        }
+        for (char& c : local_seq) {
+            if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
+        }
+        if (r.strand == -1) {
+            thread_local std::string _rc;
+            reverse_complement(local_seq, _rc);
+            local_seq = _rc;
+        }
+        // Repeat ratio check for genome mode
+        {
+            tsl::robin_set<uint32_t> seen;
+            int total = 0;
+            int ms = mqm.get_mer_size();
+            for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
+                uint32_t code;
+                if (encode_mer_at(local_seq, k, ms, code)) {
+                    auto it = mqm.compressed_mer_query.find(code);
+                    if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, cur_ele)) {
+                        ++total;
+                        seen.insert(code);
+                    }
+                }
+            }
+            double ratio = (double)total / std::max(1, (int)seen.size());
+            if (ratio > args.repeat_ratio) {
+                ++idx;
+                ++cnt;
+                continue;
+            }
+        }
+        ele_reads.emplace_back(r, std::move(local_seq));
+        ++idx;
+        ++cnt;
+    }
+    if (ele_reads.empty()) return;
+
+    // Cluster by locus
+    std::sort(ele_reads.begin(), ele_reads.end(),
+        [](const auto& a, const auto& b) {
+            if (a.first.chr != b.first.chr) return a.first.chr < b.first.chr;
+            if (a.first.strand != b.first.strand) return a.first.strand > b.first.strand;
+            return a.first.start < b.first.start;
+        });
+
+    std::string best_did;
+    std::string best_seq;
+    double best_score = -1.0;
+
+    auto consider = [&](std::string contig, int cluster_start,
+                        const std::pair<Read, std::string>& first_r,
+                        const std::pair<Read, std::string>& last_r) {
+        if (contig.empty()) return;
+        if (args.trim) {
+            auto it = cne_refs.find(cur_ele);
+            if (it != cne_refs.end()) {
+                trim_contig_sw(contig, it->second, mqm, cur_ele);
+            } else {
+                trim_contig(contig, mqm, cur_ele);
+            }
+        }
+        if (contig.size() < 20) return;
+        ContigScore sc = score_contig(contig, mqm, cur_ele);
+        bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
+            static_cast<double>(sc.hits) / sc.distinct > 2.0;
+        if (repeat_chimera) return;
+        char s = first_r.first.strand == 1 ? '+' : '-';
+        std::string did = std::to_string(cur_ele) + "." +
+            first_r.first.chr + ":" +
+            std::to_string(cluster_start) + "-" +
+            std::to_string(last_r.first.end) + "(" + s + ")";
+        if (best_did.empty() || sc.hits > best_score) {
+            best_did = std::move(did);
+            best_seq = std::move(contig);
+            best_score = static_cast<double>(sc.hits);
+        }
+    };
+
+    // Per-locus assembly
+    std::vector<std::pair<Read, std::string>> cluster;
+    int cluster_start = ele_reads[0].first.start;
+
+    for (size_t j = 0; j < ele_reads.size(); ++j) {
+        const auto& r = ele_reads[j];
+        bool new_cluster = false;
+        if (!cluster.empty()) {
+            int gap = r.first.start - cluster.back().first.end;
+            if (gap > args.max_loci_gap ||
+                r.first.chr != cluster.back().first.chr ||
+                r.first.strand != cluster.back().first.strand)
+            {
+                new_cluster = true;
+            }
+        }
+
+        if (new_cluster) {
+            std::vector<std::string> reads_for_graph;
+            reads_for_graph.reserve(cluster.size());
+            for (const auto& c : cluster) {
+                reads_for_graph.push_back(c.second);
+            }
+            std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count,
+                                                   mqm, cur_ele, nullptr, nullptr,
+                                                   args.debug_eles.count(cur_ele) > 0);
+            consider(std::move(contig), cluster_start, cluster.front(), cluster.back());
+            cluster.clear();
+            cluster_start = r.first.start;
+        }
+        cluster.push_back(r);
+    }
+
+    // Last cluster
+    if (!cluster.empty()) {
+        std::vector<std::string> reads_for_graph;
+        reads_for_graph.reserve(cluster.size());
+        for (const auto& c : cluster) {
+            reads_for_graph.push_back(c.second);
+        }
+        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count,
+                                               mqm, cur_ele, nullptr, nullptr,
+                                               args.debug_eles.count(cur_ele) > 0);
+        consider(std::move(contig), cluster_start, cluster.front(), cluster.back());
+    }
+
+    if (!best_did.empty()) {
+        out.push_back(GenomeResult{cur_ele, std::move(best_did), std::move(best_seq)});
+    }
+}
+
 int main(int argc, char* argv[]) {
     try {
         Args args = parse_args(argc, argv);
@@ -460,6 +617,7 @@ int main(int argc, char* argv[]) {
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
+                      << "  -t, --threads <n>     Worker threads for genome-mode assembly (default: 4)\n"
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
@@ -560,8 +718,6 @@ int main(int argc, char* argv[]) {
 
         // Phase 3: Group and assemble
         std::vector<std::pair<std::string, std::string>> results;
-        struct BestEntry { std::string display_id; std::string seq; double score; };
-        std::map<int, BestEntry> best;
 
         // Open SNP output if requested (reads mode only)
         std::ofstream snp_stream, gfa_stream;
@@ -576,12 +732,11 @@ int main(int argc, char* argv[]) {
             gfa_out_ptr = &gfa_stream;
         }
 
-        size_t idx = 0;
-        while (idx < all_reads.size()) {
-            // Start of a new element
-            int cur_ele = all_reads[idx].ele_id;
+        if (!is_genome) {
+            size_t idx = 0;
+            while (idx < all_reads.size()) {
+                int cur_ele = all_reads[idx].ele_id;
 
-            if (!is_genome) {
                 // Reads mode: one group per element
                 std::vector<std::string> reads;
                 reads.reserve(args.max_reads);
@@ -643,174 +798,50 @@ int main(int argc, char* argv[]) {
                 if (contig.size() < 20) continue;
 
                 results.emplace_back(std::to_string(cur_ele), contig);
+            }
+        } else {
+            // Element blocks: all_reads is sorted by ele_id
+            std::vector<std::pair<size_t, size_t>> blocks;
+            {
+                size_t i = 0;
+                while (i < all_reads.size()) {
+                    size_t j = i + 1;
+                    while (j < all_reads.size() && all_reads[j].ele_id == all_reads[i].ele_id) ++j;
+                    blocks.emplace_back(i, j);
+                    i = j;
+                }
+            }
+            std::vector<GenomeResult> grs;
+            const int nthreads = std::max(1, args.threads);
+            if (nthreads == 1) {
+                for (const auto& b : blocks) {
+                    process_genome_element(all_reads, b.first, b.second, args, mqm, cne_refs, grs);
+                }
             } else {
-                // Genome mode: collect all reads for this element
-                std::vector<std::pair<Read, std::string>> ele_reads; // (read, local_seq)
-                ele_reads.reserve(args.max_reads);
-                int cnt = 0;
-                while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele && cnt < args.max_reads) {
-                    auto& r = all_reads[idx];
-                    std::string local_seq = r.seq;
-                    for (char& c : local_seq) {
-                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-                    }
-                    for (char& c : local_seq) {
-                        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
-                    }
-                    if (r.strand == -1) {
-                        thread_local std::string _rc;
-                        reverse_complement(local_seq, _rc);
-                        local_seq = _rc;
-                    }
-                    // Repeat ratio check for genome mode
-                    {
-                        tsl::robin_set<uint32_t> seen;
-                        int total = 0;
-                        int ms = mqm.get_mer_size();
-                        for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
-                            uint32_t code;
-                            if (encode_mer_at(local_seq, k, ms, code)) {
-                                auto it = mqm.compressed_mer_query.find(code);
-                                if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, cur_ele)) {
-                                    ++total;
-                                    seen.insert(code);
-                                }
-                            }
+                std::atomic<size_t> next_block{0};
+                std::vector<std::vector<GenomeResult>> per_thread(nthreads);
+                std::vector<std::thread> workers;
+                workers.reserve(nthreads);
+                for (int t = 0; t < nthreads; ++t) {
+                    workers.emplace_back([&, t]() {
+                        while (true) {
+                            size_t bi = next_block.fetch_add(1);
+                            if (bi >= blocks.size()) break;
+                            process_genome_element(all_reads, blocks[bi].first, blocks[bi].second,
+                                                   args, mqm, cne_refs, per_thread[t]);
                         }
-                        double ratio = (double)total / std::max(1, (int)seen.size());
-                        if (ratio > args.repeat_ratio) {
-                            ++idx;
-                            ++cnt;
-                            continue;
-                        }
-                    }
-                    ele_reads.emplace_back(r, std::move(local_seq));
-                    ++idx;
-                    ++cnt;
-                }
-                while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele) ++idx;
-
-                // Cluster by locus
-                auto sort_key = [](const std::pair<Read, std::string>& a) {
-                    return std::make_tuple(a.first.chr, a.first.strand, a.first.start);
-                };
-                std::sort(ele_reads.begin(), ele_reads.end(),
-                    [](const auto& a, const auto& b) {
-                        if (a.first.chr != b.first.chr) return a.first.chr < b.first.chr;
-                        if (a.first.strand != b.first.strand) return a.first.strand > b.first.strand;
-                        return a.first.start < b.first.start;
                     });
-
-                // Per-locus assembly
-                std::vector<std::pair<Read, std::string>> cluster;
-                int cluster_start = ele_reads[0].first.start;
-                std::string best_display_id;
-
-                for (size_t j = 0; j < ele_reads.size(); ++j) {
-                    const auto& r = ele_reads[j];
-                    bool new_cluster = false;
-                    if (!cluster.empty()) {
-                        int gap = r.first.start - cluster.back().first.end;
-                        if (gap > args.max_loci_gap ||
-                            r.first.chr != cluster.back().first.chr ||
-                            r.first.strand != cluster.back().first.strand)
-                        {
-                            new_cluster = true;
-                        }
-                    }
-
-                    if (new_cluster) {
-                        // Assemble current cluster
-                        std::vector<std::string> reads_for_graph;
-                        reads_for_graph.reserve(cluster.size());
-                        for (const auto& c : cluster) {
-                            reads_for_graph.push_back(c.second);
-                        }
-
-                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr, args.debug_eles.count(cur_ele) > 0);
-                        if (!contig.empty()) {
-                            if (args.trim) {
-                                auto it = cne_refs.find(cur_ele);
-                                if (it != cne_refs.end()) {
-                                    trim_contig_sw(contig, it->second, mqm, cur_ele);
-                                } else {
-                                    trim_contig(contig, mqm, cur_ele);
-                                }
-                            }
-                            if (contig.size() >= 20) {
-                                ContigScore sc = score_contig(contig, mqm, cur_ele);
-                                bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
-                                    static_cast<double>(sc.hits) / sc.distinct > 2.0;
-                                if (!repeat_chimera) {
-                                    char s = cluster[0].first.strand == 1 ? '+' : '-';
-                                    std::string did = std::to_string(cur_ele) + "." +
-                                        cluster[0].first.chr + ":" +
-                                        std::to_string(cluster_start) + "-" +
-                                        std::to_string(cluster.back().first.end) + "(" + s + ")";
-                                    auto it = best.find(cur_ele);
-                                    if (it == best.end() || sc.hits > it->second.score) {
-                                        best[cur_ele] = BestEntry{did, contig, static_cast<double>(sc.hits)};
-                                    }
-                                }
-                            }
-                        }
-
-                        cluster.clear();
-                        cluster_start = r.first.start;
-                    }
-                    cluster.push_back(r);
                 }
-
-                // Last cluster
-                if (!cluster.empty()) {
-                    std::vector<std::string> reads_for_graph;
-                    reads_for_graph.reserve(cluster.size());
-                    for (const auto& c : cluster) {
-                        reads_for_graph.push_back(c.second);
-                    }
-
-                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr, args.debug_eles.count(cur_ele) > 0);
-                    if (!contig.empty()) {
-                        if (args.trim) {
-                            auto it = cne_refs.find(cur_ele);
-                            if (it != cne_refs.end()) {
-                                trim_contig_sw(contig, it->second, mqm, cur_ele);
-                            } else {
-                                trim_contig(contig, mqm, cur_ele);
-                            }
-                        }
-                        if (contig.size() >= 20) {
-                            ContigScore sc = score_contig(contig, mqm, cur_ele);
-                            bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
-                                static_cast<double>(sc.hits) / sc.distinct > 2.0;
-                            if (!repeat_chimera) {
-                                char s = cluster[0].first.strand == 1 ? '+' : '-';
-                                std::string did = std::to_string(cur_ele) + "." +
-                                    cluster[0].first.chr + ":" +
-                                    std::to_string(cluster_start) + "-" +
-                                    std::to_string(cluster.back().first.end) + "(" + s + ")";
-                                auto it = best.find(cur_ele);
-                                if (it == best.end() || sc.hits > it->second.score) {
-                                    best[cur_ele] = BestEntry{did, contig, static_cast<double>(sc.hits)};
-                                }
-                            }
-                        }
-                    }
+                for (auto& w : workers) w.join();
+                for (auto& v : per_thread) {
+                    for (auto& r : v) grs.push_back(std::move(r));
                 }
             }
-        }
-
-        // For genome mode: collect best results
-        if (is_genome) {
-            for (const auto& [eid, entry] : best) {
-                results.emplace_back(entry.display_id, entry.seq);
+            std::sort(grs.begin(), grs.end(),
+                [](const GenomeResult& a, const GenomeResult& b) { return a.ele_id < b.ele_id; });
+            for (auto& r : grs) {
+                results.emplace_back(std::move(r.display_id), std::move(r.seq));
             }
-            std::sort(results.begin(), results.end(),
-                [](const auto& a, const auto& b) {
-                    int id_a = std::stoi(a.first.substr(0, a.first.find('.')));
-                    int id_b = std::stoi(b.first.substr(0, b.first.find('.')));
-                    return id_a < id_b;
-                });
         }
 
         // Phase 4: Write output
