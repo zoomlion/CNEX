@@ -21,31 +21,37 @@ using KmerCounts = tsl::robin_map<std::string, int>;
 using EdgeCounts = tsl::robin_map<std::string, int>;  // "src\ttgt" → read count
 
 inline std::tuple<Graph, KmerCounts, EdgeCounts> de_bruijn_graph(
-    const std::vector<std::string>& reads, uint64_t k, int min_count = 1
+    const std::vector<std::string>& reads, uint64_t k, int min_count = 1,
+    bool need_kcounts = false, bool need_ecounts = false
 ) {
     tsl::robin_map<std::string_view, int> sv_raw;
     KmerCounts k_counts;
     EdgeCounts e_counts;
     sv_raw.reserve(reads.size() * 10);
-    k_counts.reserve(reads.size() * 2);
-    e_counts.reserve(reads.size());
+    if (need_kcounts) k_counts.reserve(reads.size() * 2);
+    if (need_ecounts) e_counts.reserve(reads.size());
 
     for (const auto& read : reads) {
         if (read.length() < (k + 1)) continue;
         auto sv = std::string_view(read);
-        for (size_t i = 0; i <= read.length() - k; ++i)
-            k_counts[std::string(sv.substr(i, k))]++;
+        if (need_kcounts) {
+            for (size_t i = 0; i <= read.length() - k; ++i)
+                k_counts[std::string(sv.substr(i, k))]++;
+        }
         for (size_t i = 0; i <= read.length() - (k + 1); ++i)
             sv_raw[sv.substr(i, k + 1)]++;
     }
 
-    std::set<std::pair<std::string_view, std::string_view>> valid_edges;
+    std::vector<std::pair<std::string_view, std::string_view>> valid_edges;
+    valid_edges.reserve(sv_raw.size());
     for (const auto& [kmer, count] : sv_raw) {
         if (count < min_count) continue;
-        auto prefix = kmer.substr(0, k);
-        auto suffix = kmer.substr(1, k);
-        valid_edges.insert({prefix, suffix});
+        valid_edges.emplace_back(kmer.substr(0, k), kmer.substr(1, k));
     }
+    // Same ordering as std::set over the (prefix, suffix) pairs.
+    std::sort(valid_edges.begin(), valid_edges.end());
+    valid_edges.erase(std::unique(valid_edges.begin(), valid_edges.end()),
+                      valid_edges.end());
 
     // Build graph and count edge traversals (per read, dedup)
     Graph graph;
@@ -54,26 +60,29 @@ inline std::tuple<Graph, KmerCounts, EdgeCounts> de_bruijn_graph(
         graph[std::string(edge.first)].push_back(std::string(edge.second));
     }
 
-    // Count edge traversals: each read counts each edge at most once
-    for (const auto& read : reads) {
-        if (read.length() < (k + 1)) continue;
-        auto sv = std::string_view(read);
-        std::set<std::string> seen_edges;
-        for (size_t i = 0; i <= read.length() - (k + 1); ++i) {
-            auto kmer = sv.substr(i, k + 1);
-            auto prefix = std::string(kmer.substr(0, k));
-            auto suffix = std::string(kmer.substr(1, k));
-            auto git = graph.find(prefix);
-            if (git == graph.end()) continue;
-            bool has_edge = false;
-            for (const auto& tgt : git->second) {
-                if (tgt == suffix) { has_edge = true; break; }
-            }
-            if (has_edge) {
-                std::string ekey = prefix + "\t" + suffix;
-                if (seen_edges.find(ekey) == seen_edges.end()) {
-                    seen_edges.insert(ekey);
-                    e_counts[ekey]++;
+    // Count edge traversals: each read counts each edge at most once.
+    // Only needed for SNP calling; skipped when not requested.
+    if (need_ecounts) {
+        for (const auto& read : reads) {
+            if (read.length() < (k + 1)) continue;
+            auto sv = std::string_view(read);
+            std::set<std::string> seen_edges;
+            for (size_t i = 0; i <= read.length() - (k + 1); ++i) {
+                auto kmer = sv.substr(i, k + 1);
+                auto prefix = std::string(kmer.substr(0, k));
+                auto suffix = std::string(kmer.substr(1, k));
+                auto git = graph.find(prefix);
+                if (git == graph.end()) continue;
+                bool has_edge = false;
+                for (const auto& tgt : git->second) {
+                    if (tgt == suffix) { has_edge = true; break; }
+                }
+                if (has_edge) {
+                    std::string ekey = prefix + "\t" + suffix;
+                    if (seen_edges.find(ekey) == seen_edges.end()) {
+                        seen_edges.insert(ekey);
+                        e_counts[ekey]++;
+                    }
                 }
             }
         }
