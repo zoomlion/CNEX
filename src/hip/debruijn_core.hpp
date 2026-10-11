@@ -309,6 +309,127 @@ inline std::vector<std::string> trace_longest_path(
 }
 
 
+inline std::string path_to_string(const std::vector<std::string>& path) {
+    if (path.empty()) return "";
+    std::string s = path[0];
+    for (size_t i = 1; i < path.size(); ++i) s += path[i].back();
+    return s;
+}
+
+
+// Evidence-anchored walk: seeded at the highest-scoring node, extends both
+// directions preferring element-scored neighbors, bridging short unscored gaps.
+// Used as a second pass when the topology-driven path carries no element evidence.
+inline std::vector<std::string> anchored_trace(
+    const Graph& graph,
+    const std::unordered_map<std::string, int>& node_scores,
+    uint64_t max_path_length = 2500,
+    int gap_limit = 3)
+{
+    if (graph.empty() || node_scores.empty()) return {};
+
+    std::unordered_map<std::string, std::vector<std::string>> rev;
+    rev.reserve(graph.size());
+    for (const auto& [node, nexts] : graph)
+        for (const auto& nx : nexts) rev[nx].push_back(node);
+
+    auto get_score = [&](const std::string& n) {
+        auto it = node_scores.find(n);
+        return it == node_scores.end() ? 0 : it->second;
+    };
+    auto degree = [&](const std::string& n) {
+        auto it = graph.find(n);
+        size_t out = (it == graph.end()) ? 0 : it->second.size();
+        auto rit = rev.find(n);
+        size_t in = (rit == rev.end()) ? 0 : rit->second.size();
+        return out + in;
+    };
+
+    std::string seed;
+    int best_sc = 0;
+    size_t best_deg = 0;
+    for (const auto& [node, _] : graph) {
+        int sc = get_score(node);
+        if (sc <= 0) continue;
+        size_t deg = degree(node);
+        if (sc > best_sc || (sc == best_sc && deg > best_deg)) {
+            best_sc = sc; best_deg = deg; seed = node;
+        }
+    }
+    if (seed.empty()) return {};
+
+    auto walk = [&](const Graph& g, const std::string& start) {
+        std::vector<std::string> path;
+        tsl::robin_set<std::string> visited;
+        std::string cur = start;
+        visited.insert(cur);
+        int gap = 0;
+        while (path.size() + 1 < max_path_length) {
+            path.push_back(cur);
+            auto it = g.find(cur);
+            if (it == g.end() || it->second.empty()) break;
+            std::string chosen;
+            int chosen_sc = -1;
+            size_t chosen_deg = 0;
+            for (const auto& nx : it->second) {
+                if (visited.count(nx)) continue;
+                int sc = get_score(nx);
+                if (sc <= 0) continue;
+                size_t deg = degree(nx);
+                if (sc > chosen_sc || (sc == chosen_sc && deg > chosen_deg)) {
+                    chosen = nx; chosen_sc = sc; chosen_deg = deg;
+                }
+            }
+            if (chosen.empty()) {
+                if (gap >= gap_limit) break;
+                int allowed = gap_limit - gap;
+                int best_reach = -1;
+                for (const auto& nx : it->second) {
+                    if (visited.count(nx)) continue;
+                    tsl::robin_set<std::string> seen = visited;
+                    seen.insert(nx);
+                    std::vector<std::string> frontier{nx};
+                    int reach = -1;
+                    for (int d = 1; d <= allowed && reach < 0; ++d) {
+                        std::vector<std::string> next_frontier;
+                        for (const auto& f : frontier) {
+                            auto fit = g.find(f);
+                            if (fit == g.end()) continue;
+                            for (const auto& f2 : fit->second) {
+                                if (seen.count(f2)) continue;
+                                int sc2 = get_score(f2);
+                                if (sc2 > 0) { reach = sc2; break; }
+                                seen.insert(f2);
+                                next_frontier.push_back(f2);
+                            }
+                            if (reach >= 0) break;
+                        }
+                        frontier = std::move(next_frontier);
+                    }
+                    if (reach > best_reach) { best_reach = reach; chosen = nx; }
+                }
+                if (chosen.empty()) break;
+                ++gap;
+            } else {
+                gap = 0;
+            }
+            visited.insert(chosen);
+            cur = chosen;
+        }
+        return path;
+    };
+
+    auto fwd = walk(graph, seed);
+    auto bwd = walk(rev, seed);
+
+    std::vector<std::string> path;
+    for (auto rit = bwd.rbegin(); rit != bwd.rend(); ++rit)
+        if (*rit != seed) path.push_back(*rit);
+    path.insert(path.end(), fwd.begin(), fwd.end());
+    return path;
+}
+
+
 inline std::string assemble_sequence(const Graph& graph,
                                const std::unordered_map<std::string, int>& node_scores,
                                std::vector<std::string>* out_path = nullptr) {

@@ -26,6 +26,7 @@ struct Args {
     int min_count = 2;
     int max_reads = 200;
     int max_loci_gap = 5000;
+    tsl::robin_set<int> debug_eles;
     bool trim = true;
     bool trim_set = false;
     bool no_trim_set = false;
@@ -74,6 +75,16 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--max-loci-gap") {
             if (++i >= argc) throw std::runtime_error("Missing value for --max-loci-gap");
             args.max_loci_gap = std::stoi(argv[i]);
+        } else if (arg == "--debug-ele") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --debug-ele");
+            std::string list = argv[i];
+            size_t p = 0;
+            while (p < list.size()) {
+                size_t q = list.find(',', p);
+                if (q == std::string::npos) q = list.size();
+                if (q > p) args.debug_eles.insert(std::stoi(list.substr(p, q - p)));
+                p = q + 1;
+            }
         } else if (arg == "--trim") {
             args.trim = true;
             args.trim_set = true;
@@ -238,7 +249,8 @@ std::unordered_map<std::string, int> build_node_scores(
 std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
                                int min_count, const MerQueryManager& mqm, int ele_id,
                                std::ofstream* snp_out = nullptr,
-                               std::ofstream* gfa_out = nullptr)
+                               std::ofstream* gfa_out = nullptr,
+                               bool debug = false)
 {
     auto [graph, kmer_counts, e_counts] = de_bruijn_graph(reads, k, min_count);
     if (graph.empty()) return "";
@@ -249,6 +261,24 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
 
     std::vector<std::string> contig_path;
     std::string contig = assemble_sequence(graph, node_scores, &contig_path);
+
+    if (!node_scores.empty() && !contig.empty()) {
+        ContigScore cs1 = score_contig(contig, mqm, ele_id);
+        if (cs1.hits < 3) {
+            auto path2 = anchored_trace(graph, node_scores);
+            std::string contig2 = path_to_string(path2);
+            ContigScore cs2 = score_contig(contig2, mqm, ele_id);
+            if (debug)
+                std::cerr << "DBG ele=" << ele_id << " pass1 hits=" << cs1.hits
+                          << " len=" << contig.size() << " | pass2 hits=" << cs2.hits
+                          << " len=" << contig2.size()
+                          << (cs2.hits > cs1.hits ? " USE2" : " keep1") << "\n";
+            if (cs2.hits > cs1.hits) {
+                contig = std::move(contig2);
+                contig_path = std::move(path2);
+            }
+        }
+    }
 
     bool has_var = false;
     if (snp_out && !contig_path.empty())
@@ -697,7 +727,7 @@ int main(int argc, char* argv[]) {
                             reads_for_graph.push_back(c.second);
                         }
 
-                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
+                        std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr, args.debug_eles.count(cur_ele) > 0);
                         if (!contig.empty()) {
                             if (args.trim) {
                                 auto it = cne_refs.find(cur_ele);
@@ -739,7 +769,7 @@ int main(int argc, char* argv[]) {
                         reads_for_graph.push_back(c.second);
                     }
 
-                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
+                    std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr, args.debug_eles.count(cur_ele) > 0);
                     if (!contig.empty()) {
                         if (args.trim) {
                             auto it = cne_refs.find(cur_ele);
