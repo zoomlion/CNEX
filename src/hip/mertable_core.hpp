@@ -44,7 +44,7 @@ public:
     }
     size_t k;
     float min_entropy;
-    int max_assign = 5;
+    int max_assign = 0;   // 0 = keep all assignments
 
     TableMer(size_t input_k = 13, float input_min_entropy = 1.4f)
         : k(input_k), min_entropy(input_min_entropy) {}
@@ -89,8 +89,8 @@ public:
     void dump(const std::string& filename) {
         std::ofstream out(filename);
         for (const auto& [key, assigns] : merTable) {
-            // A k-mer with too many loci/elements is a repeat signal: drop it entirely
-            if (static_cast<int>(assigns.size()) > max_assign) continue;
+            // Optional build-time cap; 0 keeps every assignment (default)
+            if (max_assign > 0 && static_cast<int>(assigns.size()) > max_assign) continue;
             std::string mer = int2mer(key);
             for (const auto& a : assigns) {
                 out << mer << "\t" << a.bunch_id << "\t" << a.loci << "\t" << a.count << "\n";

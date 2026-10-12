@@ -14,7 +14,7 @@ struct Args {
     int k = 13;
     int min_c = 4;
     float min_entropy = 1.2f;
-    int max_assign = 5;
+    int max_assign = 0;   // 0 = keep all assignments
     std::string output = "mers_table.tsv";
     bool help_requested = false;
 };
@@ -158,8 +158,9 @@ int main(int argc, char* argv[]) {
                       << "\nOptions:\n"
                       << "  -k, --mer-size <n>    K-mer size (default: 13)\n"
                       << "  -c, --min-c <n>       Minimum species count (default: 4)\n"
-                      << "  -a, --max-assign <n>  Max (element, locus) assignments per k-mer;\n"
-                      << "                        k-mers with more assignments are dropped as repeats (default: 5)\n"
+                      << "  -a, --max-assign <n>  Optional build-time cap: drop k-mers with more than n\n"
+                      << "                        (element, locus) assignments (default: 0 = keep all;\n"
+                      << "                        filtering is normally done at validate load time)\n"
                       << "  --min-entropy <f>     Minimum k-mer entropy (default: 1.2)\n"
                       << "  -o, --output <file>    Output TSV (default: mers_table.tsv)\n";
             return 1;

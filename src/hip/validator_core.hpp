@@ -17,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -288,7 +289,10 @@ public:
         if (mer_size == 0) mer_size = static_cast<int>(mer.length());
     }
 
-    void load_from_file(const std::string& path) {
+    // Load a mers table. Rows are grouped per k-mer (dump order). When
+    // max_assign > 0, groups with more than max_assign (element, locus)
+    // assignments are dropped at load time (repeat/paralog filter); 0 = keep all.
+    void load_from_file(const std::string& path, int max_assign = 0) {
         std::ifstream file(path);
         if (!file.is_open()) {
             throw std::runtime_error("Cannot open mers file: " + path);
@@ -301,13 +305,27 @@ public:
 
         std::string line;
         uint32_t cur_key = 0;
-        size_t cur_off = 0;
-        uint32_t cur_cnt = 0;
         bool have_cur = false;
-        auto flush_range = [&]() {
-            if (have_cur && cur_cnt > 0) {
-                compressed_mer_query[cur_key] = pack_range(cur_off, cur_cnt);
+        std::vector<std::pair<int, int>> group;
+        group.reserve(64);
+        long long kept_mers = 0, kept_rows = 0, dropped_mers = 0, dropped_rows = 0;
+        long long shared_mers = 0;
+
+        auto flush_group = [&]() {
+            if (!have_cur) return;
+            const int sz = static_cast<int>(group.size());
+            if (sz > 1) ++shared_mers;
+            if (max_assign == 0 || sz <= max_assign) {
+                const size_t off = assign_arena.size();
+                assign_arena.insert(assign_arena.end(), group.begin(), group.end());
+                compressed_mer_query[cur_key] = pack_range(off, group.size());
+                ++kept_mers;
+                kept_rows += sz;
+            } else {
+                ++dropped_mers;
+                dropped_rows += sz;
             }
+            group.clear();
         };
 
         while (std::getline(file, line)) {
@@ -340,16 +358,25 @@ public:
             int loci = 0;
             for (const char* q = t2 + 1; q < loci_end; ++q) loci = loci * 10 + (*q - '0');
             if (!have_cur || encoded_mer != cur_key) {
-                flush_range();
+                flush_group();
                 cur_key = encoded_mer;
-                cur_off = assign_arena.size();
-                cur_cnt = 0;
                 have_cur = true;
             }
-            assign_arena.push_back({id, loci});
-            ++cur_cnt;
+            group.emplace_back(id, loci);
         }
-        flush_range();
+        flush_group();
+
+        if (max_assign > 0) {
+            const long long total_mers = kept_mers + dropped_mers;
+            std::cerr << "  mer load filter: max-assign=" << max_assign
+                      << "  kept " << kept_mers << " mers/" << kept_rows << " rows"
+                      << "  dropped " << dropped_mers << " mers/" << dropped_rows << " rows";
+            if (total_mers > 0) {
+                std::cerr << " (" << (100.0 * static_cast<double>(dropped_mers) /
+                                      static_cast<double>(total_mers)) << "% mers)";
+            }
+            std::cerr << "  shared(>1 assign): " << shared_mers << "\n";
+        }
     }
 
     int get_mer_size() const { return mer_size; }

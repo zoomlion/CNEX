@@ -48,6 +48,8 @@ struct Args {
     std::string pigz_path = "pigz/pigz";
     int max_diff = 2;
     double vote_frac = 0.1;
+    // Load-time cap on (element, locus) assignments per k-mer; 0 = keep all.
+    int max_assign = 3;
     // Extra gate rows from --tiers (appended on top of T1 and T2).
     std::vector<GateTier> extra_tiers;
     bool help_requested = false;
@@ -493,6 +495,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--vote-frac") {
             if (++i >= argc) throw std::runtime_error("Missing value for --vote-frac");
             args.vote_frac = std::stod(argv[i]);
+        } else if (arg == "--max-assign") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --max-assign");
+            args.max_assign = std::stoi(argv[i]);
         } else if (arg == "--tiers") {
             if (++i >= argc) throw std::runtime_error("Missing value for --tiers");
             for (auto& t : parse_tiers(argv[i])) args.extra_tiers.push_back(t);
@@ -573,6 +578,8 @@ int main(int argc, char* argv[]) {
                       << "  --max-diff <n>        chain gap tolerance, all rows (default: 2)\n"
                       << "  --vote-frac <f>       min fraction of k-mers for top CNE vote, all rows\n"
                       << "                        (default: 0.1)\n"
+                      << "  --max-assign <n>      Load-time cap: k-mers with more than n (element, locus)\n"
+                      << "                        assignments are dropped (default: 3; 0 = keep all)\n"
                       << "  --tiers \"<rv,mc[,ms]> <rv,mc[,ms]> ...\"\n"
                       << "                        space-separated extra OR gate rows appended on top\n"
                       << "                        of the fixed T1 (3.0,7,25) and T2 (2.0,10,30) rows;\n"
@@ -599,7 +606,7 @@ int main(int argc, char* argv[]) {
         // Load mers table
         std::cerr << "Loading mers table from " << args.mers_file << " ...\n";
         MerQueryManager mqm;
-        mqm.load_from_file(args.mers_file);
+        mqm.load_from_file(args.mers_file, args.max_assign);
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
 

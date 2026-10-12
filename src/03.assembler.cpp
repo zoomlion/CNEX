@@ -28,6 +28,7 @@ struct Args {
     int min_count = 2;
     int max_reads = 200;
     int max_loci_gap = 5000;
+    int max_assign = 3;   // load-time cap; 0 = keep all
     int threads = 4;
     tsl::robin_set<int> debug_eles;
     bool trim = true;
@@ -78,6 +79,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--max-loci-gap") {
             if (++i >= argc) throw std::runtime_error("Missing value for --max-loci-gap");
             args.max_loci_gap = std::stoi(argv[i]);
+        } else if (arg == "--max-assign") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --max-assign");
+            args.max_assign = std::stoi(argv[i]);
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) throw std::runtime_error("Missing value for --threads");
             args.threads = std::stoi(argv[i]);
@@ -294,12 +298,12 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
 void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
     if (seq.size() < 26) return;
     int mer_size = mqm.get_mer_size();
-    int n = static_cast<int>(seq.size()) - 12;
+    int n = static_cast<int>(seq.size()) - mer_size + 1;
 
     int first_hit = -1, last_hit = -1;
     for (int i = 0; i < n; ++i) {
         uint32_t code;
-        if (!encode_mer_at(seq, static_cast<size_t>(i), 13, code)) continue;
+        if (!encode_mer_at(seq, static_cast<size_t>(i), mer_size, code)) continue;
         auto it = mqm.compressed_mer_query.find(code);
         if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
             if (first_hit < 0) first_hit = i;
@@ -312,7 +316,7 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
     int margin = 6;
     int start = std::max(0, first_hit - margin);
     int end = std::min(n, last_hit + margin);
-    auto trimmed = seq.substr(start, end + 12 - start);
+    auto trimmed = seq.substr(start, end + mer_size - 1 - start);
     if (trimmed.size() >= 20) {
         seq = std::move(trimmed);
     }
@@ -664,6 +668,8 @@ int main(int argc, char* argv[]) {
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
+                      << "  --max-assign <n>      Load-time cap on (element, locus) assignments per\n"
+                      << "                        k-mer, must match validate (default: 3; 0 = keep all)\n"
                       << "  -t, --threads <n>     Worker threads for genome-mode assembly (default: 4)\n"
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
@@ -675,7 +681,7 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "Loading mers table from " << args.mers_file << " ...\n";
         MerQueryManager mqm;
-        mqm.load_from_file(args.mers_file);
+        mqm.load_from_file(args.mers_file, args.max_assign);
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
 
