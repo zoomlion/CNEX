@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <stdexcept>
@@ -254,23 +255,33 @@ public:
 
         while (std::getline(file, line)) {
             if (line.empty()) continue;
-            size_t t1 = line.find('\t');
-            if (t1 == std::string::npos) continue;
-            size_t t2 = line.find('\t', t1 + 1);
-            if (t2 == std::string::npos) continue;
-            size_t t3 = line.find('\t', t2 + 1);
-            std::string loc_s = (t3 == std::string::npos)
-                                ? line.substr(t2 + 1)
-                                : line.substr(t2 + 1, t3 - t2 - 1);
-            int id = std::stoi(line.substr(t1 + 1, t2 - t1 - 1));
-            int loci = std::stoi(loc_s);
-            if (mer_size == 0) mer_size = static_cast<int>(t1);
-            uint32_t encoded_mer;
-            try {
-                encoded_mer = dna_encoder(line.substr(0, t1));
-            } catch (const std::invalid_argument&) {
-                continue;
+            const char* p = line.data();
+            const char* e = p + line.size();
+            const char* t1 = static_cast<const char*>(memchr(p, '\t', e - p));
+            if (t1 == nullptr) continue;
+            const char* t2 = static_cast<const char*>(memchr(t1 + 1, '\t', e - t1 - 1));
+            if (t2 == nullptr) continue;
+            const char* t3 = static_cast<const char*>(memchr(t2 + 1, '\t', e - t2 - 1));
+            const char* loci_end = (t3 != nullptr) ? t3 : e;
+            if (mer_size == 0) mer_size = static_cast<int>(t1 - p);
+
+            uint32_t encoded_mer = 0;
+            bool valid = true;
+            for (const char* q = p; q < t1; ++q) {
+                switch (*q) {
+                    case 'A': encoded_mer <<= 2; break;
+                    case 'C': encoded_mer = (encoded_mer << 2) | 1u; break;
+                    case 'G': encoded_mer = (encoded_mer << 2) | 2u; break;
+                    case 'T': encoded_mer = (encoded_mer << 2) | 3u; break;
+                    default: valid = false; break;
+                }
+                if (!valid) break;
             }
+            if (!valid) continue;
+            int id = 0;
+            for (const char* q = t1 + 1; q < t2; ++q) id = id * 10 + (*q - '0');
+            int loci = 0;
+            for (const char* q = t2 + 1; q < loci_end; ++q) loci = loci * 10 + (*q - '0');
             if (!have_cur || encoded_mer != cur_key) {
                 flush_range();
                 cur_key = encoded_mer;
