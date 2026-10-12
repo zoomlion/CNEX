@@ -603,6 +603,21 @@ int main(int argc, char* argv[]) {
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
 
+        // Build the direct-index accelerator for genome-mode window scans
+        // (k <= 13). Reads mode does not use it, so skip it there.
+        bool genome_input = (args.input_type == Args::InputType::GENOME);
+        if (!genome_input && !args.reads_files.empty() &&
+            args.input_type == Args::InputType::AUTO &&
+            detect_file_type(args.reads_files[0], args.pigz_path) == FileType::FASTA) {
+            genome_input = true;
+        }
+        if (genome_input && mer_size >= 7) {
+            mqm.build_direct_index();
+            if (!mqm.has_direct_index())
+                std::cerr << "  (direct index unavailable for k=" << mer_size
+                          << ", using hash lookups)\n";
+        }
+
         // Create output directory
         if (fs::exists(args.output_dir)) {
             fs::remove_all(args.output_dir);
@@ -655,6 +670,19 @@ int main(int argc, char* argv[]) {
         // Wait for monitor
         processed.store(n_total);
         monitor.join();
+
+        if (validate_profile_enabled()) {
+            std::cerr << "[profile] windows=" << g_val_profile.windows
+                      << " gathers=" << g_val_profile.gathers
+                      << " emits=" << g_val_profile.emits
+                      << "\n[profile] pushed=" << g_val_profile.pushed
+                      << " tally_calls=" << g_val_profile.tally_calls
+                      << " chain_calls=" << g_val_profile.chain_calls
+                      << " prep_ns=" << g_val_profile.prep_ns
+                      << " win_ns=" << g_val_profile.win_ns
+                      << "\n[profile] gather_ns=" << g_val_profile.gather_ns
+                      << " tally_ns=" << g_val_profile.tally_ns << "\n";
+        }
 
         std::cerr << "Done. Output written to " << args.output_dir << "\n";
         return 0;

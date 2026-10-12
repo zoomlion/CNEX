@@ -9,8 +9,11 @@
 #include <tsl/robin_map.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -18,6 +21,30 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// Optional counters for the segmented genome-mode validator. Enabled by
+// setting the VALIDATE_PROFILE environment variable to a non-zero value.
+struct ValidateProfile {
+    std::atomic<long long> windows{0};
+    std::atomic<long long> gathers{0};
+    std::atomic<long long> emits{0};
+    std::atomic<long long> pushed{0};
+    std::atomic<long long> tally_calls{0};
+    std::atomic<long long> chain_calls{0};
+    std::atomic<long long> prep_ns{0};
+    std::atomic<long long> win_ns{0};
+    std::atomic<long long> gather_ns{0};
+    std::atomic<long long> tally_ns{0};
+};
+inline ValidateProfile g_val_profile;
+
+inline bool validate_profile_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("VALIDATE_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
 
 // ─── 2-bit DNA encoding ───
 
@@ -91,10 +118,11 @@ struct VoteTally {
 };
 
 // O(m) tally with epoch stamps: element ids are bounded, no sort/clear per window.
-inline VoteTally tally_votes(const std::vector<int>& nums) {
+template <typename IdAt>
+inline VoteTally tally_votes_impl(int n, IdAt&& id_at) {
     VoteTally r;
-    r.n = static_cast<int>(nums.size());
-    if (nums.empty()) return r;
+    r.n = n;
+    if (n == 0) return r;
 
     thread_local std::vector<unsigned> stamps;
     thread_local std::vector<int> counts;
@@ -108,7 +136,8 @@ inline VoteTally tally_votes(const std::vector<int>& nums) {
     }
     seen.clear();
 
-    for (int id : nums) {
+    for (int i = 0; i < n; ++i) {
+        int id = id_at(i);
         if (id >= static_cast<int>(stamps.size())) {
             stamps.resize(id + 1, 0u);
             counts.resize(id + 1, 0);
@@ -135,6 +164,11 @@ inline VoteTally tally_votes(const std::vector<int>& nums) {
     return r;
 }
 
+inline VoteTally tally_votes(const std::vector<int>& nums) {
+    return tally_votes_impl(static_cast<int>(nums.size()),
+                            [&](int i) { return nums[i]; });
+}
+
 // Gate matrix: T1 = legacy defaults (from the flags); T2, T3, ... are extra
 // OR-combined rows. A window is accepted when ANY row passes. Rows share one
 // tally and one chain evaluation per window.
@@ -153,30 +187,28 @@ struct ValidatorConfig {
 };
 
 // chain_fn(best_id) -> (passing, span); invoked at most once per window.
+inline bool gate_ratio_precheck(const VoteTally& t, const ValidatorConfig& cfg) {
+    if (t.best_id < 0 || cfg.tiers.empty()) return false;
+    float threshold = static_cast<float>(t.n) * static_cast<float>(cfg.vote_frac);
+    if (t.best_cnt <= threshold) return false;
+    for (const auto& tier : cfg.tiers) {
+        if (t.best_cnt >= static_cast<int>(tier.vote_ratio * t.second_cnt)) return true;
+    }
+    return false;
+}
+
 template <typename ChainFn>
 inline bool gate_pass(const VoteTally& t, const ValidatorConfig& cfg, ChainFn&& chain_fn,
                       int& passing_out, int& span_out) {
     passing_out = 0;
     span_out = 0;
-    if (t.best_id < 0 || cfg.tiers.empty()) return false;
-
-    float threshold = static_cast<float>(t.n) * static_cast<float>(cfg.vote_frac);
-    if (t.best_cnt <= threshold) return false;
+    if (!gate_ratio_precheck(t, cfg)) return false;
 
     // Integer truncation matches the historical T1 semantics; keep it even
     // for fractional ratios (e.g. 1.5) to avoid changing accepted windows.
     auto ratio_ok = [&](const GateTier& tier) {
         return t.best_cnt >= static_cast<int>(tier.vote_ratio * t.second_cnt);
     };
-
-    bool any_ratio = false;
-    for (const auto& tier : cfg.tiers) {
-        if (ratio_ok(tier)) {
-            any_ratio = true;
-            break;
-        }
-    }
-    if (!any_ratio) return false;
 
     auto cs = chain_fn(t.best_id);
     passing_out = cs.first;
@@ -202,6 +234,31 @@ public:
     tsl::robin_map<uint32_t, uint64_t> compressed_mer_query;
     std::vector<std::pair<int, int>> assign_arena;
     int mer_size = 0;
+
+    // Optional direct-index accelerator for the genome-mode prep pass
+    // (k <= 13): maps each 2-bit k-mer code to a slot holding rank+1, with
+    // the packed range stored in direct_rng[rank]. Costs 4^k * 4 bytes.
+    std::vector<uint32_t> direct_index;
+    std::vector<uint64_t> direct_rng;
+
+    bool has_direct_index() const { return !direct_index.empty(); }
+
+    void build_direct_index() {
+        if (mer_size <= 0 || mer_size > 13) return;
+        direct_index.assign(size_t(1) << (2 * mer_size), 0);
+        direct_rng.resize(compressed_mer_query.size());
+        uint32_t rank = 0;
+        for (const auto& kv : compressed_mer_query) {
+            direct_index[kv.first] = rank + 1;
+            direct_rng[rank] = kv.second;
+            ++rank;
+        }
+    }
+
+    inline uint64_t direct_query(uint32_t code) const {
+        uint32_t r = direct_index[code];
+        return r ? direct_rng[r - 1] : 0;
+    }
 
     static inline uint64_t pack_range(uint64_t off, uint64_t cnt) {
         return (off << 32) | (cnt & 0xffffffffULL);
@@ -460,23 +517,93 @@ inline void validate_sequence_segmented(
     thread_local std::vector<uint64_t> fwd_ranges;
     thread_local std::vector<uint64_t> rc_ranges;
     thread_local std::vector<uint64_t> upper_bits;
-    thread_local std::vector<int> match_ids;
-    thread_local std::vector<int> match_starts;
-    thread_local std::vector<int> match_loci;
+    thread_local std::vector<uint32_t> codes_fwd;
+    thread_local std::vector<uint32_t> codes_rc;
+    // Per-segment match cache: each position's assignment range is expanded
+    // once, and all overlapping windows read contiguous slices of it.
+    thread_local std::vector<uint32_t> off_fwd, off_rc;    // position -> offset
+    thread_local std::vector<uint64_t> pack_fwd, pack_rc;  // (id << 32) | locus
+    int cur_o = 0;   // current window origin within the segment
+    const bool vp = validate_profile_enabled();
+    thread_local long long tl_prep_ns = 0;
+    thread_local long long tl_win_ns = 0;
+    thread_local long long tl_gather_ns = 0;
+    thread_local long long tl_tally_ns = 0;
 
-    auto chain_stats = [&](int confi_id) -> std::pair<int, int> {
-        int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
-        for (size_t idx = 0; idx < match_ids.size(); ++idx) {
-            if (match_ids[idx] != confi_id) continue;
-            int x = match_starts[idx];
-            int l = match_loci[idx];
-            if (first < 0) first = x;
-            else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
-            prev_x = x; prev_l = l; last = x; ++m;
+    // Tally updated directly from the range arrays, without materializing the
+    // match list. The list is only built for windows that pass the ratio
+    // pre-check and therefore need chain evaluation.
+    struct TallyAcc {
+        std::vector<uint64_t> sc;   // (stamp << 32) | count
+        std::vector<int> seen;
+        unsigned epoch = 0;
+        int total = 0;
+        void begin() {
+            ++epoch;
+            if (epoch == 0) {
+                std::fill(sc.begin(), sc.end(), 0ull);
+                epoch = 1;
+            }
+            seen.clear();
+            total = 0;
         }
-        if (m == 0) return {0, 0};
-        return {passing, last - first + k};
+        inline void add(int id) {
+            ++total;
+            if (id >= static_cast<int>(sc.size())) sc.resize(id + 1, 0ull);
+            uint64_t v = sc[id];
+            if (static_cast<unsigned>(v >> 32) != epoch) {
+                sc[id] = (static_cast<uint64_t>(epoch) << 32) | 1ull;
+                seen.push_back(id);
+            } else {
+                sc[id] = v + 1;
+            }
+        }
+        VoteTally finish() const {
+            VoteTally r;
+            r.n = total;
+            for (int id : seen) {
+                int c = static_cast<int>(sc[id] & 0xffffffffu);
+                if (c > r.best_cnt) {
+                    r.second_cnt = r.best_cnt;
+                    r.best_cnt = c;
+                    r.best_id = id;
+                } else if (c > r.second_cnt) {
+                    r.second_cnt = c;
+                }
+            }
+            return r;
+        }
     };
+    thread_local TallyAcc tally_acc;
+
+    auto make_chain = [&](const std::vector<uint32_t>* off,
+                          const std::vector<uint64_t>* pack, bool rc_strand) {
+        return [&, off, pack, rc_strand](int confi_id) -> std::pair<int, int> {
+            if (vp) ++g_val_profile.chain_calls;
+            int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
+            for (int x = 0; x < nspan; ++x) {
+                // The RC strand enumerates k-mer starts backwards (its first
+                // match is the window's last position), so map x to the cache
+                // position in that order.
+                int p = rc_strand ? (cur_o + (nspan - 1 - x)) : (cur_o + x);
+                uint32_t b = (*off)[p];
+                uint32_t e = (*off)[p + 1];
+                for (uint32_t j = b; j < e; ++j) {
+                    uint64_t v = (*pack)[j];
+                    int id = static_cast<int>(v >> 32);
+                    if (id != confi_id) continue;
+                    int l = static_cast<int>(static_cast<uint32_t>(v));
+                    if (first < 0) first = x;
+                    else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
+                    prev_x = x; prev_l = l; last = x; ++m;
+                }
+            }
+            if (m == 0) return {0, 0};
+            return {passing, last - first + k};
+        };
+    };
+    auto chain_fwd = make_chain(&off_fwd, &pack_fwd, false);
+    auto chain_rc = make_chain(&off_rc, &pack_rc, true);
 
     const int seg_stride = SEG - (window_size - 1);
     for (int seg_start = 0; seg_start < L; seg_start += seg_stride) {
@@ -487,31 +614,141 @@ inline void validate_sequence_segmented(
         rc_ranges.assign(seg_len, 0);
         upper_bits.assign((seg_len + 63) >> 6, 0ULL);
 
-        uint32_t rolling = 0;
-        int valid_run = 0;
-        for (int i = seg_start; i < seg_end; ++i) {
-            unsigned char raw = static_cast<unsigned char>(seq[i]);
-            char c = static_cast<char>(raw);
-            if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-            if (raw >= 'A' && raw <= 'Z')
-                upper_bits[(i - seg_start) >> 6] |= (1ULL << ((i - seg_start) & 63));
-            int8_t bits = base_lookup[static_cast<unsigned char>(c)];
-            if (bits < 0) {
-                valid_run = 0;
-                rolling = 0;
-                continue;
+        auto _t_prep = std::chrono::steady_clock::now();
+        if (mqm.has_direct_index()) {
+            // Two passes: compute k-mer codes sequentially (no dependent
+            // memory stalls), then run the direct-index lookups with software
+            // prefetching to hide the random-access latency.
+            codes_fwd.assign(seg_len, UINT32_MAX);
+            codes_rc.assign(seg_len, UINT32_MAX);
+            uint32_t rolling = 0;
+            uint32_t rc_rolling = 0;
+            int valid_run = 0;
+            for (int i = seg_start; i < seg_end; ++i) {
+                unsigned char raw = static_cast<unsigned char>(seq[i]);
+                char c = static_cast<char>(raw);
+                if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+                if (raw >= 'A' && raw <= 'Z')
+                    upper_bits[(i - seg_start) >> 6] |= (1ULL << ((i - seg_start) & 63));
+                int8_t bits = base_lookup[static_cast<unsigned char>(c)];
+                if (bits < 0) {
+                    valid_run = 0;
+                    rolling = 0;
+                    rc_rolling = 0;
+                    continue;
+                }
+                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
+                rc_rolling = (rc_rolling >> 2) |
+                             (static_cast<uint32_t>(3 - bits) << (2 * k - 2));
+                ++valid_run;
+                if (valid_run >= k) {
+                    int st = i - k + 1 - seg_start;
+                    codes_fwd[st] = rolling;
+                    codes_rc[st] = rc_rolling;
+                }
             }
-            rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
-            ++valid_run;
-            if (valid_run >= k) {
-                int st = i - k + 1 - seg_start;   // k-mer start index within the segment
-                auto it = mqm.compressed_mer_query.find(rolling);
-                if (it != mqm.compressed_mer_query.end()) fwd_ranges[st] = it->second;
-                uint32_t rc = rc_code_2bit(rolling, k);
-                auto it2 = mqm.compressed_mer_query.find(rc);
-                if (it2 != mqm.compressed_mer_query.end()) rc_ranges[st] = it2->second;
+            constexpr int kPrefetchDist = 32;
+            for (int st = 0; st < seg_len; ++st) {
+                int pf = st + kPrefetchDist;
+                if (pf < seg_len && codes_fwd[pf] != UINT32_MAX) {
+                    __builtin_prefetch(&mqm.direct_index[codes_fwd[pf]]);
+                    __builtin_prefetch(&mqm.direct_index[codes_rc[pf]]);
+                }
+                uint32_t cf = codes_fwd[st];
+                if (cf == UINT32_MAX) continue;
+                uint32_t r = mqm.direct_index[cf];
+                if (r) fwd_ranges[st] = mqm.direct_rng[r - 1];
+                uint32_t rr = mqm.direct_index[codes_rc[st]];
+                if (rr) rc_ranges[st] = mqm.direct_rng[rr - 1];
+            }
+        } else {
+            uint32_t rolling = 0;
+            int valid_run = 0;
+            for (int i = seg_start; i < seg_end; ++i) {
+                unsigned char raw = static_cast<unsigned char>(seq[i]);
+                char c = static_cast<char>(raw);
+                if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+                if (raw >= 'A' && raw <= 'Z')
+                    upper_bits[(i - seg_start) >> 6] |= (1ULL << ((i - seg_start) & 63));
+                int8_t bits = base_lookup[static_cast<unsigned char>(c)];
+                if (bits < 0) {
+                    valid_run = 0;
+                    rolling = 0;
+                    continue;
+                }
+                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
+                ++valid_run;
+                if (valid_run >= k) {
+                    int st = i - k + 1 - seg_start;   // k-mer start index within the segment
+                    auto it = mqm.compressed_mer_query.find(rolling);
+                    if (it != mqm.compressed_mer_query.end()) fwd_ranges[st] = it->second;
+                    uint32_t rc = rc_code_2bit(rolling, k);
+                    auto it2 = mqm.compressed_mer_query.find(rc);
+                    if (it2 != mqm.compressed_mer_query.end()) rc_ranges[st] = it2->second;
+                }
             }
         }
+        if (vp) {
+            tl_prep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - _t_prep).count();
+        }
+
+        // Expand every position's assignment range once for the whole segment;
+        // all overlapping windows then share contiguous slices of this cache.
+        off_fwd.assign(seg_len + 1, 0);
+        off_rc.assign(seg_len + 1, 0);
+        pack_fwd.clear();
+        pack_rc.clear();
+        {
+            auto _t_cache = vp ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+            for (int p = 0; p < seg_len; ++p) {
+                constexpr int kCachePrefetch = 32;
+                if (p + kCachePrefetch < seg_len) {
+                    uint64_t rp = fwd_ranges[p + kCachePrefetch];
+                    if (rp)
+                        __builtin_prefetch(&mqm.assign_arena[MerQueryManager::range_off(rp)]);
+                }
+                uint64_t rf = fwd_ranges[p];
+                if (rf) {
+                    uint32_t off = MerQueryManager::range_off(rf);
+                    uint32_t cnt = MerQueryManager::range_cnt(rf);
+                    for (uint32_t a = 0; a < cnt; ++a) {
+                        const auto& pr = mqm.assign_arena[off + a];
+                        pack_fwd.push_back(
+                            (static_cast<uint64_t>(static_cast<uint32_t>(pr.first)) << 32) |
+                            static_cast<uint32_t>(pr.second));
+                    }
+                }
+                off_fwd[p + 1] = static_cast<uint32_t>(pack_fwd.size());
+            }
+            for (int p = 0; p < seg_len; ++p) {
+                constexpr int kCachePrefetch = 32;
+                if (p + kCachePrefetch < seg_len) {
+                    uint64_t rp = rc_ranges[p + kCachePrefetch];
+                    if (rp)
+                        __builtin_prefetch(&mqm.assign_arena[MerQueryManager::range_off(rp)]);
+                }
+                uint64_t rr = rc_ranges[p];
+                if (rr) {
+                    uint32_t off = MerQueryManager::range_off(rr);
+                    uint32_t cnt = MerQueryManager::range_cnt(rr);
+                    for (uint32_t a = 0; a < cnt; ++a) {
+                        const auto& pr = mqm.assign_arena[off + a];
+                        pack_rc.push_back(
+                            (static_cast<uint64_t>(static_cast<uint32_t>(pr.first)) << 32) |
+                            static_cast<uint32_t>(pr.second));
+                    }
+                }
+                off_rc[p + 1] = static_cast<uint32_t>(pack_rc.size());
+            }
+            if (vp) {
+                tl_gather_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - _t_cache).count();
+                g_val_profile.pushed += (long long)(pack_fwd.size() + pack_rc.size());
+            }
+        }
+        auto _t_win = std::chrono::steady_clock::now();
 
         int s0 = seg_start;
         if (step_size > 1) {
@@ -520,6 +757,7 @@ inline void validate_sequence_segmented(
         }
         const int last_start = seg_end - window_size;
         for (int s = s0; s <= last_start; s += step_size) {
+            if (vp) ++g_val_profile.windows;
             // soft-mask skip: window must contain at least one uppercase base
             int o = s - seg_start;
             int e = o + window_size;
@@ -535,63 +773,83 @@ inline void validate_sequence_segmented(
             }
             if (!has_upper) continue;
 
-            // forward chain: k-mer starts increasing
-            match_ids.clear(); match_starts.clear(); match_loci.clear();
-            for (int i = s; i < s + nspan; ++i) {
-                uint64_t r = fwd_ranges[i - seg_start];
-                if (!r) continue;
-                uint32_t off = MerQueryManager::range_off(r);
-                uint32_t cnt = MerQueryManager::range_cnt(r);
-                int x = i - s;
-                for (uint32_t a = 0; a < cnt; ++a) {
-                    match_ids.push_back(mqm.assign_arena[off + a].first);
-                    match_starts.push_back(x);
-                    match_loci.push_back(mqm.assign_arena[off + a].second);
-                }
+            // forward strand: tally a contiguous slice of the segment cache;
+            // chain evaluation runs only when the ratio pre-check can pass.
+            cur_o = o;
+            if (vp) ++g_val_profile.tally_calls;
+            auto _tt = vp ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+            tally_acc.begin();
+            for (uint32_t j = off_fwd[o]; j < off_fwd[o + nspan]; ++j) {
+                tally_acc.add(static_cast<int>(pack_fwd[j] >> 32));
+            }
+            if (vp) {
+                tl_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - _tt).count();
             }
             int fwd_id = -1, fwd_count = 0;
             bool fwd_ok = false;
-            if (!match_ids.empty()) {
-                VoteTally t = tally_votes(match_ids);
+            VoteTally fwd_t = tally_acc.finish();
+            if (gate_ratio_precheck(fwd_t, cfg)) {
                 int passing = 0, span = 0;
-                if (gate_pass(t, cfg, chain_stats, passing, span)) {
+                if (gate_pass(fwd_t, cfg, chain_fwd, passing, span)) {
                     fwd_ok = true;
-                    fwd_id = t.best_id;
-                    fwd_count = t.n;
+                    fwd_id = fwd_t.best_id;
+                    fwd_count = fwd_t.n;
                 }
             }
 
-            // reverse-complement chain: k-mer starts decreasing => RC positions increasing
-            match_ids.clear(); match_starts.clear(); match_loci.clear();
-            for (int i = s + nspan - 1; i >= s; --i) {
-                uint64_t r = rc_ranges[i - seg_start];
-                if (!r) continue;
-                uint32_t off = MerQueryManager::range_off(r);
-                uint32_t cnt = MerQueryManager::range_cnt(r);
-                int x = (nspan - 1) - (i - s);
-                for (uint32_t a = 0; a < cnt; ++a) {
-                    match_ids.push_back(mqm.assign_arena[off + a].first);
-                    match_starts.push_back(x);
-                    match_loci.push_back(mqm.assign_arena[off + a].second);
+            // reverse-complement strand: same slice, but matches are enumerated
+            // backwards (window's last k-mer position first) to preserve the
+            // legacy match order for tally tie-breaking.
+            if (vp) ++g_val_profile.tally_calls;
+            _tt = vp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            tally_acc.begin();
+            for (int p = o + nspan - 1; p >= o; --p) {
+                for (uint32_t j = off_rc[p]; j < off_rc[p + 1]; ++j) {
+                    tally_acc.add(static_cast<int>(pack_rc[j] >> 32));
                 }
+            }
+            if (vp) {
+                tl_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - _tt).count();
             }
             int rev_id = -1, rev_count = 0;
             bool rev_ok = false;
-            if (!match_ids.empty()) {
-                VoteTally t = tally_votes(match_ids);
+            VoteTally rev_t = tally_acc.finish();
+            if (gate_ratio_precheck(rev_t, cfg)) {
                 int passing = 0, span = 0;
-                if (gate_pass(t, cfg, chain_stats, passing, span)) {
+                if (gate_pass(rev_t, cfg, chain_rc, passing, span)) {
                     rev_ok = true;
-                    rev_id = t.best_id;
-                    rev_count = t.n;
+                    rev_id = rev_t.best_id;
+                    rev_count = rev_t.n;
                 }
+            }
+            if (vp) {
+                tl_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - _tt).count();
             }
 
             if (!fwd_ok && !rev_ok) continue;
+            if (vp) ++g_val_profile.emits;
             if (!fwd_ok) emit(s, -1, rev_id);
             else if (!rev_ok) emit(s, 1, fwd_id);
             else if (fwd_count >= rev_count) emit(s, 1, fwd_id);
             else emit(s, -1, rev_id);
         }
+        if (vp) {
+            tl_win_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - _t_win).count();
+        }
+    }
+    if (vp) {
+        g_val_profile.prep_ns += tl_prep_ns;
+        g_val_profile.win_ns += tl_win_ns;
+        g_val_profile.gather_ns += tl_gather_ns;
+        g_val_profile.tally_ns += tl_tally_ns;
+        tl_prep_ns = 0;
+        tl_win_ns = 0;
+        tl_gather_ns = 0;
+        tl_tally_ns = 0;
     }
 }
