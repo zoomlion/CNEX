@@ -406,6 +406,23 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
         }
     };
 
+    // Write one validated entry: `id strand ele seq` plus the rescue score as
+    // an optional 5th column when the entry came through T3 verification.
+    auto write_entry = [&](const char* sid, int strand, int ele, const char* seq,
+                           double rescue_score, size_t margin) {
+        if (out_pos + margin >= OUT_BUF_SIZE) flush_buffer();
+        int n;
+        if (rescue_score > 0.0) {
+            n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                         "%s\t%d\t%d\t%s\t%.4f\n", sid, strand, ele, seq, rescue_score);
+        } else {
+            n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                         "%s\t%d\t%d\t%s\n", sid, strand, ele, seq);
+        }
+        if (n > 0) out_pos += static_cast<size_t>(n);
+        if (out_pos > OUT_BUF_SIZE * 0.8) flush_buffer();
+    };
+
     std::vector<Read> chunk;
     while (queue.pop(chunk)) {
         for (const auto& read : chunk) {
@@ -430,20 +447,8 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                         for (char& c : wseq) {
                             if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
                         }
-                        if (out_pos + margin >= OUT_BUF_SIZE) flush_buffer();
-                        int n;
-                        if (rescue_score > 0.0) {
-                            n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
-                                         "%s\t%d\t%d\t%s\t%.4f\n",
-                                         sid.c_str(), strand, confi_id, wseq.c_str(),
-                                         rescue_score);
-                        } else {
-                            n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
-                                         "%s\t%d\t%d\t%s\n",
-                                         sid.c_str(), strand, confi_id, wseq.c_str());
-                        }
-                        if (n > 0) out_pos += static_cast<size_t>(n);
-                        if (out_pos > OUT_BUF_SIZE * 0.8) flush_buffer();
+                        write_entry(sid.c_str(), strand, confi_id, wseq.c_str(),
+                                    rescue_score, margin);
                     },
                     verify_fn);
             } else {
@@ -451,24 +456,8 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                 auto [confi_id, strand] = validate_read_verified(read.seq, mqm, mer_size, -1,
                                                                   cfg, verify_fn, &rescue_score);
                 if (confi_id > -1) {
-                    if (out_pos + 512 >= OUT_BUF_SIZE) flush_buffer();
-                    int n;
-                    if (rescue_score > 0.0) {
-                        n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
-                                     "%s\t%d\t%d\t%s\t%.4f\n",
-                                     read.seq_id.c_str(), strand, confi_id,
-                                     read.seq.c_str(), rescue_score);
-                    } else {
-                        n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
-                                     "%s\t%d\t%d\t%s\n",
-                                     read.seq_id.c_str(), strand, confi_id, read.seq.c_str());
-                    }
-                    if (n > 0) {
-                        out_pos += static_cast<size_t>(n);
-                    }
-                    if (out_pos > OUT_BUF_SIZE * 0.8) {
-                        flush_buffer();
-                    }
+                    write_entry(read.seq_id.c_str(), strand, confi_id,
+                                read.seq.c_str(), rescue_score, 512);
                 }
             }
         }

@@ -221,14 +221,12 @@ inline std::vector<std::string> greedy_trace(
 }
 
 
-// Extend past the tail of `path` toward `stop` (empty = no stop). Neighbors
-// are ranked by element score first, out-degree only as a tie-break; the walk
-// never crosses `stop`, so contigs cannot crawl past their designated end.
+// Extend past the tail of `path`. Neighbors are ranked by element score first,
+// out-degree only as a tie-break.
 inline void extend_forward(
     const Graph& graph,
     std::vector<std::string>& path,
     uint64_t max_path_length,
-    const std::string& stop,
     const std::unordered_map<std::string, int>* node_scores
 ) {
     tsl::robin_map<std::string, int> visited;
@@ -236,7 +234,6 @@ inline void extend_forward(
 
     std::string current = path.back();
     while (path.size() < max_path_length) {
-        if (!stop.empty() && current == stop) break;
         auto it = graph.find(current);
         if (it == graph.end() || it->second.empty()) break;
 
@@ -277,12 +274,11 @@ inline tsl::robin_map<std::string, std::vector<std::string>> build_reverse_graph
 }
 
 
-// Mirror of extend_forward for the head of `path`; never crosses `stop`.
+// Mirror of extend_forward for the head of `path`.
 inline void extend_backward(
     const Graph& graph,
     std::vector<std::string>& path,
     uint64_t max_path_length,
-    const std::string& stop,
     const std::unordered_map<std::string, int>* node_scores
 ) {
     auto rev = build_reverse_graph(graph);
@@ -291,7 +287,6 @@ inline void extend_backward(
 
     std::string current = path.front();
     while (path.size() < max_path_length) {
-        if (!stop.empty() && current == stop) break;
         auto it = rev.find(current);
         if (it == rev.end() || it->second.empty()) break;
 
@@ -336,10 +331,10 @@ inline std::vector<std::string> trace_longest_path(
     // topology guesses and legitimate element sequence often continues past
     // them.
     if (path.size() < max_path_length) {
-        extend_forward(graph, path, max_path_length, std::string(), node_scores);
+        extend_forward(graph, path, max_path_length, node_scores);
     }
     if (path.size() < max_path_length) {
-        extend_backward(graph, path, max_path_length, std::string(), node_scores);
+        extend_backward(graph, path, max_path_length, node_scores);
     }
 
     return path;

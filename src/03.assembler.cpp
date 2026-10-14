@@ -52,6 +52,32 @@ struct Read {
     double rescue = 0.0;   // T3 rescue score from validate (0 = strict output)
 };
 
+// Uppercase, N-mask and (for the minus strand) reverse-complement a validated
+// sequence so every downstream consumer sees element orientation.
+static inline void normalize_read_seq(std::string& seq, int strand) {
+    for (char& c : seq) {
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+    }
+    for (char& c : seq) {
+        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
+    }
+    if (strand == -1) {
+        thread_local std::string rc;
+        reverse_complement(seq, rc);
+        seq = rc;
+    }
+}
+
+static inline bool asm_debug_enabled() {
+    static const bool enabled = std::getenv("MERCURY_ASM_DEBUG") != nullptr;
+    return enabled;
+}
+
+static inline bool rescue_handoff_enabled() {
+    static const bool enabled = std::getenv("MERCURY_NO_RESCUE_HANDOFF") == nullptr;
+    return enabled;
+}
+
 Args parse_args(int argc, char* argv[]) {
     Args args;
     int i = 1;
@@ -262,9 +288,7 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
         de_bruijn_graph(reads, k, min_count, gfa_out != nullptr, snp_out != nullptr);
     if (graph.empty()) return "";
 
-    std::unordered_map<std::string, int> node_scores;
-    auto ns = build_node_scores(graph, mqm, ele_id, k);
-    if (!ns.empty()) node_scores = std::move(ns);
+    std::unordered_map<std::string, int> node_scores = build_node_scores(graph, mqm, ele_id, k);
 
     std::vector<std::string> contig_path;
     std::string contig = assemble_sequence(graph, node_scores, &contig_path);
@@ -539,17 +563,7 @@ static void process_genome_element(
     while (idx < end) {
         const auto& r = all_reads[idx];
         std::string local_seq = r.seq;
-        for (char& c : local_seq) {
-            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-        }
-        for (char& c : local_seq) {
-            if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
-        }
-        if (r.strand == -1) {
-            thread_local std::string _rc;
-            reverse_complement(local_seq, _rc);
-            local_seq = _rc;
-        }
+        normalize_read_seq(local_seq, r.strand);
         // Repeat ratio check for genome mode; the distinct element-mer count
         // doubles as a per-read score bound for branch-and-bound below.
         {
@@ -713,9 +727,7 @@ static void process_genome_element(
         try_range(*cr);
     }
 
-    static const bool rescue_handoff =
-        std::getenv("MERCURY_NO_RESCUE_HANDOFF") == nullptr;
-    if (best_did.empty() && rescue_handoff) {
+    if (best_did.empty() && rescue_handoff_enabled()) {
         // T3 rescue handoff: validate already SW-verified these windows against
         // the element panel; mer-based gates do not apply to them. Emit the
         // best-scoring window as the element's claim.
@@ -730,17 +742,7 @@ static void process_genome_element(
         }
         if (best_r != nullptr) {
             std::string seq = best_r->seq;
-            for (char& c : seq) {
-                if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-            }
-            for (char& c : seq) {
-                if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
-            }
-            if (best_r->strand == -1) {
-                thread_local std::string _rc_rescue;
-                reverse_complement(seq, _rc_rescue);
-                seq = _rc_rescue;
-            }
+            normalize_read_seq(seq, best_r->strand);
             if (seq.size() >= 20) {
                 char s = best_r->strand == 1 ? '+' : '-';
                 std::string did = std::to_string(cur_ele) + "." + best_r->chr + ":" +
@@ -910,17 +912,7 @@ int main(int argc, char* argv[]) {
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele && cnt < args.max_reads) {
                     const auto& r = all_reads[idx];
                     std::string local_seq = r.seq;
-                    for (char& c : local_seq) {
-                        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-                    }
-                    for (char& c : local_seq) {
-                        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
-                    }
-                    if (r.strand == -1) {
-                        thread_local std::string _rc;
-                        reverse_complement(local_seq, _rc);
-                        local_seq = _rc;
-                    }
+                    normalize_read_seq(local_seq, r.strand);
                     // Repeat ratio check
                     {
                         thread_local tsl::robin_set<uint32_t> seen;
@@ -957,6 +949,7 @@ int main(int argc, char* argv[]) {
                 // trim, apply the repeat-chimera guard and keep the contig with
                 // the highest element-mer hit count.
                 std::string contig;
+                ContigScore contig_sc{0, 0};   // score of `contig` (cluster path)
                 size_t best_support = 0;
                 int last_second_hits = -1;
                 int last_total_reads = 0;
@@ -1000,6 +993,7 @@ int main(int argc, char* argv[]) {
                                 static_cast<int>(best_score) > second_hits)
                                 second_hits = static_cast<int>(best_score);
                             contig = std::move(c);
+                            contig_sc = sc;
                             best_score = score;
                             best_support = kv.second.size();
                         } else if (static_cast<int>(score) > second_hits) {
@@ -1016,9 +1010,20 @@ int main(int argc, char* argv[]) {
                 // fails the floor counts as "no acceptable output".
                 static constexpr int kMinOutputDistinct = 12;
                 static constexpr int kMinFallbackDistinct = 16;
+
+                // `final_sc` is the score of the sequence that is actually
+                // emitted. The cluster winner was already scored at selection
+                // time and its sequence is unchanged here, so reuse it; the
+                // fallback/rescue paths change the sequence and rescore below.
+                ContigScore final_sc{0, 0};
+                bool final_sc_valid = false;
                 if (!contig.empty()) {
-                    ContigScore sc = score_contig(contig, mqm, cur_ele);
-                    if (sc.distinct < kMinOutputDistinct) contig.clear();
+                    final_sc = contig_sc;
+                    final_sc_valid = true;
+                    if (final_sc.distinct < kMinOutputDistinct) {
+                        contig.clear();
+                        final_sc_valid = false;
+                    }
                 }
 
                 bool rescued = false;
@@ -1054,9 +1059,7 @@ int main(int argc, char* argv[]) {
                         // reads against the element panel, so the mer-distinct
                         // floor does not apply. Emit the best-scoring one as-is
                         // (mer-based trimming would cut it to nothing).
-                        static const bool rescue_handoff =
-                            std::getenv("MERCURY_NO_RESCUE_HANDOFF") == nullptr;
-                        if (!rescue_handoff) continue;
+                        if (!rescue_handoff_enabled()) continue;
                         size_t ri = reads.size();
                         double best_rs = 0.0;
                         for (size_t i = 0; i < reads.size(); ++i) {
@@ -1072,9 +1075,18 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                ContigScore final_sc = score_contig(contig, mqm, cur_ele);
-                if (!rescued && final_sc.distinct < kMinOutputDistinct) continue;
-                if (std::getenv("MERCURY_ASM_DEBUG")) {
+                if (!final_sc_valid) {
+                    if (rescued) {
+                        // Rescue claims bypass the mer-distinct floor; the
+                        // score is only needed for the debug dump.
+                        if (asm_debug_enabled())
+                            final_sc = score_contig(contig, mqm, cur_ele);
+                    } else {
+                        final_sc = score_contig(contig, mqm, cur_ele);
+                        if (final_sc.distinct < kMinOutputDistinct) continue;
+                    }
+                }
+                if (asm_debug_enabled()) {
                     std::fprintf(stderr, "ASMDBG\t%d\t%zu\t%d\t%d\t%zu\t%d\t%d\t%d\n",
                                  cur_ele, contig.size(), final_sc.hits,
                                  final_sc.distinct, best_support,
