@@ -6,7 +6,10 @@
 // Replaces the Python hybrid prototype with a fully native implementation
 // Streaming pipeline: reader thread + worker thread pool
 
+#include <hip/panel_core.hpp>
 #include <hip/validator_core.hpp>
+
+#include <parasail.h>
 
 #include <algorithm>
 #include <atomic>
@@ -52,6 +55,10 @@ struct Args {
     int max_assign = 3;
     // Extra gate rows from --tiers (appended on top of T1 and T2).
     std::vector<GateTier> extra_tiers;
+    // In-validate T3 rescue: SW-verify near-miss windows/reads.
+    std::string rescue_panels;        // MSA with per-element panels (leave-one-out)
+    double rescue_tau = -1.0;         // normalized SW score threshold
+    GateTier t3{1.5, 5, 25};          // near-miss gate row
     bool help_requested = false;
     InputType input_type = InputType::AUTO;
 };
@@ -314,10 +321,65 @@ void reader_thread(const std::vector<std::string>& files,
     queue.finish();
 }
 
+// ─── T3 rescue verification (SIMD SW vs element panels) ───
+
+struct VerifyContext {
+    const std::unordered_map<int, std::vector<std::string>>* panels = nullptr;
+    double tau = 0.9;
+    parasail_matrix_t* mat = nullptr;
+    std::atomic<long long>* tried = nullptr;
+    std::atomic<long long>* passed = nullptr;
+    std::atomic<long long>* pairs = nullptr;
+};
+
+static void clean_upper(std::string& s) {
+    for (char& c : s) {
+        c = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'A';
+    }
+}
+
+// Returns the best normalized SW score over the element's panel sequences when
+// it reaches tau (0.0 otherwise). The score is propagated to the output as the
+// rescue tag of the read/window.
+static double verify_window(const VerifyContext& vc, int ele, const std::string& w, int strand) {
+    if (!vc.panels || !vc.mat) return 0.0;
+    auto it = vc.panels->find(ele);
+    if (it == vc.panels->end() || it->second.empty()) return 0.0;
+    vc.tried->fetch_add(1, std::memory_order_relaxed);
+
+    std::string s = w;
+    clean_upper(s);
+    if (strand == -1) {
+        thread_local std::string _rc;
+        reverse_complement(s, _rc);
+        s = _rc;
+    }
+    double best = 0.0;
+    long long np = 0;
+    for (const std::string& q : it->second) {
+        parasail_result_t* r = parasail_sw_striped_16(
+            q.c_str(), static_cast<int>(q.size()),
+            s.c_str(), static_cast<int>(s.size()), 2, 1, vc.mat);
+        ++np;
+        int m = std::min<int>(q.size(), s.size());
+        double v = m > 0 ? static_cast<double>(r->score) / m : 0.0;
+        parasail_result_free(r);
+        if (v > best) best = v;
+    }
+    vc.pairs->fetch_add(np, std::memory_order_relaxed);
+    if (best >= vc.tau) {
+        vc.passed->fetch_add(1, std::memory_order_relaxed);
+        return best;
+    }
+    return 0.0;
+}
+
 // ─── Worker thread ───
 
 void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                    int mer_size, const ValidatorConfig& cfg,
+                   const VerifyContext& vc,
                    const std::string& output_dir,
                    std::atomic<int64_t>& processed) {
     const int window_size = cfg.window_size;
@@ -332,6 +394,10 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
     const size_t OUT_BUF_SIZE = 1 << 20;
     std::vector<char> out_buf(OUT_BUF_SIZE);
     size_t out_pos = 0;
+
+    auto verify_fn = [&](int ele, const std::string& w, int strand) {
+        return verify_window(vc, ele, w, strand);
+    };
 
     auto flush_buffer = [&]() {
         if (out_pos > 0) {
@@ -349,7 +415,7 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                 const size_t margin = static_cast<size_t>(window_size) + 256;
                 validate_sequence_segmented(
                     read.seq, mqm, base_offset, cfg,
-                    [&](int start, int strand, int confi_id) {
+                    [&](int start, int strand, int confi_id, double rescue_score) {
                         std::string sid;
                         sid.reserve(contig.size() + 24);
                         sid += contig;
@@ -365,19 +431,38 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                             if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
                         }
                         if (out_pos + margin >= OUT_BUF_SIZE) flush_buffer();
-                        int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                        int n;
+                        if (rescue_score > 0.0) {
+                            n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                                         "%s\t%d\t%d\t%s\t%.4f\n",
+                                         sid.c_str(), strand, confi_id, wseq.c_str(),
+                                         rescue_score);
+                        } else {
+                            n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
                                          "%s\t%d\t%d\t%s\n",
                                          sid.c_str(), strand, confi_id, wseq.c_str());
+                        }
                         if (n > 0) out_pos += static_cast<size_t>(n);
                         if (out_pos > OUT_BUF_SIZE * 0.8) flush_buffer();
-                    });
+                    },
+                    verify_fn);
             } else {
-                auto [confi_id, strand] = validate_read(read.seq, mqm, mer_size, -1, cfg);
+                double rescue_score = 0.0;
+                auto [confi_id, strand] = validate_read_verified(read.seq, mqm, mer_size, -1,
+                                                                  cfg, verify_fn, &rescue_score);
                 if (confi_id > -1) {
                     if (out_pos + 512 >= OUT_BUF_SIZE) flush_buffer();
-                    int n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                    int n;
+                    if (rescue_score > 0.0) {
+                        n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
+                                     "%s\t%d\t%d\t%s\t%.4f\n",
+                                     read.seq_id.c_str(), strand, confi_id,
+                                     read.seq.c_str(), rescue_score);
+                    } else {
+                        n = snprintf(out_buf.data() + out_pos, OUT_BUF_SIZE - out_pos,
                                      "%s\t%d\t%d\t%s\n",
                                      read.seq_id.c_str(), strand, confi_id, read.seq.c_str());
+                    }
                     if (n > 0) {
                         out_pos += static_cast<size_t>(n);
                     }
@@ -498,6 +583,15 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--max-assign") {
             if (++i >= argc) throw std::runtime_error("Missing value for --max-assign");
             args.max_assign = std::stoi(argv[i]);
+        } else if (arg == "--rescue-panels") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --rescue-panels");
+            args.rescue_panels = argv[i];
+        } else if (arg == "--rescue-tau") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --rescue-tau");
+            args.rescue_tau = std::stod(argv[i]);
+        } else if (arg == "--t3") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --t3");
+            args.t3 = parse_gate_row(argv[i]);
         } else if (arg == "--tiers") {
             if (++i >= argc) throw std::runtime_error("Missing value for --tiers");
             for (auto& t : parse_tiers(argv[i])) args.extra_tiers.push_back(t);
@@ -586,7 +680,11 @@ int main(int argc, char* argv[]) {
                       << "                        quote the whole list. ms defaults to 25. Rows are\n"
                       << "                        sorted by vote_ratio (desc); a row with lower\n"
                       << "                        vote_ratio must not have a lower min_c than the row\n"
-                      << "                        above. Max 6 rows in total.\n";
+                      << "                        above. Max 6 rows in total.\n"
+                      << "  --rescue-panels <msa> In-validate T3 rescue: per-element panels from the\n"
+                      << "                        leave-one-out MSA (top-3 longest non-ref sequences)\n"
+                      << "  --rescue-tau <f>      Normalized SW score threshold for the T3 rescue\n"
+                      << "  --t3 \"<rv,mc[,ms]>\"   Near-miss gate row (default: 1.5,5,25)\n";
             return 1;
         }
 
@@ -602,6 +700,36 @@ int main(int argc, char* argv[]) {
 
         // Validate CLI-derived gate matrix before touching disk or loading data
         ValidatorConfig cfg = build_validator_config(args);
+
+        // In-validate T3 rescue: load per-element panels and prepare the SIMD
+        // SW verification context (shared read-only across workers).
+        std::unordered_map<int, std::vector<std::string>> panels;
+        VerifyContext vc;
+        std::atomic<long long> v_tried{0}, v_passed{0}, v_pairs{0};
+        if (!args.rescue_panels.empty()) {
+            if (args.rescue_tau < 0.0) {
+                std::cerr << "Error: --rescue-panels requires --rescue-tau\n";
+                return 1;
+            }
+            std::cerr << "Loading rescue panels from " << args.rescue_panels << " ...\n";
+            panel_core::load_panels(args.rescue_panels, 3, panels);
+            size_t nseq = 0;
+            for (const auto& kv : panels) nseq += kv.second.size();
+            std::cerr << "  panels: " << panels.size() << " elements, " << nseq
+                      << " sequences; T3=" << args.t3.vote_ratio << ","
+                      << args.t3.min_c << "," << args.t3.min_span
+                      << " tau=" << args.rescue_tau << "\n";
+            cfg.verify.enabled = true;
+            cfg.verify.t3 = args.t3;
+            cfg.verify.tau = args.rescue_tau;
+            vc.panels = &panels;
+            vc.tau = args.rescue_tau;
+            vc.mat = parasail_matrix_create("ACGT", 2, -1);
+            if (!vc.mat) throw std::runtime_error("parasail_matrix_create failed");
+            vc.tried = &v_tried;
+            vc.passed = &v_passed;
+            vc.pairs = &v_pairs;
+        }
 
         // Load mers table
         std::cerr << "Loading mers table from " << args.mers_file << " ...\n";
@@ -650,6 +778,7 @@ int main(int argc, char* argv[]) {
             workers.emplace_back(worker_thread, i, std::ref(queue),
                                  std::cref(mqm), mer_size,
                                  std::cref(cfg),
+                                 std::cref(vc),
                                  std::cref(args.output_dir),
                                  std::ref(processed));
         }
@@ -677,6 +806,12 @@ int main(int argc, char* argv[]) {
         // Wait for monitor
         processed.store(n_total);
         monitor.join();
+
+        if (vc.mat) {
+            parasail_matrix_free(vc.mat);
+            std::cerr << "  T3 rescue: verified=" << v_tried
+                      << ", passed=" << v_passed << ", sw_pairs=" << v_pairs << "\n";
+        }
 
         if (validate_profile_enabled()) {
             std::cerr << "[profile] windows=" << g_val_profile.windows

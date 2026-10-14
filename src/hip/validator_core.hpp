@@ -179,12 +179,23 @@ struct GateTier {
     int min_span = 25;
 };
 
+// In-validate rescue: windows/reads that fail every strict tier but reach the
+// slightly looser T3 row are verified with SIMD Smith-Waterman against the
+// element's panel(s); a normalized score >= tau emits them as validated
+// evidence (same downstream assembly path as the strict output).
+struct VerifyConfig {
+    bool enabled = false;
+    GateTier t3{1.5, 5, 25};
+    double tau = 0.9;
+};
+
 struct ValidatorConfig {
     int window_size = 150;
     int step_size = 25;
     double vote_frac = 0.1;
     int max_diff = 2;
     std::vector<GateTier> tiers = {GateTier{}};   // T1 OR T2 ...
+    VerifyConfig verify;
 };
 
 // chain_fn(best_id) -> (passing, span); invoked at most once per window.
@@ -221,6 +232,20 @@ inline bool gate_pass(const VoteTally& t, const ValidatorConfig& cfg, ChainFn&& 
         }
     }
     return false;
+}
+
+// T3 rescue gate: evaluated only when the strict rows failed. Uses the strict
+// concentration threshold (vote_frac) and the relaxed T3 chain/dominance row.
+template <typename ChainFn>
+inline std::pair<int, int> rescue_gate(const VoteTally& t, const ValidatorConfig& cfg,
+                                       ChainFn&& chain_fn) {
+    if (!cfg.verify.enabled || t.best_id < 0) return {-1, 0};
+    const double threshold = static_cast<double>(cfg.vote_frac) * t.n;
+    if (!(static_cast<double>(t.best_cnt) > threshold)) return {-1, 0};
+    if (t.best_cnt < static_cast<int>(cfg.verify.t3.vote_ratio * t.second_cnt)) return {-1, 0};
+    auto cs = chain_fn(t.best_id);
+    if (cs.first < cfg.verify.t3.min_c || cs.second < cfg.verify.t3.min_span) return {-1, 0};
+    return {t.best_id, t.best_cnt};
 }
 
 
@@ -386,18 +411,25 @@ public:
 
 // ─── validate_read ───
 
-inline std::pair<int, int> validate_read(
+// Reads-mode validation with optional T3 rescue verification. `verify` is
+// invoked only when both strands fail the strict gates and T3 passes for a
+// strand; it receives the read (forward orientation) and the strand to test.
+template <typename Verify>
+inline std::pair<int, int> validate_read_verified(
     const std::string& seq,
     const MerQueryManager& compressed_mer_query,
     int mer_size,
-    int target_ele_id = -1,
-    const ValidatorConfig& cfg = ValidatorConfig{})
+    int target_ele_id,
+    const ValidatorConfig& cfg,
+    Verify&& verify,
+    double* rescue_score = nullptr)
 {
     thread_local std::vector<int> match_ids;
     thread_local std::vector<int> match_starts;
     thread_local std::vector<int> match_loci;
 
-    auto validate_chain = [&](const std::string& chain) -> std::pair<int, int> {
+    auto validate_chain = [&](const std::string& chain, int& r_ele, int& r_votes)
+        -> std::pair<int, int> {
         match_ids.clear();
         match_starts.clear();
         match_loci.clear();
@@ -473,18 +505,43 @@ inline std::pair<int, int> validate_read(
         };
 
         int passing = 0, span = 0;
-        if (!gate_pass(tally, cfg, chain_of, passing, span)) return {-1, 0};
+        if (!gate_pass(tally, cfg, chain_of, passing, span)) {
+            auto rg = rescue_gate(tally, cfg, chain_of);
+            if (rg.first >= 0) {
+                r_ele = rg.first;
+                r_votes = rg.second;
+            }
+            return {-1, 0};
+        }
 
         return {tally.best_id, static_cast<int>(tally.n)};
     };
 
-    auto [forward_id, forward_count] = validate_chain(seq);
+    int f_ele = -1, f_votes = 0, r_ele = -1, r_votes = 0;
+    auto [forward_id, forward_count] = validate_chain(seq, f_ele, f_votes);
 
     thread_local std::string _rc_buf;
     reverse_complement(seq, _rc_buf);
-    auto [reverse_id, reverse_count] = validate_chain(_rc_buf);
+    auto [reverse_id, reverse_count] = validate_chain(_rc_buf, r_ele, r_votes);
 
     if (forward_id == -1 && reverse_id == -1) {
+        if (cfg.verify.enabled) {
+            int ele = -1, strand = 0;
+            if (f_ele >= 0 && (r_ele < 0 || f_votes >= r_votes)) {
+                ele = f_ele;
+                strand = 1;
+            } else if (r_ele >= 0) {
+                ele = r_ele;
+                strand = -1;
+            }
+            if (ele >= 0) {
+                double sc = verify(ele, seq, strand);
+                if (sc > 0.0) {
+                    if (rescue_score) *rescue_score = sc;
+                    return {ele, strand};
+                }
+            }
+        }
         return {-1, 0};
     } else if (forward_id == -1) {
         return {reverse_id, -1};
@@ -495,6 +552,18 @@ inline std::pair<int, int> validate_read(
                std::make_pair(forward_id, 1) :
                std::make_pair(reverse_id, -1);
     }
+}
+
+// Strict-only wrapper (rescue verification disabled).
+inline std::pair<int, int> validate_read(
+    const std::string& seq,
+    const MerQueryManager& compressed_mer_query,
+    int mer_size,
+    int target_ele_id = -1,
+    const ValidatorConfig& cfg = ValidatorConfig{})
+{
+    return validate_read_verified(seq, compressed_mer_query, mer_size, target_ele_id, cfg,
+                                  [](int, const std::string&, int) { return 0.0; });
 }
 
 
@@ -515,13 +584,14 @@ inline uint32_t rc_code_2bit(uint32_t code, int k) {
     return res;
 }
 
-template <typename Emit>
+template <typename Emit, typename Verify>
 inline void validate_sequence_segmented(
     const std::string& seq,
     const MerQueryManager& mqm,
     int start_offset,
     const ValidatorConfig& cfg,
-    Emit&& emit)
+    Emit&& emit,
+    Verify&& verify)
 {
     const int k = mqm.mer_size;
     const int window_size = cfg.window_size;
@@ -857,12 +927,33 @@ inline void validate_sequence_segmented(
                     std::chrono::steady_clock::now() - _tt).count();
             }
 
-            if (!fwd_ok && !rev_ok) continue;
-            if (vp) ++g_val_profile.emits;
-            if (!fwd_ok) emit(s, -1, rev_id);
-            else if (!rev_ok) emit(s, 1, fwd_id);
-            else if (fwd_count >= rev_count) emit(s, 1, fwd_id);
-            else emit(s, -1, rev_id);
+            if (fwd_ok || rev_ok) {
+                if (vp) ++g_val_profile.emits;
+                if (!fwd_ok) emit(s, -1, rev_id, 0.0);
+                else if (!rev_ok) emit(s, 1, fwd_id, 0.0);
+                else if (fwd_count >= rev_count) emit(s, 1, fwd_id, 0.0);
+                else emit(s, -1, rev_id, 0.0);
+            } else if (cfg.verify.enabled) {
+                // T3 near-miss: SIMD SW verification decides (both strands).
+                auto rf = rescue_gate(fwd_t, cfg, chain_fwd);
+                auto rr = rescue_gate(rev_t, cfg, chain_rc);
+                int ele = -1, strand = 0;
+                if (rf.first >= 0 && (rr.first < 0 || rf.second >= rr.second)) {
+                    ele = rf.first;
+                    strand = 1;
+                } else if (rr.first >= 0) {
+                    ele = rr.first;
+                    strand = -1;
+                }
+                if (ele >= 0) {
+                    std::string w(seq, s, window_size);
+                    double sc = verify(ele, w, strand);
+                    if (sc > 0.0) {
+                        if (vp) ++g_val_profile.emits;
+                        emit(s, strand, ele, sc);
+                    }
+                }
+            }
         }
         if (vp) {
             tl_win_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
