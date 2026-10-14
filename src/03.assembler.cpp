@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -48,6 +49,7 @@ struct Read {
     std::string chr;
     int start = 0;
     int end = 0;
+    double rescue = 0.0;   // T3 rescue score from validate (0 = strict output)
 };
 
 Args parse_args(int argc, char* argv[]) {
@@ -330,6 +332,69 @@ bool filter_contig(const std::string& seq, const MerQueryManager& mqm, int mer_s
     cfg.tiers[0].min_c = min_c;
     auto [confi_id, _] = validate_read(seq, mqm, mer_size, -1, cfg);
     return confi_id == ele_id;
+}
+
+// Reads-mode locus clustering (always on, sequence-only): two reads are linked
+// into the same locus cluster when their weighted shared k-mer support reaches
+// kClusterMinScore. Each shared element k-mer contributes 1/(number of reads
+// carrying it), so cross-locus repeat k-mers (present in many reads) barely
+// count while same-locus k-mers count strongly. Clusters are assembled
+// separately and the best-supported one is kept, so repeat reads cannot
+// pollute the contig.
+static constexpr double kClusterMinScore = 2.0;
+
+static std::vector<int> cluster_reads_by_shared_kmers(
+    const std::vector<std::string>& reads, int k)
+{
+    const int n = static_cast<int>(reads.size());
+    std::vector<int> parent(n);
+    for (int i = 0; i < n; ++i) parent[i] = i;
+    if (n < 2) return parent;
+
+    auto find_root = [&](int x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    };
+
+    std::unordered_map<uint32_t, std::vector<int>> occ;
+    for (int i = 0; i < n; ++i) {
+        const std::string& s = reads[i];
+        const int last = static_cast<int>(s.size()) - k;
+        for (int p = 0; p <= last; ++p) {
+            uint32_t code;
+            if (!encode_mer_at(s, static_cast<size_t>(p), static_cast<size_t>(k), code))
+                continue;
+            auto& lst = occ[code];
+            if (!lst.empty() && lst.back() == i) continue;
+            lst.push_back(i);
+        }
+    }
+
+    std::unordered_map<uint64_t, double> pair_score;
+    for (const auto& kv : occ) {
+        const auto& lst = kv.second;
+        if (lst.size() < 2 || lst.size() > 128) continue;
+        const double w = 1.0 / static_cast<double>(lst.size());
+        for (size_t a = 0; a + 1 < lst.size(); ++a) {
+            for (size_t b = a + 1; b < lst.size(); ++b) {
+                int x = lst[a], y = lst[b];
+                if (x > y) std::swap(x, y);
+                pair_score[(static_cast<uint64_t>(x) << 32) |
+                           static_cast<uint32_t>(y)] += w;
+            }
+        }
+    }
+    for (const auto& kv : pair_score) {
+        if (kv.second < kClusterMinScore) continue;
+        int a = find_root(static_cast<int>(kv.first >> 32));
+        int b = find_root(static_cast<int>(kv.first & 0xffffffffu));
+        if (a != b) parent[b] = a;
+    }
+    for (int i = 0; i < n; ++i) parent[i] = find_root(i);
+    return parent;
 }
 
 std::unordered_map<int, std::string> load_cne_refs(const std::string& path) {
@@ -648,6 +713,44 @@ static void process_genome_element(
         try_range(*cr);
     }
 
+    static const bool rescue_handoff =
+        std::getenv("MERCURY_NO_RESCUE_HANDOFF") == nullptr;
+    if (best_did.empty() && rescue_handoff) {
+        // T3 rescue handoff: validate already SW-verified these windows against
+        // the element panel; mer-based gates do not apply to them. Emit the
+        // best-scoring window as the element's claim.
+        const Read* best_r = nullptr;
+        double best_rs = 0.0;
+        for (size_t i = begin; i < end; ++i) {
+            const auto& r = all_reads[i];
+            if (r.rescue > best_rs) {
+                best_rs = r.rescue;
+                best_r = &r;
+            }
+        }
+        if (best_r != nullptr) {
+            std::string seq = best_r->seq;
+            for (char& c : seq) {
+                if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+            }
+            for (char& c : seq) {
+                if (c != 'A' && c != 'C' && c != 'G' && c != 'T') c = 'N';
+            }
+            if (best_r->strand == -1) {
+                thread_local std::string _rc_rescue;
+                reverse_complement(seq, _rc_rescue);
+                seq = _rc_rescue;
+            }
+            if (seq.size() >= 20) {
+                char s = best_r->strand == 1 ? '+' : '-';
+                std::string did = std::to_string(cur_ele) + "." + best_r->chr + ":" +
+                    std::to_string(best_r->start) + "-" + std::to_string(best_r->end) +
+                    "(" + s + ")";
+                out.push_back(GenomeResult{cur_ele, std::move(did), std::move(seq)});
+            }
+        }
+    }
+
     if (!best_did.empty()) {
         out.push_back(GenomeResult{cur_ele, std::move(best_did), std::move(best_seq)});
     }
@@ -720,7 +823,11 @@ int main(int argc, char* argv[]) {
                 std::string seq_id = line.substr(0, t1);
                 int strand = std::stoi(line.substr(t1 + 1, t2 - t1 - 1));
                 int ele_id = std::stoi(line.substr(t2 + 1, t3 - t2 - 1));
-                std::string seq = line.substr(t3 + 1);
+                // Optional 5th column: rescue score from validate (tab-separated).
+                size_t t4 = line.find('\t', t3 + 1);
+                std::string seq = (t4 == std::string::npos)
+                    ? line.substr(t3 + 1)
+                    : line.substr(t3 + 1, t4 - t3 - 1);
 
                 if (seq.empty()) continue;
 
@@ -729,6 +836,10 @@ int main(int argc, char* argv[]) {
                 read.strand = strand;
                 read.ele_id = ele_id;
                 read.seq = seq;
+                if (t4 != std::string::npos) {
+                    try { read.rescue = std::stod(line.substr(t4 + 1)); }
+                    catch (...) { read.rescue = 0.0; }
+                }
 
                 GenomePos gp;
                 if (!is_genome && parse_genome_id(seq_id, gp)) {
@@ -793,6 +904,8 @@ int main(int argc, char* argv[]) {
                 // Reads mode: one group per element
                 std::vector<std::string> reads;
                 reads.reserve(args.max_reads);
+                std::vector<double> rescues;   // parallel to reads: T3 rescue score
+                rescues.reserve(args.max_reads);
                 int cnt = 0;
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele && cnt < args.max_reads) {
                     const auto& r = all_reads[idx];
@@ -832,25 +945,141 @@ int main(int argc, char* argv[]) {
                         }
                     }
                     reads.push_back(std::move(local_seq));
+                    rescues.push_back(r.rescue);
                     ++idx;
                     ++cnt;
                 }
                 // Skip remaining reads of this element
                 while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele) ++idx;
 
-                std::string contig = debruijn_assemble(reads, args.kmer, args.min_count, mqm, cur_ele, snp_out_ptr, gfa_out_ptr);
-                if (contig.empty()) continue;
+                // Best-cluster assembly (same semantics as genome mode): split
+                // the element's reads into locus-pure clusters, assemble each,
+                // trim, apply the repeat-chimera guard and keep the contig with
+                // the highest element-mer hit count.
+                std::string contig;
+                size_t best_support = 0;
+                int last_second_hits = -1;
+                int last_total_reads = 0;
+                int last_groups = 0;
+                if (reads.size() >= 2) {
+                    std::vector<int> labels =
+                        cluster_reads_by_shared_kmers(reads, args.kmer);
+                    std::unordered_map<int, std::vector<int>> groups;
+                    for (int i = 0; i < static_cast<int>(labels.size()); ++i)
+                        groups[labels[i]].push_back(i);
+                    double best_score = -1.0;
+                    int second_hits = -1;
+                    for (const auto& kv : groups) {
+                        if (kv.second.size() < 2) continue;
+                        std::vector<std::string> sub;
+                        sub.reserve(kv.second.size());
+                        for (int i : kv.second) sub.push_back(reads[i]);
+                        std::string c = debruijn_assemble(sub, args.kmer, args.min_count,
+                                                          mqm, cur_ele, snp_out_ptr,
+                                                          gfa_out_ptr);
+                        if (c.empty()) continue;
+                        if (args.trim) {
+                            auto it = cne_refs.find(cur_ele);
+                            if (it != cne_refs.end()) {
+                                trim_contig_sw(c, it->second, mqm, cur_ele);
+                            } else {
+                                trim_contig(c, mqm, cur_ele);
+                            }
+                        }
+                        if (c.size() < 20) continue;
+                        ContigScore sc = score_contig(c, mqm, cur_ele);
+                        bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
+                            static_cast<double>(sc.hits) / sc.distinct > 2.0;
+                        if (repeat_chimera) continue;
+                        double score = static_cast<double>(sc.hits);
+                        if (score > best_score ||
+                            (score == best_score && kv.second.size() > best_support) ||
+                            (score == best_score && kv.second.size() == best_support &&
+                             c.size() > contig.size())) {
+                            if (best_score >= 0 &&
+                                static_cast<int>(best_score) > second_hits)
+                                second_hits = static_cast<int>(best_score);
+                            contig = std::move(c);
+                            best_score = score;
+                            best_support = kv.second.size();
+                        } else if (static_cast<int>(score) > second_hits) {
+                            second_hits = static_cast<int>(score);
+                        }
+                    }
+                    last_second_hits = second_hits;
+                    last_total_reads = static_cast<int>(reads.size());
+                    last_groups = static_cast<int>(groups.size());
+                }
+                // Output evidence floor: a claim needs at least this many
+                // distinct element mers, otherwise it is a short/repeat junk
+                // fragment (precision parity with genome mode). A contig that
+                // fails the floor counts as "no acceptable output".
+                static constexpr int kMinOutputDistinct = 12;
+                static constexpr int kMinFallbackDistinct = 16;
+                if (!contig.empty()) {
+                    ContigScore sc = score_contig(contig, mqm, cur_ele);
+                    if (sc.distinct < kMinOutputDistinct) contig.clear();
+                }
 
-                if (args.trim) {
-                    auto it = cne_refs.find(cur_ele);
-                    if (it != cne_refs.end()) {
-                        trim_contig_sw(contig, it->second, mqm, cur_ele);
+                bool rescued = false;
+                if (contig.empty()) {
+                    // Fallback: the element's verified reads are still
+                    // evidence, so emit the single read carrying the most
+                    // distinct element mers (a cheap, alignment-free fidelity
+                    // proxy: a true-locus read covers many different element
+                    // mers, repeat-derived noise covers few). Same semantics as
+                    // genome mode: no claim unless the floor is cleared.
+                    int best_dist = -1;
+                    size_t best_idx = 0;
+                    for (size_t i = 0; i < reads.size(); ++i) {
+                        ContigScore sc = score_contig(reads[i], mqm, cur_ele);
+                        if (sc.distinct > best_dist) {
+                            best_dist = sc.distinct;
+                            best_idx = i;
+                        }
+                    }
+                    if (best_dist >= kMinFallbackDistinct) {
+                        contig = std::move(reads[best_idx]);
+                        if (args.trim) {
+                            auto it = cne_refs.find(cur_ele);
+                            if (it != cne_refs.end()) {
+                                trim_contig_sw(contig, it->second, mqm, cur_ele);
+                            } else {
+                                trim_contig(contig, mqm, cur_ele);
+                            }
+                        }
+                        if (contig.size() < 20) continue;
                     } else {
-                        trim_contig(contig, mqm, cur_ele);
+                        // T3 rescue handoff: validate already SW-verified these
+                        // reads against the element panel, so the mer-distinct
+                        // floor does not apply. Emit the best-scoring one as-is
+                        // (mer-based trimming would cut it to nothing).
+                        static const bool rescue_handoff =
+                            std::getenv("MERCURY_NO_RESCUE_HANDOFF") == nullptr;
+                        if (!rescue_handoff) continue;
+                        size_t ri = reads.size();
+                        double best_rs = 0.0;
+                        for (size_t i = 0; i < reads.size(); ++i) {
+                            if (rescues[i] > best_rs) {
+                                best_rs = rescues[i];
+                                ri = i;
+                            }
+                        }
+                        if (ri == reads.size()) continue;
+                        contig = std::move(reads[ri]);
+                        rescued = true;
+                        if (contig.size() < 20) continue;
                     }
                 }
-                if (contig.size() < 20) continue;
 
+                ContigScore final_sc = score_contig(contig, mqm, cur_ele);
+                if (!rescued && final_sc.distinct < kMinOutputDistinct) continue;
+                if (std::getenv("MERCURY_ASM_DEBUG")) {
+                    std::fprintf(stderr, "ASMDBG\t%d\t%zu\t%d\t%d\t%zu\t%d\t%d\t%d\n",
+                                 cur_ele, contig.size(), final_sc.hits,
+                                 final_sc.distinct, best_support,
+                                 last_total_reads, last_groups, last_second_hits);
+                }
                 results.emplace_back(std::to_string(cur_ele), contig);
             }
         } else {
