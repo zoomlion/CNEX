@@ -7,6 +7,9 @@ src/02.validate
 *.gcda
 profile/
 
+# Local parasail vendor (pip copy; replace with the upstream submodule)
+src/parasail/
+
 # Python cache
 __pycache__/
 *.pyc
