@@ -727,15 +727,16 @@ int main(int argc, char* argv[]) {
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
 
-        // Build the direct-index accelerator for genome-mode window scans
-        // (k <= 13). Reads mode does not use it, so skip it there.
+        // Build the direct-index accelerator for window/read scans (k <= 13).
+        // Both modes use it now: genome-mode prep and the reads-mode chain
+        // scan probe it instead of the hash map.
         bool genome_input = (args.input_type == Args::InputType::GENOME);
         if (!genome_input && !args.reads_files.empty() &&
             args.input_type == Args::InputType::AUTO &&
             detect_file_type(args.reads_files[0], args.pigz_path) == FileType::FASTA) {
             genome_input = true;
         }
-        if (genome_input && mer_size >= 7) {
+        if (mer_size >= 7) {
             mqm.build_direct_index();
             if (!mqm.has_direct_index())
                 std::cerr << "  (direct index unavailable for k=" << mer_size

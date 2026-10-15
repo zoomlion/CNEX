@@ -451,6 +451,7 @@ inline std::pair<int, int> validate_read_verified(
         uint32_t rolling = 0;
         uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * mer_size_local)) - 1);
         int valid_run = 0;
+        const bool use_direct = compressed_mer_query.has_direct_index();
 
         for (int i = 0; i < chain_len; ++i) {
             int8_t bits = base_lookup[static_cast<unsigned char>(chain[i])];
@@ -463,10 +464,18 @@ inline std::pair<int, int> validate_read_verified(
             valid_run++;
             if (valid_run >= mer_size_local) {
                 int start = i - mer_size_local + 1;
-                auto it = compressed_mer_query.compressed_mer_query.find(rolling);
-                if (it != compressed_mer_query.compressed_mer_query.end()) {
-                    uint32_t off = MerQueryManager::range_off(it->second);
-                    uint32_t cnt = MerQueryManager::range_cnt(it->second);
+                uint64_t range = 0;
+                if (use_direct) {
+                    uint32_t rank = compressed_mer_query.direct_index[rolling];
+                    if (rank) range = compressed_mer_query.direct_rng[rank - 1];
+                } else {
+                    auto it = compressed_mer_query.compressed_mer_query.find(rolling);
+                    if (it != compressed_mer_query.compressed_mer_query.end())
+                        range = it->second;
+                }
+                if (range) {
+                    uint32_t off = MerQueryManager::range_off(range);
+                    uint32_t cnt = MerQueryManager::range_cnt(range);
                     for (uint32_t a = 0; a < cnt; ++a) {
                         int id = compressed_mer_query.assign_arena[off + a].first;
                         int loci = compressed_mer_query.assign_arena[off + a].second;
