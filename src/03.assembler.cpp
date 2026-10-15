@@ -25,7 +25,6 @@ struct Args {
     std::string mers_file;
     std::string output = "assembled.fasta";
     int kmer = 19;
-    int min_c = 3;
     int min_count = 2;
     int max_reads = 200;
     int max_loci_gap = 5000;
@@ -95,9 +94,6 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "-k" || arg == "--kmer") {
             if (++i >= argc) throw std::runtime_error("Missing value for --kmer");
             args.kmer = std::stoi(argv[i]);
-        } else if (arg == "--min-c") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --min-c");
-            args.min_c = std::stoi(argv[i]);
         } else if (arg == "--min-count") {
             if (++i >= argc) throw std::runtime_error("Missing value for --min-count");
             args.min_count = std::stoi(argv[i]);
@@ -346,16 +342,6 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
     if (trimmed.size() >= 20) {
         seq = std::move(trimmed);
     }
-}
-
-bool filter_contig(const std::string& seq, const MerQueryManager& mqm, int mer_size,
-                   int ele_id, int min_c)
-{
-    if ((int)seq.size() < mer_size + min_c) return true;
-    ValidatorConfig cfg;
-    cfg.tiers[0].min_c = min_c;
-    auto [confi_id, _] = validate_read(seq, mqm, mer_size, -1, cfg);
-    return confi_id == ele_id;
 }
 
 // Reads-mode locus clustering (always on, sequence-only): two reads are linked
@@ -769,7 +755,6 @@ int main(int argc, char* argv[]) {
                       << "  --mers <file>         Mers table (required)\n"
                       << "  -o, --output <file>   Output FASTA (default: assembled.fasta)\n"
                       << "  -k, --kmer <n>        K-mer length (default: 19)\n"
-                      << "  --min-c <n>           Min k-mer matches for validation (default: 3)\n"
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"

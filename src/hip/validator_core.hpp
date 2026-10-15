@@ -281,11 +281,6 @@ public:
         }
     }
 
-    inline uint64_t direct_query(uint32_t code) const {
-        uint32_t r = direct_index[code];
-        return r ? direct_rng[r - 1] : 0;
-    }
-
     static inline uint64_t pack_range(uint64_t off, uint64_t cnt) {
         return (off << 32) | (cnt & 0xffffffffULL);
     }
