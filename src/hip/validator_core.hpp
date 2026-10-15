@@ -448,41 +448,124 @@ inline std::pair<int, int> validate_read_verified(
         match_starts.reserve(chain_len);
         match_loci.reserve(chain_len);
 
-        uint32_t rolling = 0;
-        uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * mer_size_local)) - 1);
-        int valid_run = 0;
+        const uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * mer_size_local)) - 1);
         const bool use_direct = compressed_mer_query.has_direct_index();
+        const int k = mer_size_local;
+        const int n_codes = chain_len - k + 1;
 
-        for (int i = 0; i < chain_len; ++i) {
-            int8_t bits = base_lookup[static_cast<unsigned char>(chain[i])];
-            if (bits < 0) {
-                valid_run = 0;
-                rolling = 0;
-                continue;
-            }
-            rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
-            valid_run++;
-            if (valid_run >= mer_size_local) {
-                int start = i - mer_size_local + 1;
-                uint64_t range = 0;
-                if (use_direct) {
-                    uint32_t rank = compressed_mer_query.direct_index[rolling];
-                    if (rank) range = compressed_mer_query.direct_rng[rank - 1];
-                } else {
-                    auto it = compressed_mer_query.compressed_mer_query.find(rolling);
-                    if (it != compressed_mer_query.compressed_mer_query.end())
-                        range = it->second;
+        // Pass 1: rolling 2-bit code of every k-mer start position. Positions
+        // covered by a non-ACGT base stay UINT32_MAX and are never probed.
+        thread_local std::vector<uint32_t> scan_codes;
+        scan_codes.assign(n_codes, UINT32_MAX);
+        {
+            uint32_t rolling = 0;
+            int valid_run = 0;
+            for (int i = 0; i < chain_len; ++i) {
+                int8_t bits = base_lookup[static_cast<unsigned char>(chain[i])];
+                if (bits < 0) {
+                    valid_run = 0;
+                    rolling = 0;
+                    continue;
                 }
-                if (range) {
-                    uint32_t off = MerQueryManager::range_off(range);
-                    uint32_t cnt = MerQueryManager::range_cnt(range);
-                    for (uint32_t a = 0; a < cnt; ++a) {
-                        int id = compressed_mer_query.assign_arena[off + a].first;
-                        int loci = compressed_mer_query.assign_arena[off + a].second;
-                        if (target_ele_id == -1 || id == target_ele_id) {
-                            match_ids.push_back(id);
-                            match_starts.push_back(start);
-                            match_loci.push_back(loci);
+                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
+                ++valid_run;
+                if (valid_run >= k) scan_codes[i - k + 1] = rolling;
+            }
+        }
+
+        if (use_direct) {
+            // Passes 2-4: resolve code -> rank -> range -> assignment rows with
+            // software prefetching one level ahead, so the three dependent
+            // random accesses overlap instead of stalling the scan.
+            constexpr int kPf = 32;
+            thread_local std::vector<uint32_t> scan_ranks;
+            thread_local std::vector<uint64_t> scan_ranges;
+            scan_ranks.assign(n_codes, 0);
+            scan_ranges.assign(n_codes, 0);
+
+            const int ramp = std::min(kPf, n_codes);
+            for (int s = 0; s < ramp; ++s) {
+                uint32_t c = scan_codes[s];
+                if (c != UINT32_MAX)
+                    __builtin_prefetch(&compressed_mer_query.direct_index[c]);
+            }
+            for (int s = 0; s < n_codes; ++s) {
+                int pf = s + kPf;
+                if (pf < n_codes) {
+                    uint32_t c = scan_codes[pf];
+                    if (c != UINT32_MAX)
+                        __builtin_prefetch(&compressed_mer_query.direct_index[c]);
+                }
+                uint32_t c = scan_codes[s];
+                if (c == UINT32_MAX) continue;
+                uint32_t rank = compressed_mer_query.direct_index[c];
+                if (rank) scan_ranks[s] = rank;
+            }
+            for (int s = 0; s < ramp; ++s) {
+                if (scan_ranks[s])
+                    __builtin_prefetch(&compressed_mer_query.direct_rng[scan_ranks[s] - 1]);
+            }
+            for (int s = 0; s < n_codes; ++s) {
+                int pf = s + kPf;
+                if (pf < n_codes && scan_ranks[pf])
+                    __builtin_prefetch(&compressed_mer_query.direct_rng[scan_ranks[pf] - 1]);
+                uint32_t rank = scan_ranks[s];
+                if (rank) scan_ranges[s] = compressed_mer_query.direct_rng[rank - 1];
+            }
+            for (int s = 0; s < ramp; ++s) {
+                uint64_t rp = scan_ranges[s];
+                if (rp)
+                    __builtin_prefetch(
+                        &compressed_mer_query.assign_arena[MerQueryManager::range_off(rp)]);
+            }
+            for (int s = 0; s < n_codes; ++s) {
+                int pf = s + kPf;
+                if (pf < n_codes) {
+                    uint64_t rp = scan_ranges[pf];
+                    if (rp)
+                        __builtin_prefetch(
+                            &compressed_mer_query.assign_arena[MerQueryManager::range_off(rp)]);
+                }
+                uint64_t range = scan_ranges[s];
+                if (!range) continue;
+                uint32_t off = MerQueryManager::range_off(range);
+                uint32_t cnt = MerQueryManager::range_cnt(range);
+                for (uint32_t a = 0; a < cnt; ++a) {
+                    int id = compressed_mer_query.assign_arena[off + a].first;
+                    int loci = compressed_mer_query.assign_arena[off + a].second;
+                    if (target_ele_id == -1 || id == target_ele_id) {
+                        match_ids.push_back(id);
+                        match_starts.push_back(s);
+                        match_loci.push_back(loci);
+                    }
+                }
+            }
+        } else {
+            uint32_t rolling = 0;
+            int valid_run = 0;
+            for (int i = 0; i < chain_len; ++i) {
+                int8_t bits = base_lookup[static_cast<unsigned char>(chain[i])];
+                if (bits < 0) {
+                    valid_run = 0;
+                    rolling = 0;
+                    continue;
+                }
+                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
+                valid_run++;
+                if (valid_run >= mer_size_local) {
+                    int start = i - mer_size_local + 1;
+                    auto it = compressed_mer_query.compressed_mer_query.find(rolling);
+                    if (it != compressed_mer_query.compressed_mer_query.end()) {
+                        uint32_t off = MerQueryManager::range_off(it->second);
+                        uint32_t cnt = MerQueryManager::range_cnt(it->second);
+                        for (uint32_t a = 0; a < cnt; ++a) {
+                            int id = compressed_mer_query.assign_arena[off + a].first;
+                            int loci = compressed_mer_query.assign_arena[off + a].second;
+                            if (target_ele_id == -1 || id == target_ele_id) {
+                                match_ids.push_back(id);
+                                match_starts.push_back(start);
+                                match_loci.push_back(loci);
+                            }
                         }
                     }
                 }
