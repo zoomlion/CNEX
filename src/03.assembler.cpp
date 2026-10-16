@@ -25,7 +25,7 @@ struct Args {
     std::string mers_file;
     std::string output = "assembled.fasta";
     int kmer = 19;
-    int min_count = 2;
+    int min_count = 1;
     int max_reads = 200;
     int max_loci_gap = 5000;
     int max_assign = 3;   // load-time cap; 0 = keep all
@@ -34,6 +34,7 @@ struct Args {
     bool trim = true;
     bool trim_set = false;
     bool no_trim_set = false;
+    bool sw_trim = false;
     double repeat_ratio = 1.2;
     bool output_snp = false;
     bool help_requested = false;
@@ -67,6 +68,17 @@ static inline void normalize_read_seq(std::string& seq, int strand) {
     }
 }
 
+// Shared output evidence floors (both assembly modes):
+//   - a de Bruijn contig needs >= 12 distinct element mers, or >= 8 when the
+//     contig verifies against the cross-species CNE reference;
+//   - a single-sequence claim (reads-mode fallback, genome single-window
+//     cluster) needs >= 16 distinct element mers on its own.
+static constexpr int kMinOutputDistinct = 12;
+static constexpr int kMinOutputDistinctLow = 8;
+static constexpr size_t kMinOutputSupportLow = 4;
+static constexpr double kMinCneRefIdentity = 0.75;
+static constexpr int kMinFallbackDistinct = 16;
+
 static inline bool asm_debug_enabled() {
     static const bool enabled = std::getenv("MERCURY_ASM_DEBUG") != nullptr;
     return enabled;
@@ -75,6 +87,14 @@ static inline bool asm_debug_enabled() {
 static inline bool rescue_handoff_enabled() {
     static const bool enabled = std::getenv("MERCURY_NO_RESCUE_HANDOFF") == nullptr;
     return enabled;
+}
+
+static inline double min_cne_ref_identity() {
+    static const double v = []() {
+        const char* s = std::getenv("MERCURY_CNE_IDENT");
+        return s ? std::atof(s) : kMinCneRefIdentity;
+    }();
+    return v;
 }
 
 Args parse_args(int argc, char* argv[]) {
@@ -130,6 +150,8 @@ Args parse_args(int argc, char* argv[]) {
             args.repeat_ratio = std::stod(argv[i]);
         } else if (arg == "--snp") {
             args.output_snp = true;
+        } else if (arg == "--sw-trim") {
+            args.sw_trim = true;
         } else if (arg == "--cne-ref") {
             if (++i >= argc) throw std::runtime_error("Missing value for --cne-ref");
             args.cne_ref_path = argv[i];
@@ -428,7 +450,8 @@ std::unordered_map<int, std::string> load_cne_refs(const std::string& path) {
 }
 
 void sw_align(const std::string& ref, const std::string& seq,
-              int& r_start, int& r_end, int& score) {
+              int& r_start, int& r_end, int& score,
+              int* out_matches = nullptr, int* out_alen = nullptr) {
     int m = (int)ref.size(), n = (int)seq.size();
     const int match_score = 5, mismatch_score = -4;
     const int gap_open = 15, gap_extend = 1;
@@ -456,24 +479,83 @@ void sw_align(const std::string& ref, const std::string& seq,
     // Traceback from (max_i, max_j) to find start position in seq
     int i = max_i, j = max_j;
     int cur = std::max({M[i][j], Ix[i][j], Iy[i][j]});
+    int n_matches = 0, n_alen = 0;
     while (i > 0 && j > 0 && cur > 0) {
         if (cur == M[i][j]) {
             int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
             int prev = std::max({M[i - 1][j - 1], Ix[i - 1][j - 1], Iy[i - 1][j - 1]});
             if (M[i][j] == prev + d) cur = M[i - 1][j - 1];
             else cur = std::max({M[i - 1][j - 1], Ix[i - 1][j - 1], Iy[i - 1][j - 1]});
+            if (ref[i - 1] == seq[j - 1]) ++n_matches;
+            ++n_alen;
             --i; --j;
         } else if (cur == Ix[i][j]) {
             cur = Ix[i - 1][j];
+            ++n_alen;
             --i;
         } else {
             cur = Iy[i][j - 1];
+            ++n_alen;
             --j;
         }
         if (cur <= 0) break;
     }
     r_start = j;
     r_end = max_j;
+    if (out_matches) *out_matches = n_matches;
+    if (out_alen) *out_alen = n_alen;
+}
+
+// Local SW identity with the evaluation scoring (match +2, mismatch -1,
+// linear gap 1/base). Returns matches / alignment length of the best local
+// alignment, 0.0 when no positive-scoring alignment exists.
+static double sw_identity_2m1(const std::string& ref, const std::string& seq) {
+    const int m = static_cast<int>(ref.size());
+    const int n = static_cast<int>(seq.size());
+    if (m == 0 || n == 0) return 0.0;
+    const int match_score = 2, mismatch_score = -1, gap = 1;
+    std::vector<std::vector<int>> M(m + 1, std::vector<int>(n + 1, 0));
+    std::vector<std::vector<int>> X(m + 1, std::vector<int>(n + 1, 0));
+    std::vector<std::vector<int>> Y(m + 1, std::vector<int>(n + 1, 0));
+    int best = 0, max_i = 0, max_j = 0, best_state = 0;
+    for (int i = 1; i <= m; ++i) {
+        for (int j = 1; j <= n; ++j) {
+            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
+            X[i][j] = std::max({M[i - 1][j] - gap, X[i - 1][j] - gap, 0});
+            Y[i][j] = std::max({M[i][j - 1] - gap, Y[i][j - 1] - gap, 0});
+            M[i][j] = std::max({0, M[i - 1][j - 1] + d, X[i][j], Y[i][j]});
+            if (M[i][j] > best) { best = M[i][j]; max_i = i; max_j = j; best_state = 0; }
+            if (X[i][j] > best) { best = X[i][j]; max_i = i; max_j = j; best_state = 1; }
+            if (Y[i][j] > best) { best = Y[i][j]; max_i = i; max_j = j; best_state = 2; }
+        }
+    }
+    if (best == 0) return 0.0;
+    int i = max_i, j = max_j, state = best_state;
+    int matches = 0, alen = 0;
+    while (i > 0 && j > 0) {
+        if (state == 0) {
+            if (M[i][j] == 0) break;
+            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
+            if (M[i][j] == M[i - 1][j - 1] + d) {
+                if (ref[i - 1] == seq[j - 1]) ++matches;
+                ++alen;
+                --i; --j;
+                continue;
+            }
+            if (M[i][j] == X[i][j]) { state = 1; continue; }
+            if (M[i][j] == Y[i][j]) { state = 2; continue; }
+            break;
+        } else if (state == 1) {
+            ++alen;
+            if (X[i][j] == M[i - 1][j] - gap) state = 0;
+            --i;
+        } else {
+            ++alen;
+            if (Y[i][j] == M[i][j - 1] - gap) state = 0;
+            --j;
+        }
+    }
+    return alen > 0 ? static_cast<double>(matches) / alen : 0.0;
 }
 
 void trim_contig_sw(std::string& seq, const std::string& ref,
@@ -688,6 +770,19 @@ static void process_genome_element(
               [](const ClusterRange& a, const ClusterRange& b) { return a.ub > b.ub; });
     bool debug_ele = args.debug_eles.count(cur_ele) > 0;
     auto try_range = [&](const ClusterRange& cr) {
+        const size_t n_reads = cr.end - cr.begin;
+        if (n_reads < 2) {
+            // A de Bruijn path on a single window is the window itself, and
+            // edge filtering cannot remove spurious/paralogous windows: with
+            // min-count=1 every lone window would become a claim. Mirror the
+            // reads-mode single-sequence fallback instead: keep the window
+            // only when it carries enough distinct element mers itself;
+            // weaker ones are left to the T3 rescue handoff.
+            const EleRead& er = ele_reads[cr.begin];
+            if (er.seen < kMinFallbackDistinct) return;
+            consider(er.seq, er.read.start, er, er, cr.pos);
+            return;
+        }
         std::vector<std::string> reads_for_graph = sample_cluster(ele_reads, cr.begin, cr.end);
         std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count,
                                                mqm, cur_ele, nullptr, nullptr, debug_ele);
@@ -755,7 +850,7 @@ int main(int argc, char* argv[]) {
                       << "  --mers <file>         Mers table (required)\n"
                       << "  -o, --output <file>   Output FASTA (default: assembled.fasta)\n"
                       << "  -k, --kmer <n>        K-mer length (default: 19)\n"
-                      << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 2)\n"
+                      << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 1)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
                       << "  --max-assign <n>      Load-time cap on (element, locus) assignments per\n"
@@ -938,6 +1033,13 @@ int main(int argc, char* argv[]) {
                 int last_second_hits = -1;
                 int last_total_reads = 0;
                 int last_groups = 0;
+                auto dbg_bail = [&](const char* tag, long v) {
+                    if (asm_debug_enabled())
+                        std::fprintf(stderr, "ASMDBG2\t%d\t%s\t%ld\t%zu\n",
+                                     cur_ele, tag, v, reads.size());
+                };
+                int dbg_ng = 0, dbg_cand = 0, dbg_trim20 = 0, dbg_chim = 0;
+                bool dbg_floor_cleared = false;
                 if (reads.size() >= 2) {
                     std::vector<int> labels =
                         cluster_reads_by_shared_kmers(reads, args.kmer);
@@ -948,6 +1050,7 @@ int main(int argc, char* argv[]) {
                     int second_hits = -1;
                     for (const auto& kv : groups) {
                         if (kv.second.size() < 2) continue;
+                        ++dbg_ng;
                         std::vector<std::string> sub;
                         sub.reserve(kv.second.size());
                         for (int i : kv.second) sub.push_back(reads[i]);
@@ -955,19 +1058,22 @@ int main(int argc, char* argv[]) {
                                                           mqm, cur_ele, snp_out_ptr,
                                                           gfa_out_ptr);
                         if (c.empty()) continue;
+                        ++dbg_cand;
                         if (args.trim) {
                             auto it = cne_refs.find(cur_ele);
-                            if (it != cne_refs.end()) {
+                            if (it != cne_refs.end() && args.sw_trim) {
                                 trim_contig_sw(c, it->second, mqm, cur_ele);
                             } else {
                                 trim_contig(c, mqm, cur_ele);
                             }
                         }
                         if (c.size() < 20) continue;
+                        ++dbg_trim20;
                         ContigScore sc = score_contig(c, mqm, cur_ele);
                         bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
                             static_cast<double>(sc.hits) / sc.distinct > 2.0;
                         if (repeat_chimera) continue;
+                        ++dbg_chim;
                         double score = static_cast<double>(sc.hits);
                         if (score > best_score ||
                             (score == best_score && kv.second.size() > best_support) ||
@@ -992,9 +1098,6 @@ int main(int argc, char* argv[]) {
                 // distinct element mers, otherwise it is a short/repeat junk
                 // fragment (precision parity with genome mode). A contig that
                 // fails the floor counts as "no acceptable output".
-                static constexpr int kMinOutputDistinct = 12;
-                static constexpr int kMinFallbackDistinct = 16;
-
                 // `final_sc` is the score of the sequence that is actually
                 // emitted. The cluster winner was already scored at selection
                 // time and its sequence is unchanged here, so reuse it; the
@@ -1005,9 +1108,28 @@ int main(int argc, char* argv[]) {
                     final_sc = contig_sc;
                     final_sc_valid = true;
                     if (final_sc.distinct < kMinOutputDistinct) {
-                        contig.clear();
-                        final_sc_valid = false;
+                        bool keep = false;
+                        if (final_sc.distinct >= kMinOutputDistinctLow &&
+                            best_support >= kMinOutputSupportLow && !cne_refs.empty()) {
+                            auto it = cne_refs.find(cur_ele);
+                            if (it != cne_refs.end() &&
+                                sw_identity_2m1(it->second, contig) >= min_cne_ref_identity()) {
+                                keep = true;
+                            }
+                        }
+                        if (!keep) {
+                            contig.clear();
+                            final_sc_valid = false;
+                            dbg_floor_cleared = true;
+                        }
                     }
+                }
+                if (asm_debug_enabled()) {
+                    std::fprintf(stderr,
+                                 "ASMDBG2\t%d\tnr=%zu\tng=%d\tcand=%d\ttrim20=%d\tchim=%d\tcontig=%zu\tsup=%zu\tfloor=%d\tsh=%d\n",
+                                 cur_ele, reads.size(), dbg_ng, dbg_cand, dbg_trim20,
+                                 dbg_chim, contig.size(), best_support,
+                                 dbg_floor_cleared ? 1 : 0, last_second_hits);
                 }
 
                 bool rescued = false;
@@ -1031,19 +1153,19 @@ int main(int argc, char* argv[]) {
                         contig = std::move(reads[best_idx]);
                         if (args.trim) {
                             auto it = cne_refs.find(cur_ele);
-                            if (it != cne_refs.end()) {
+                            if (it != cne_refs.end() && args.sw_trim) {
                                 trim_contig_sw(contig, it->second, mqm, cur_ele);
                             } else {
                                 trim_contig(contig, mqm, cur_ele);
                             }
                         }
-                        if (contig.size() < 20) continue;
+                        if (contig.size() < 20) { dbg_bail("fb_short", best_dist); continue; }
                     } else {
                         // T3 rescue handoff: validate already SW-verified these
                         // reads against the element panel, so the mer-distinct
                         // floor does not apply. Emit the best-scoring one as-is
                         // (mer-based trimming would cut it to nothing).
-                        if (!rescue_handoff_enabled()) continue;
+                        if (!rescue_handoff_enabled()) { dbg_bail("no_handoff", best_dist); continue; }
                         size_t ri = reads.size();
                         double best_rs = 0.0;
                         for (size_t i = 0; i < reads.size(); ++i) {
@@ -1052,10 +1174,10 @@ int main(int argc, char* argv[]) {
                                 ri = i;
                             }
                         }
-                        if (ri == reads.size()) continue;
+                        if (ri == reads.size()) { dbg_bail("no_rescue", best_dist); continue; }
                         contig = std::move(reads[ri]);
                         rescued = true;
-                        if (contig.size() < 20) continue;
+                        if (contig.size() < 20) { dbg_bail("rc_short", (long)best_rs); continue; }
                     }
                 }
 
@@ -1067,7 +1189,10 @@ int main(int argc, char* argv[]) {
                             final_sc = score_contig(contig, mqm, cur_ele);
                     } else {
                         final_sc = score_contig(contig, mqm, cur_ele);
-                        if (final_sc.distinct < kMinOutputDistinct) continue;
+                        if (final_sc.distinct < kMinOutputDistinct) {
+                            dbg_bail("out_floor", final_sc.distinct);
+                            continue;
+                        }
                     }
                 }
                 if (asm_debug_enabled()) {
