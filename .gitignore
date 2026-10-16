@@ -7,8 +7,11 @@ src/02.validate
 *.gcda
 profile/
 
-# Local parasail vendor (pip copy; replace with the upstream submodule)
-src/parasail/
+# parasail is a git submodule at src/parasail (see .gitmodules)
+# only its build outputs are ignored
+src/parasail/build/
+src/parasail/lib/
+src/parasail/include/
 
 # Python cache
 __pycache__/

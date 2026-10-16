@@ -1,3 +1,9 @@
 [submodule "src/robin-map"]
 	path = src/robin-map
 	url = https://github.com/Tessil/robin-map.git
+[submodule "src/parasail"]
+	path = src/parasail
+	url = https://github.com/jeffdaily/parasail.git
+[submodule "src/pigz"]
+	path = src/pigz
+	url = https://github.com/madler/pigz.git

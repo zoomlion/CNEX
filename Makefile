@@ -3,15 +3,35 @@ CXXFLAGS := -std=c++17 -O3 -march=native -pthread -Isrc -Isrc/robin-map/include
 LDFLAGS  := -lpthread -lz
 PREFIX   := $(CURDIR)
 
-# Local parasail vendor (2.6.1 from the pip package; identical API surface to
-# upstream 2.6.2 for the SIMD SW calls used by the in-validate T3 rescue).
-PARASAIL_INC := -Isrc/parasail/include
-PARASAIL_LIB := src/parasail/lib/libparasail.so
-PARASAIL_RPATH := -Wl,-rpath,$(CURDIR)/src/parasail/lib
+# parasail is a git submodule (src/parasail, pinned to v2.6.2). It is built on
+# demand with CMake and exposed at src/parasail/lib/libparasail.so for linking
+# and for the T3 rescue SIMD SW calls used by validate.
+PARASAIL_SRC   := src/parasail
+PARASAIL_BUILD := $(PARASAIL_SRC)/build
+PARASAIL_INC   := -I$(PARASAIL_SRC)
+PARASAIL_LIB   := $(PARASAIL_SRC)/lib/libparasail.so
+PARASAIL_RPATH := -Wl,-rpath,$(CURDIR)/$(PARASAIL_SRC)/lib
 
-.PHONY: all install clean
+# pigz is a git submodule (src/pigz, pinned to v2.8). Its binary src/pigz/pigz is
+# what config.py points at for (de)compression.
+PIGZ := src/pigz/pigz
 
-all: mertable validate assemble
+.PHONY: all install clean parasail pigz
+
+all: mertable validate assemble pigz
+
+parasail: $(PARASAIL_LIB)
+
+pigz: $(PIGZ)
+
+$(PIGZ):
+	$(MAKE) -C src/pigz pigz
+
+$(PARASAIL_LIB): $(PARASAIL_SRC)/parasail.h
+	cmake -S $(PARASAIL_SRC) -B $(PARASAIL_BUILD) -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+	cmake --build $(PARASAIL_BUILD) -j
+	mkdir -p $(PARASAIL_SRC)/lib
+	cp -a $$(find $(PARASAIL_BUILD) -name 'libparasail.so*' -type f -o -name 'libparasail.so*' -type l) $(PARASAIL_SRC)/lib/
 
 mertable: src/01.mertable.cpp src/hip/mertable_core.hpp
 	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
@@ -28,3 +48,4 @@ install: all
 
 clean:
 	rm -rf mertable validate assemble bin/mertable bin/validate bin/assemble
+	-$(MAKE) -C src/pigz clean
