@@ -25,6 +25,11 @@ struct Args {
     std::string mers_file;
     std::string output = "assembled.fasta";
     int kmer = 19;
+    // Reads-mode default: assemble each element with every k in the list and
+    // keep the best-scoring contig (long k separates paralogs, short k bridges
+    // low-coverage seams). `-k` clears this to force a single k; --multi-k
+    // overrides the list; --no-multi-k disables it.
+    std::vector<int> multi_k = {27, 19};
     int min_count = 1;
     int max_reads = 200;
     int max_loci_gap = 5000;
@@ -113,6 +118,23 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "-k" || arg == "--kmer") {
             if (++i >= argc) throw std::runtime_error("Missing value for --kmer");
             args.kmer = std::stoi(argv[i]);
+            args.multi_k.clear();   // explicit -k means single-k mode
+        } else if (arg == "--no-multi-k") {
+            args.multi_k.clear();
+        } else if (arg == "--multi-k") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --multi-k");
+            std::string list = argv[i];
+            size_t p = 0;
+            while (p < list.size()) {
+                size_t q = list.find(',', p);
+                if (q == std::string::npos) q = list.size();
+                if (q > p) {
+                    int k = std::stoi(list.substr(p, q - p));
+                    if (k < 3) throw std::runtime_error("--multi-k values must be >= 3");
+                    args.multi_k.push_back(k);
+                }
+                p = q + 1;
+            }
         } else if (arg == "--min-count") {
             if (++i >= argc) throw std::runtime_error("Missing value for --min-count");
             args.min_count = std::stoi(argv[i]);
@@ -733,7 +755,11 @@ int main(int argc, char* argv[]) {
                       << "\nOptions:\n"
                       << "  --mers <file>         Mers table (required)\n"
                       << "  -o, --output <file>   Output FASTA (default: assembled.fasta)\n"
-                      << "  -k, --kmer <n>        K-mer length (default: 19)\n"
+                      << "  -k, --kmer <n>        K-mer length, single-k mode (default: 19)\n"
+                      << "  --multi-k <k1,k2,..>  Reads mode: assemble each element with every k\n"
+                      << "                        and keep the best-scoring contig\n"
+                      << "                        (default: 27,19; -k or --no-multi-k disables)\n"
+                      << "  --no-multi-k          Disable the reads-mode multi-k default\n"
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 1)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
@@ -863,9 +889,14 @@ int main(int argc, char* argv[]) {
             gfa_out_ptr = &gfa_stream;
         }
 
-        if (!is_genome) {
-            size_t idx = 0;
-            while (idx < all_reads.size()) {
+        // Per-element reads-mode worker: returns the claim sequence ("" = none).
+        // Pure w.r.t. shared state (mqm/cne_refs are read-only), so it can run
+        // from several threads; the only shared resource is the optional SNP/GFA
+        // stream pair, which is why the SNP path stays sequential.
+        auto process_reads_element = [&](size_t begin, size_t end,
+                                         std::ofstream* snp_out_ptr,
+                                         std::ofstream* gfa_out_ptr) -> std::string {
+                size_t idx = begin;
                 int cur_ele = all_reads[idx].ele_id;
 
                 // Reads mode: one group per element
@@ -874,7 +905,7 @@ int main(int argc, char* argv[]) {
                 std::vector<double> rescues;   // parallel to reads: T3 rescue score
                 rescues.reserve(args.max_reads);
                 int cnt = 0;
-                while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele && cnt < args.max_reads) {
+                while (idx < end && cnt < args.max_reads) {
                     const auto& r = all_reads[idx];
                     std::string local_seq = r.seq;
                     normalize_read_seq(local_seq, r.strand);
@@ -905,8 +936,6 @@ int main(int argc, char* argv[]) {
                     ++idx;
                     ++cnt;
                 }
-                // Skip remaining reads of this element
-                while (idx < all_reads.size() && all_reads[idx].ele_id == cur_ele) ++idx;
 
                 // Best-cluster assembly (same semantics as genome mode): split
                 // the element's reads into locus-pure clusters, assemble each,
@@ -926,51 +955,57 @@ int main(int argc, char* argv[]) {
                 int dbg_ng = 0, dbg_cand = 0, dbg_trim20 = 0, dbg_chim = 0;
                 bool dbg_floor_cleared = false;
                 if (reads.size() >= 2) {
-                    std::vector<int> labels =
-                        cluster_reads_by_shared_kmers(reads, args.kmer);
-                    std::unordered_map<int, std::vector<int>> groups;
-                    for (int i = 0; i < static_cast<int>(labels.size()); ++i)
-                        groups[labels[i]].push_back(i);
+                    std::vector<int> ks = args.multi_k.empty()
+                        ? std::vector<int>{args.kmer} : args.multi_k;
                     double best_score = -1.0;
                     int second_hits = -1;
-                    for (const auto& kv : groups) {
-                        if (kv.second.size() < 2) continue;
-                        ++dbg_ng;
-                        std::vector<std::string> sub;
-                        sub.reserve(kv.second.size());
-                        for (int i : kv.second) sub.push_back(reads[i]);
-                        std::string c = debruijn_assemble(sub, args.kmer, args.min_count,
-                                                          mqm, cur_ele, snp_out_ptr,
-                                                          gfa_out_ptr);
-                        if (c.empty()) continue;
-                        ++dbg_cand;
-                        if (args.trim) trim_contig(c, mqm, cur_ele);
-                        if (c.size() < 20) continue;
-                        ++dbg_trim20;
-                        ContigScore sc = score_contig(c, mqm, cur_ele);
-                        bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
-                            static_cast<double>(sc.hits) / sc.distinct > 2.0;
-                        if (repeat_chimera) continue;
-                        ++dbg_chim;
-                        double score = static_cast<double>(sc.hits);
-                        if (score > best_score ||
-                            (score == best_score && kv.second.size() > best_support) ||
-                            (score == best_score && kv.second.size() == best_support &&
-                             c.size() > contig.size())) {
-                            if (best_score >= 0 &&
-                                static_cast<int>(best_score) > second_hits)
-                                second_hits = static_cast<int>(best_score);
-                            contig = std::move(c);
-                            contig_sc = sc;
-                            best_score = score;
-                            best_support = kv.second.size();
-                        } else if (static_cast<int>(score) > second_hits) {
-                            second_hits = static_cast<int>(score);
+                    int total_groups = 0;
+                    for (int kk : ks) {
+                        std::vector<int> labels =
+                            cluster_reads_by_shared_kmers(reads, kk);
+                        std::unordered_map<int, std::vector<int>> groups;
+                        for (int i = 0; i < static_cast<int>(labels.size()); ++i)
+                            groups[labels[i]].push_back(i);
+                        total_groups += static_cast<int>(groups.size());
+                        for (const auto& kv : groups) {
+                            if (kv.second.size() < 2) continue;
+                            ++dbg_ng;
+                            std::vector<std::string> sub;
+                            sub.reserve(kv.second.size());
+                            for (int i : kv.second) sub.push_back(reads[i]);
+                            std::string c = debruijn_assemble(sub, kk, args.min_count,
+                                                              mqm, cur_ele, snp_out_ptr,
+                                                              gfa_out_ptr);
+                            if (c.empty()) continue;
+                            ++dbg_cand;
+                            if (args.trim) trim_contig(c, mqm, cur_ele);
+                            if (c.size() < 20) continue;
+                            ++dbg_trim20;
+                            ContigScore sc = score_contig(c, mqm, cur_ele);
+                            bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
+                                static_cast<double>(sc.hits) / sc.distinct > 2.0;
+                            if (repeat_chimera) continue;
+                            ++dbg_chim;
+                            double score = static_cast<double>(sc.hits);
+                            if (score > best_score ||
+                                (score == best_score && kv.second.size() > best_support) ||
+                                (score == best_score && kv.second.size() == best_support &&
+                                 c.size() > contig.size())) {
+                                if (best_score >= 0 &&
+                                    static_cast<int>(best_score) > second_hits)
+                                    second_hits = static_cast<int>(best_score);
+                                contig = std::move(c);
+                                contig_sc = sc;
+                                best_score = score;
+                                best_support = kv.second.size();
+                            } else if (static_cast<int>(score) > second_hits) {
+                                second_hits = static_cast<int>(score);
+                            }
                         }
                     }
                     last_second_hits = second_hits;
                     last_total_reads = static_cast<int>(reads.size());
-                    last_groups = static_cast<int>(groups.size());
+                    last_groups = total_groups;
                 }
                 // Output evidence floor: a claim needs at least this many
                 // distinct element mers, otherwise it is a short/repeat junk
@@ -1030,13 +1065,13 @@ int main(int argc, char* argv[]) {
                     if (best_dist >= kMinFallbackDistinct) {
                         contig = std::move(reads[best_idx]);
                         if (args.trim) trim_contig(contig, mqm, cur_ele);
-                        if (contig.size() < 20) { dbg_bail("fb_short", best_dist); continue; }
+                        if (contig.size() < 20) { dbg_bail("fb_short", best_dist); return std::string(); }
                     } else {
                         // T3 rescue handoff: validate already SW-verified these
                         // reads against the element panel, so the mer-distinct
                         // floor does not apply. Emit the best-scoring one as-is
                         // (mer-based trimming would cut it to nothing).
-                        if (!rescue_handoff_enabled()) { dbg_bail("no_handoff", best_dist); continue; }
+                        if (!rescue_handoff_enabled()) { dbg_bail("no_handoff", best_dist); return std::string(); }
                         size_t ri = reads.size();
                         double best_rs = 0.0;
                         for (size_t i = 0; i < reads.size(); ++i) {
@@ -1045,10 +1080,10 @@ int main(int argc, char* argv[]) {
                                 ri = i;
                             }
                         }
-                        if (ri == reads.size()) { dbg_bail("no_rescue", best_dist); continue; }
+                        if (ri == reads.size()) { dbg_bail("no_rescue", best_dist); return std::string(); }
                         contig = std::move(reads[ri]);
                         rescued = true;
-                        if (contig.size() < 20) { dbg_bail("rc_short", (long)best_rs); continue; }
+                        if (contig.size() < 20) { dbg_bail("rc_short", (long)best_rs); return std::string(); }
                     }
                 }
 
@@ -1062,7 +1097,7 @@ int main(int argc, char* argv[]) {
                         final_sc = score_contig(contig, mqm, cur_ele);
                         if (final_sc.distinct < kMinOutputDistinct) {
                             dbg_bail("out_floor", final_sc.distinct);
-                            continue;
+                            return std::string();
                         }
                     }
                 }
@@ -1072,8 +1107,56 @@ int main(int argc, char* argv[]) {
                                  final_sc.distinct, best_support,
                                  last_total_reads, last_groups, last_second_hits);
                 }
-                results.emplace_back(std::to_string(cur_ele), contig);
+                return contig;
+        };
+
+        if (!is_genome) {
+            // One range per element so the work can fan out across threads.
+            std::vector<std::pair<size_t, size_t>> ranges;
+            {
+                size_t i = 0;
+                while (i < all_reads.size()) {
+                    size_t j = i + 1;
+                    while (j < all_reads.size() && all_reads[j].ele_id == all_reads[i].ele_id) ++j;
+                    ranges.emplace_back(i, j);
+                    i = j;
+                }
             }
+            std::vector<std::pair<int, std::string>> eres;
+            eres.reserve(ranges.size());
+            const int nthreads = std::max(1, args.threads);
+            if (args.output_snp || nthreads == 1 || ranges.size() <= 1) {
+                for (const auto& r : ranges) {
+                    std::string c = process_reads_element(r.first, r.second, snp_out_ptr, gfa_out_ptr);
+                    if (!c.empty()) eres.emplace_back(all_reads[r.first].ele_id, std::move(c));
+                }
+            } else {
+                std::atomic<size_t> next_range{0};
+                std::vector<std::vector<std::pair<int, std::string>>> per_thread(nthreads);
+                std::vector<std::thread> workers;
+                workers.reserve(nthreads);
+                for (int t = 0; t < nthreads; ++t) {
+                    workers.emplace_back([&, t]() {
+                        while (true) {
+                            size_t ri = next_range.fetch_add(1);
+                            if (ri >= ranges.size()) break;
+                            const auto rr = ranges[ri];
+                            std::string c = process_reads_element(rr.first, rr.second, nullptr, nullptr);
+                            if (!c.empty())
+                                per_thread[t].emplace_back(all_reads[rr.first].ele_id, std::move(c));
+                        }
+                    });
+                }
+                for (auto& w : workers) w.join();
+                for (auto& v : per_thread)
+                    for (auto& p : v) eres.push_back(std::move(p));
+            }
+            std::sort(eres.begin(), eres.end(),
+                [](const std::pair<int, std::string>& a, const std::pair<int, std::string>& b) {
+                    return a.first < b.first;
+                });
+            for (auto& p : eres)
+                results.emplace_back(std::to_string(p.first), std::move(p.second));
         } else {
             // Element blocks: all_reads is sorted by ele_id
             std::vector<std::pair<size_t, size_t>> blocks;
