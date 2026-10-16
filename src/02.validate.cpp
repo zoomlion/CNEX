@@ -156,11 +156,7 @@ public:
                 buffer_.clear();
             }
             pos_ = 0;
-            auto _io0 = std::chrono::steady_clock::now();
             size_t bytes_read = fread(raw_, 1, sizeof(raw_), fp_);
-            g_val_profile.rd_reader_io_ns +=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - _io0).count();
             if (bytes_read == 0) {
                 if (!buffer_.empty()) {
                     line = std::move(buffer_);
@@ -189,11 +185,7 @@ public:
                 buffer_.clear();
             }
             pos_ = 0;
-            auto _io0 = std::chrono::steady_clock::now();
             size_t bytes_read = fread(raw_, 1, sizeof(raw_), fp_);
-            g_val_profile.rd_reader_io_ns +=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - _io0).count();
             if (bytes_read == 0) {
                 if (!buffer_.empty()) {
                     buffer_.clear();
@@ -253,15 +245,10 @@ void reader_thread(std::vector<std::string> files,
                    std::atomic<int64_t>& total_reads,
                    Args::InputType input_type) {
     int64_t count = 0;
-    const auto t_start = std::chrono::steady_clock::now();
 
     auto flush_chunk = [&](std::vector<Read>& chunk) {
         if (!chunk.empty()) {
-            const auto t0 = std::chrono::steady_clock::now();
             queue.push(std::move(chunk));
-            g_val_profile.rd_reader_push_ns +=
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - t0).count();
             chunk.clear();
             chunk.reserve(chunk_size);
         }
@@ -361,10 +348,6 @@ void reader_thread(std::vector<std::string> files,
         }
     }
 
-    g_val_profile.rd_reader_wall_ns +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - t_start).count();
-    g_val_profile.rd_reader_threads += 1;
     total_reads.fetch_add(count, std::memory_order_relaxed);
 }
 
@@ -903,20 +886,6 @@ int main(int argc, char* argv[]) {
                           << " tally_us/call=" << (ta / rr / 1000)
                           << " gate_us/call=" << (ga / rr / 1000)
                           << " total_s=" << ((sc + ta + ga) / 1000000000) << "\n";
-            }
-            long long rt = g_val_profile.rd_reader_threads.load();
-            if (rt > 0) {
-                long long wall = g_val_profile.rd_reader_wall_ns.load();
-                long long push = g_val_profile.rd_reader_push_ns.load();
-                long long io = g_val_profile.rd_reader_io_ns.load();
-                double w = static_cast<double>(wall) / 1e9;
-                double p = static_cast<double>(push) / 1e9;
-                double io_s = static_cast<double>(io) / 1e9;
-                std::cerr << "[profile] reader_threads=" << rt
-                          << " wall_s=" << w
-                          << " push_s=" << p
-                          << " io_s=" << io_s
-                          << " parse_s=" << (w - p - io_s) << "\n";
             }
         }
 
