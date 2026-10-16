@@ -41,6 +41,13 @@ struct ValidateProfile {
     std::atomic<long long> rd_scan_ns{0};
     std::atomic<long long> rd_tally_ns{0};
     std::atomic<long long> rd_gate_ns{0};
+    // Reader-thread breakdown (seconds): wall = total lifetime; push = time
+    // blocked handing a chunk to the queue (backpressure). wall - push is the
+    // reader's own work: gzip decompress + line parsing + Read allocation.
+    std::atomic<long long> rd_reader_wall_ns{0};
+    std::atomic<long long> rd_reader_push_ns{0};
+    std::atomic<long long> rd_reader_io_ns{0};   // time blocked in fread (pigz)
+    std::atomic<long long> rd_reader_threads{0};
 };
 inline ValidateProfile g_val_profile;
 
