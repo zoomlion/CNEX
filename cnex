@@ -329,7 +329,7 @@ def main():
     p_val = sub.add_parser("validate", help="Validate reads or genome against confident k-mers")
     p_val.add_argument("files", nargs="+", help="Input files (FASTQ or FASTA, plain or .gz)")
     p_val.add_argument("--mers", required=True, help="Confident k-mer table")
-    p_val.add_argument("-t", "--threads", type=int, default=8, help="Threads per file (default: 8)")
+    p_val.add_argument("-t", "--threads", type=int, default=4, help="Threads per file (default: 4)")
     p_val.add_argument("-o", "--output-dir", default="out", help="Output directory (default: out)")
     p_val.add_argument("--type", choices=["genome", "fastq"],
                        help="Input type (auto-detected if omitted)")
@@ -373,7 +373,7 @@ def main():
                         help="Load-time cap on (element,locus) assignments per k-mer for "
                              "validate/assemble (default: 3; 0 = keep all)")
     p_pipe.add_argument("--mers", help="Start from existing k-mer table (runs 02+03)")
-    p_pipe.add_argument("-t", "--threads", type=int, default=8, help="Threads per genome (default: 8)")
+    p_pipe.add_argument("-t", "--threads", type=int, default=4, help="Threads per genome (default: 4)")
     p_pipe.add_argument("-j", "--jobs", type=int, default=4, help="Parallel genomes (default: 4)")
     p_pipe.add_argument("-o", "--output-dir", default="out", help="Output root directory (default: out)")
     p_pipe.add_argument("--trim", action="store_true",
