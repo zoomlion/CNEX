@@ -862,6 +862,17 @@ int main(int argc, char* argv[]) {
                       << " win_ns=" << g_val_profile.win_ns
                       << "\n[profile] gather_ns=" << g_val_profile.gather_ns
                       << " tally_ns=" << g_val_profile.tally_ns << "\n";
+            long long rr = g_val_profile.rd_reads.load();
+            if (rr > 0) {
+                long long sc = g_val_profile.rd_scan_ns.load();
+                long long ta = g_val_profile.rd_tally_ns.load();
+                long long ga = g_val_profile.rd_gate_ns.load();
+                std::cerr << "[profile] reads_calls=" << rr
+                          << " scan_us/call=" << (sc / rr / 1000)
+                          << " tally_us/call=" << (ta / rr / 1000)
+                          << " gate_us/call=" << (ga / rr / 1000)
+                          << " total_s=" << ((sc + ta + ga) / 1000000000) << "\n";
+            }
         }
 
         std::cerr << "Done. Output written to " << args.output_dir << "\n";

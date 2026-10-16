@@ -36,6 +36,11 @@ struct ValidateProfile {
     std::atomic<long long> win_ns{0};
     std::atomic<long long> gather_ns{0};
     std::atomic<long long> tally_ns{0};
+    // Reads mode breakdown.
+    std::atomic<long long> rd_reads{0};
+    std::atomic<long long> rd_scan_ns{0};
+    std::atomic<long long> rd_tally_ns{0};
+    std::atomic<long long> rd_gate_ns{0};
 };
 inline ValidateProfile g_val_profile;
 
@@ -261,23 +266,29 @@ public:
     std::vector<std::pair<int, int>> assign_arena;
     int mer_size = 0;
 
-    // Optional direct-index accelerator for the genome-mode prep pass
-    // (k <= 13): maps each 2-bit k-mer code to a slot holding rank+1, with
-    // the packed range stored in direct_rng[rank]. Costs 4^k * 4 bytes.
+    // Optional direct-index accelerator (k <= 13): maps each 2-bit k-mer code
+    // to the packed assignment range (count in the top 2 bits, arena offset in
+    // the low 30). Storing the range inline lets a scan resolve code -> range in
+    // ONE random access instead of the previous code -> rank -> range chain
+    // (which needed a second direct_rng array). Costs 4^k * 4 bytes.
     std::vector<uint32_t> direct_index;
-    std::vector<uint64_t> direct_rng;
+
+    static constexpr uint32_t kDirOffMask = (1u << 30) - 1;
+    static inline uint32_t pack_dir(uint32_t off, uint32_t cnt) { return (cnt << 30) | off; }
+    static inline uint32_t dir_off(uint32_t v) { return v & kDirOffMask; }
+    static inline uint32_t dir_cnt(uint32_t v) { return v >> 30; }
 
     bool has_direct_index() const { return !direct_index.empty(); }
 
     void build_direct_index() {
         if (mer_size <= 0 || mer_size > 13) return;
         direct_index.assign(size_t(1) << (2 * mer_size), 0);
-        direct_rng.resize(compressed_mer_query.size());
-        uint32_t rank = 0;
         for (const auto& kv : compressed_mer_query) {
-            direct_index[kv.first] = rank + 1;
-            direct_rng[rank] = kv.second;
-            ++rank;
+            uint32_t off = range_off(kv.second);
+            uint32_t cnt = range_cnt(kv.second);
+            // cnt <= max_assign (small); off must fit in 30 bits (arena size).
+            if (off > kDirOffMask || cnt > 3) { direct_index.clear(); return; }
+            direct_index[kv.first] = pack_dir(off, cnt);
         }
     }
 
@@ -448,6 +459,10 @@ inline std::pair<int, int> validate_read_verified(
         match_starts.reserve(chain_len);
         match_loci.reserve(chain_len);
 
+        const bool _vp = validate_profile_enabled();
+        std::chrono::steady_clock::time_point _t0, _t1, _t2;
+        if (_vp) _t0 = std::chrono::steady_clock::now();
+
         const uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * mer_size_local)) - 1);
         const bool use_direct = compressed_mer_query.has_direct_index();
         const int k = mer_size_local;
@@ -474,14 +489,13 @@ inline std::pair<int, int> validate_read_verified(
         }
 
         if (use_direct) {
-            // Passes 2-4: resolve code -> rank -> range -> assignment rows with
-            // software prefetching one level ahead, so the three dependent
-            // random accesses overlap instead of stalling the scan.
+            // Resolve code -> range in one random access (the range is packed
+            // into direct_index), then prefetch the assignment rows one level
+            // ahead so the code -> range -> arena chain overlaps instead of
+            // stalling the scan.
             constexpr int kPf = 32;
-            thread_local std::vector<uint32_t> scan_ranks;
-            thread_local std::vector<uint64_t> scan_ranges;
-            scan_ranks.assign(n_codes, 0);
-            scan_ranges.assign(n_codes, 0);
+            thread_local std::vector<uint32_t> scan_pk;
+            scan_pk.assign(n_codes, 0);
 
             const int ramp = std::min(kPf, n_codes);
             for (int s = 0; s < ramp; ++s) {
@@ -498,38 +512,26 @@ inline std::pair<int, int> validate_read_verified(
                 }
                 uint32_t c = scan_codes[s];
                 if (c == UINT32_MAX) continue;
-                uint32_t rank = compressed_mer_query.direct_index[c];
-                if (rank) scan_ranks[s] = rank;
+                scan_pk[s] = compressed_mer_query.direct_index[c];
             }
             for (int s = 0; s < ramp; ++s) {
-                if (scan_ranks[s])
-                    __builtin_prefetch(&compressed_mer_query.direct_rng[scan_ranks[s] - 1]);
-            }
-            for (int s = 0; s < n_codes; ++s) {
-                int pf = s + kPf;
-                if (pf < n_codes && scan_ranks[pf])
-                    __builtin_prefetch(&compressed_mer_query.direct_rng[scan_ranks[pf] - 1]);
-                uint32_t rank = scan_ranks[s];
-                if (rank) scan_ranges[s] = compressed_mer_query.direct_rng[rank - 1];
-            }
-            for (int s = 0; s < ramp; ++s) {
-                uint64_t rp = scan_ranges[s];
-                if (rp)
+                uint32_t v = scan_pk[s];
+                if (v)
                     __builtin_prefetch(
-                        &compressed_mer_query.assign_arena[MerQueryManager::range_off(rp)]);
+                        &compressed_mer_query.assign_arena[MerQueryManager::dir_off(v)]);
             }
             for (int s = 0; s < n_codes; ++s) {
                 int pf = s + kPf;
                 if (pf < n_codes) {
-                    uint64_t rp = scan_ranges[pf];
-                    if (rp)
+                    uint32_t v = scan_pk[pf];
+                    if (v)
                         __builtin_prefetch(
-                            &compressed_mer_query.assign_arena[MerQueryManager::range_off(rp)]);
+                            &compressed_mer_query.assign_arena[MerQueryManager::dir_off(v)]);
                 }
-                uint64_t range = scan_ranges[s];
-                if (!range) continue;
-                uint32_t off = MerQueryManager::range_off(range);
-                uint32_t cnt = MerQueryManager::range_cnt(range);
+                uint32_t v = scan_pk[s];
+                if (!v) continue;
+                uint32_t off = MerQueryManager::dir_off(v);
+                uint32_t cnt = MerQueryManager::dir_cnt(v);
                 for (uint32_t a = 0; a < cnt; ++a) {
                     int id = compressed_mer_query.assign_arena[off + a].first;
                     int loci = compressed_mer_query.assign_arena[off + a].second;
@@ -572,10 +574,20 @@ inline std::pair<int, int> validate_read_verified(
             }
         }
 
+        if (_vp) {
+            auto _t = std::chrono::steady_clock::now();
+            g_val_profile.rd_scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(_t - _t0).count();
+            _t1 = _t;
+        }
         if (match_ids.empty()) return {-1, 0};
 
         // ─── Vote + gate matrix (T1 OR T2 ...) ───
         VoteTally tally = tally_votes(match_ids);
+        if (_vp) {
+            auto _t = std::chrono::steady_clock::now();
+            g_val_profile.rd_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(_t - _t1).count();
+            _t2 = _t;
+        }
 
         auto chain_of = [&](int confi_id) -> std::pair<int, int> {
             int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
@@ -592,15 +604,20 @@ inline std::pair<int, int> validate_read_verified(
         };
 
         int passing = 0, span = 0;
-        if (!gate_pass(tally, cfg, chain_of, passing, span)) {
+        const bool gate_ok = gate_pass(tally, cfg, chain_of, passing, span);
+        if (!gate_ok) {
             auto rg = rescue_gate(tally, cfg, chain_of);
             if (rg.first >= 0) {
                 r_ele = rg.first;
                 r_votes = rg.second;
             }
-            return {-1, 0};
         }
-
+        if (_vp) {
+            g_val_profile.rd_gate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - _t2).count();
+            g_val_profile.rd_reads += 1;
+        }
+        if (!gate_ok) return {-1, 0};
         return {tally.best_id, static_cast<int>(tally.n)};
     };
 
@@ -840,10 +857,16 @@ inline void validate_sequence_segmented(
                 }
                 uint32_t cf = codes_fwd[st];
                 if (cf == UINT32_MAX) continue;
-                uint32_t r = mqm.direct_index[cf];
-                if (r) fwd_ranges[st] = mqm.direct_rng[r - 1];
-                uint32_t rr = mqm.direct_index[codes_rc[st]];
-                if (rr) rc_ranges[st] = mqm.direct_rng[rr - 1];
+                uint32_t v = mqm.direct_index[cf];
+                if (v)
+                    fwd_ranges[st] =
+                        (static_cast<uint64_t>(MerQueryManager::dir_off(v)) << 32) |
+                        MerQueryManager::dir_cnt(v);
+                uint32_t vr = mqm.direct_index[codes_rc[st]];
+                if (vr)
+                    rc_ranges[st] =
+                        (static_cast<uint64_t>(MerQueryManager::dir_off(vr)) << 32) |
+                        MerQueryManager::dir_cnt(vr);
             }
         } else {
             uint32_t rolling = 0;
