@@ -917,7 +917,6 @@ int main(int argc, char* argv[]) {
                         double ratio = (double)total / std::max(1, (int)seen.size());
                         if (ratio > args.repeat_ratio) {
                             ++idx;
-                            ++cnt;
                             continue;
                         }
                     }
