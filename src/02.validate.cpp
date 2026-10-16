@@ -766,10 +766,22 @@ int main(int argc, char* argv[]) {
             genome_input = true;
         }
         if (mer_size >= 7) {
-            mqm.build_direct_index();
-            if (!mqm.has_direct_index())
-                std::cerr << "  (direct index unavailable for k=" << mer_size
-                          << ", using hash lookups)\n";
+            if (!genome_input) {
+                // Reads mode: use the canonical (strand-merged) index so a single
+                // forward scan resolves both strands; fall back to the raw direct
+                // index if the table doesn't fit the canonical row packing.
+                if (!mqm.build_canonical_index()) {
+                    mqm.build_direct_index();
+                    if (!mqm.has_direct_index())
+                        std::cerr << "  (canonical/direct index unavailable for k=" << mer_size
+                                  << ", using hash lookups)\n";
+                }
+            } else {
+                mqm.build_direct_index();
+                if (!mqm.has_direct_index())
+                    std::cerr << "  (direct index unavailable for k=" << mer_size
+                              << ", using hash lookups)\n";
+            }
         }
 
         // Create output directory

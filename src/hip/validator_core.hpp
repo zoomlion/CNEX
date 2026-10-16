@@ -93,6 +93,16 @@ inline bool encode_mer_at(const std::string& seq, size_t pos, size_t k, uint32_t
     return true;
 }
 
+// Reverse complement of a 2-bit-encoded k-mer (A=00,C=01,G=10,T=11).
+inline uint32_t rc_code_2bit(uint32_t code, int k) {
+    uint32_t res = 0;
+    for (int i = 0; i < k; ++i) {
+        uint32_t b = (code >> (2 * i)) & 0x3u;
+        res = (res << 2) | (b ^ 0x3u);
+    }
+    return res;
+}
+
 
 inline void reverse_complement(const std::string& dna, std::string& out) {
     static const std::array<char, 256> complement = [] {
@@ -273,10 +283,11 @@ public:
     // (which needed a second direct_rng array). Costs 4^k * 4 bytes.
     std::vector<uint32_t> direct_index;
 
-    static constexpr uint32_t kDirOffMask = (1u << 30) - 1;
-    static inline uint32_t pack_dir(uint32_t off, uint32_t cnt) { return (cnt << 30) | off; }
+    static constexpr int kDirCntShift = 29;                 // 3 count bits, 29 offset bits
+    static constexpr uint32_t kDirOffMask = (1u << kDirCntShift) - 1;
+    static inline uint32_t pack_dir(uint32_t off, uint32_t cnt) { return (cnt << kDirCntShift) | off; }
     static inline uint32_t dir_off(uint32_t v) { return v & kDirOffMask; }
-    static inline uint32_t dir_cnt(uint32_t v) { return v >> 30; }
+    static inline uint32_t dir_cnt(uint32_t v) { return v >> kDirCntShift; }
 
     bool has_direct_index() const { return !direct_index.empty(); }
 
@@ -286,10 +297,72 @@ public:
         for (const auto& kv : compressed_mer_query) {
             uint32_t off = range_off(kv.second);
             uint32_t cnt = range_cnt(kv.second);
-            // cnt <= max_assign (small); off must fit in 30 bits (arena size).
-            if (off > kDirOffMask || cnt > 3) { direct_index.clear(); return; }
+            if (off > kDirOffMask || cnt > 7) { direct_index.clear(); return; }
             direct_index[kv.first] = pack_dir(off, cnt);
         }
+    }
+
+    // ─── Canonical (strand-merged) index ───
+    // Keyed by min(code, rc(code)); a canonical key aggregates the assignments
+    // of both a k-mer and its reverse complement. Each row carries a form bit
+    // (0 = this assignment came from the canonical-form k-mer, 1 = from its
+    // reverse complement), so a single forward scan can resolve both strands.
+    // Row layout: form in bit 31, element id in bits 16..30, locus in bits 0..15.
+    std::vector<uint32_t> dir_canon;
+    std::vector<uint32_t> arena_canon;   // packed form|id|loci
+    bool has_canon_index() const { return !dir_canon.empty(); }
+    static inline uint32_t pack_crow(int id, int loci, uint32_t form) {
+        return (form << 31) | (static_cast<uint32_t>(id) << 16) | (static_cast<uint32_t>(loci) & 0xffffu);
+    }
+    static inline int crow_id(uint32_t v) { return static_cast<int>((v >> 16) & 0x7fffu); }
+    static inline int crow_loci(uint32_t v) { return static_cast<int>(v & 0xffffu); }
+    static inline uint32_t crow_form(uint32_t v) { return v >> 31; }
+
+    // Build the canonical index from the loaded (raw) table. Returns false (and
+    // leaves dir_canon empty) if the id/loci ranges do not fit the row packing;
+    // callers then fall back to the raw direct index.
+    bool build_canonical_index() {
+        if (mer_size <= 0 || mer_size > 13) return false;
+        const int k = mer_size;
+        tsl::robin_map<uint32_t, uint32_t> cnt;   // canonical -> row count
+        cnt.reserve(compressed_mer_query.size());
+        size_t total = 0;
+        for (const auto& kv : compressed_mer_query) {
+            uint32_t code = kv.first;
+            uint32_t c = std::min(code, rc_code_2bit(code, k));
+            uint32_t n = range_cnt(kv.second);
+            if (range_off(kv.second) + n > 0xFFFFFFFFu) return false;
+            cnt[c] += n;
+            total += n;
+        }
+        if (total > kDirOffMask) return false;
+        dir_canon.assign(size_t(1) << (2 * k), 0);
+        tsl::robin_map<uint32_t, uint32_t> cursor;
+        cursor.reserve(cnt.size());
+        uint32_t off = 0;
+        bool ok = true;
+        for (const auto& kv : cnt) {
+            if (kv.second > 7) { ok = false; break; }
+            dir_canon[kv.first] = pack_dir(off, kv.second);
+            cursor[kv.first] = off;
+            off += kv.second;
+        }
+        cnt.clear();
+        if (!ok) { dir_canon.clear(); return false; }
+        arena_canon.resize(total);
+        for (const auto& kv : compressed_mer_query) {
+            uint32_t code = kv.first;
+            uint32_t c = std::min(code, rc_code_2bit(code, k));
+            uint32_t form = (code == c) ? 0u : 1u;
+            uint32_t o = range_off(kv.second), n = range_cnt(kv.second);
+            for (uint32_t a = 0; a < n; ++a) {
+                int id = assign_arena[o + a].first;
+                int loci = assign_arena[o + a].second;
+                if (id > 0x7fff || loci > 0xffff) { dir_canon.clear(); arena_canon.clear(); return false; }
+                arena_canon[cursor[c]++] = pack_crow(id, loci, form);
+            }
+        }
+        return true;
     }
 
     static inline uint64_t pack_range(uint64_t off, uint64_t cnt) {
@@ -430,103 +503,88 @@ inline std::pair<int, int> validate_read_verified(
     Verify&& verify,
     double* rescue_score = nullptr)
 {
-    thread_local std::vector<int> match_ids;
-    thread_local std::vector<int> match_starts;
-    thread_local std::vector<int> match_loci;
+    if (static_cast<int>(seq.size()) < mer_size) return {-1, 0};
 
-    auto validate_chain = [&](const std::string& chain, int& r_ele, int& r_votes)
-        -> std::pair<int, int> {
-        match_ids.clear();
-        match_starts.clear();
-        match_loci.clear();
+    static auto base_lookup = [] {
+        std::array<int8_t, 256> t{};
+        t.fill(-1);
+        t['A'] = 0; t['C'] = 1; t['G'] = 2; t['T'] = 3;
+        return t;
+    }();
 
-        int chain_len = static_cast<int>(chain.size());
-        int mer_size_local = mer_size;
+    const int k = mer_size;
+    const int chain_len = static_cast<int>(seq.size());
+    const uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * k)) - 1);
+    const int n_codes = chain_len - k + 1;
 
-        if (chain_len < mer_size_local) {
-            return {-1, 0};
-        }
+    thread_local std::vector<std::array<int, 3>> f_hits, r_hits;   // (pos, id, loci)
+    f_hits.clear();
+    r_hits.clear();
+    thread_local std::vector<uint32_t> scan_codes, scan_rcodes;
+    scan_codes.assign(n_codes, UINT32_MAX);
+    scan_rcodes.assign(n_codes, UINT32_MAX);
 
-        // Rolling hash: O(1) per position
-        static auto base_lookup = [] {
-            std::array<int8_t, 256> t{};
-            t.fill(-1);
-            t['A'] = 0; t['C'] = 1; t['G'] = 2; t['T'] = 3;
-            return t;
-        }();
+    const bool _vp = validate_profile_enabled();
+    std::chrono::steady_clock::time_point _t0, _t1;
+    if (_vp) _t0 = std::chrono::steady_clock::now();
 
-        match_ids.reserve(chain_len);
-        match_starts.reserve(chain_len);
-        match_loci.reserve(chain_len);
-
-        const bool _vp = validate_profile_enabled();
-        std::chrono::steady_clock::time_point _t0, _t1, _t2;
-        if (_vp) _t0 = std::chrono::steady_clock::now();
-
-        const uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * mer_size_local)) - 1);
-        const bool use_direct = compressed_mer_query.has_direct_index();
-        const int k = mer_size_local;
-        const int n_codes = chain_len - k + 1;
-
-        // Pass 1: rolling 2-bit code of every k-mer start position. Positions
-        // covered by a non-ACGT base stay UINT32_MAX and are never probed.
-        thread_local std::vector<uint32_t> scan_codes;
-        scan_codes.assign(n_codes, UINT32_MAX);
-        {
-            uint32_t rolling = 0;
-            int valid_run = 0;
-            for (int i = 0; i < chain_len; ++i) {
-                int8_t bits = base_lookup[static_cast<unsigned char>(chain[i])];
-                if (bits < 0) {
-                    valid_run = 0;
-                    rolling = 0;
-                    continue;
-                }
-                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
-                ++valid_run;
-                if (valid_run >= k) scan_codes[i - k + 1] = rolling;
+    // Pass 1: rolling 2-bit codes of every forward k-mer start position, plus
+    // each k-mer's reverse-complement code (also via a rolling update), which
+    // the canonical index needs to form min(code, rc).
+    {
+        uint32_t rolling = 0, rc_rolling = 0;
+        int valid_run = 0;
+        for (int i = 0; i < chain_len; ++i) {
+            int8_t bits = base_lookup[static_cast<unsigned char>(seq[i])];
+            if (bits < 0) { valid_run = 0; rolling = 0; rc_rolling = 0; continue; }
+            rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
+            rc_rolling = (rc_rolling >> 2) |
+                         (static_cast<uint32_t>(3 - bits) << (2 * k - 2));
+            ++valid_run;
+            if (valid_run >= k) {
+                scan_codes[i - k + 1] = rolling;
+                scan_rcodes[i - k + 1] = rc_rolling;
             }
         }
+    }
 
-        if (use_direct) {
-            // Resolve code -> range in one random access (the range is packed
-            // into direct_index), then prefetch the assignment rows one level
-            // ahead so the code -> range -> arena chain overlaps instead of
-            // stalling the scan.
+    // Legacy per-strand scan (raw direct index, or hash) of an already-encoded
+    // code array, appending (position, element, locus) to `out`.
+    auto scan_raw = [&](const std::vector<uint32_t>& codes,
+                        std::vector<std::array<int, 3>>& out) {
+        const int nc = static_cast<int>(codes.size());
+        if (compressed_mer_query.has_direct_index()) {
             constexpr int kPf = 32;
             thread_local std::vector<uint32_t> scan_pk;
-            scan_pk.assign(n_codes, 0);
-
-            const int ramp = std::min(kPf, n_codes);
+            scan_pk.assign(nc, 0);
+            const int ramp = std::min(kPf, nc);
             for (int s = 0; s < ramp; ++s) {
-                uint32_t c = scan_codes[s];
+                uint32_t c = codes[s];
                 if (c != UINT32_MAX)
                     __builtin_prefetch(&compressed_mer_query.direct_index[c]);
             }
-            for (int s = 0; s < n_codes; ++s) {
+            for (int s = 0; s < nc; ++s) {
                 int pf = s + kPf;
-                if (pf < n_codes) {
-                    uint32_t c = scan_codes[pf];
+                if (pf < nc) {
+                    uint32_t c = codes[pf];
                     if (c != UINT32_MAX)
                         __builtin_prefetch(&compressed_mer_query.direct_index[c]);
                 }
-                uint32_t c = scan_codes[s];
+                uint32_t c = codes[s];
                 if (c == UINT32_MAX) continue;
                 scan_pk[s] = compressed_mer_query.direct_index[c];
             }
             for (int s = 0; s < ramp; ++s) {
                 uint32_t v = scan_pk[s];
-                if (v)
-                    __builtin_prefetch(
-                        &compressed_mer_query.assign_arena[MerQueryManager::dir_off(v)]);
+                if (v) __builtin_prefetch(
+                    &compressed_mer_query.assign_arena[MerQueryManager::dir_off(v)]);
             }
-            for (int s = 0; s < n_codes; ++s) {
+            for (int s = 0; s < nc; ++s) {
                 int pf = s + kPf;
-                if (pf < n_codes) {
+                if (pf < nc) {
                     uint32_t v = scan_pk[pf];
-                    if (v)
-                        __builtin_prefetch(
-                            &compressed_mer_query.assign_arena[MerQueryManager::dir_off(v)]);
+                    if (v) __builtin_prefetch(
+                        &compressed_mer_query.assign_arena[MerQueryManager::dir_off(v)]);
                 }
                 uint32_t v = scan_pk[s];
                 if (!v) continue;
@@ -534,67 +592,124 @@ inline std::pair<int, int> validate_read_verified(
                 uint32_t cnt = MerQueryManager::dir_cnt(v);
                 for (uint32_t a = 0; a < cnt; ++a) {
                     int id = compressed_mer_query.assign_arena[off + a].first;
-                    int loci = compressed_mer_query.assign_arena[off + a].second;
-                    if (target_ele_id == -1 || id == target_ele_id) {
-                        match_ids.push_back(id);
-                        match_starts.push_back(s);
-                        match_loci.push_back(loci);
-                    }
+                    if (target_ele_id != -1 && id != target_ele_id) continue;
+                    out.push_back({s, id, compressed_mer_query.assign_arena[off + a].second});
                 }
             }
         } else {
-            uint32_t rolling = 0;
-            int valid_run = 0;
-            for (int i = 0; i < chain_len; ++i) {
-                int8_t bits = base_lookup[static_cast<unsigned char>(chain[i])];
-                if (bits < 0) {
-                    valid_run = 0;
-                    rolling = 0;
-                    continue;
-                }
-                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
-                valid_run++;
-                if (valid_run >= mer_size_local) {
-                    int start = i - mer_size_local + 1;
-                    auto it = compressed_mer_query.compressed_mer_query.find(rolling);
-                    if (it != compressed_mer_query.compressed_mer_query.end()) {
-                        uint32_t off = MerQueryManager::range_off(it->second);
-                        uint32_t cnt = MerQueryManager::range_cnt(it->second);
-                        for (uint32_t a = 0; a < cnt; ++a) {
-                            int id = compressed_mer_query.assign_arena[off + a].first;
-                            int loci = compressed_mer_query.assign_arena[off + a].second;
-                            if (target_ele_id == -1 || id == target_ele_id) {
-                                match_ids.push_back(id);
-                                match_starts.push_back(start);
-                                match_loci.push_back(loci);
-                            }
-                        }
-                    }
+            for (int s = 0; s < nc; ++s) {
+                uint32_t code = codes[s];
+                if (code == UINT32_MAX) continue;
+                auto it = compressed_mer_query.compressed_mer_query.find(code);
+                if (it == compressed_mer_query.compressed_mer_query.end()) continue;
+                uint32_t off = MerQueryManager::range_off(it->second);
+                uint32_t cnt = MerQueryManager::range_cnt(it->second);
+                for (uint32_t a = 0; a < cnt; ++a) {
+                    int id = compressed_mer_query.assign_arena[off + a].first;
+                    if (target_ele_id != -1 && id != target_ele_id) continue;
+                    out.push_back({s, id, compressed_mer_query.assign_arena[off + a].second});
                 }
             }
         }
+    };
 
-        if (_vp) {
-            auto _t = std::chrono::steady_clock::now();
-            g_val_profile.rd_scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(_t - _t0).count();
-            _t1 = _t;
+    if (compressed_mer_query.has_canon_index()) {
+        // Canonical (strand-merged): a single forward pass resolves both
+        // strands. Code -> canonical key (min(code, rc)) -> range in one random
+        // access; each row's form bit says whether the hit is on the forward
+        // strand (append at s) or the reverse strand (append at n_codes-1-s).
+        constexpr int kPf = 32;
+        thread_local std::vector<uint32_t> scan_pk;
+        scan_pk.assign(n_codes, 0);
+        const int ramp = std::min(kPf, n_codes);
+        for (int s = 0; s < ramp; ++s) {
+            if (scan_codes[s] == UINT32_MAX) continue;
+            __builtin_prefetch(&compressed_mer_query.dir_canon[
+                std::min(scan_codes[s], scan_rcodes[s])]);
         }
-        if (match_ids.empty()) return {-1, 0};
-
-        // ─── Vote + gate matrix (T1 OR T2 ...) ───
-        VoteTally tally = tally_votes(match_ids);
-        if (_vp) {
-            auto _t = std::chrono::steady_clock::now();
-            g_val_profile.rd_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(_t - _t1).count();
-            _t2 = _t;
+        for (int s = 0; s < n_codes; ++s) {
+            int pf = s + kPf;
+            if (pf < n_codes && scan_codes[pf] != UINT32_MAX)
+                __builtin_prefetch(&compressed_mer_query.dir_canon[
+                    std::min(scan_codes[pf], scan_rcodes[pf])]);
+            if (scan_codes[s] == UINT32_MAX) continue;
+            scan_pk[s] = compressed_mer_query.dir_canon[
+                std::min(scan_codes[s], scan_rcodes[s])];
         }
+        for (int s = 0; s < ramp; ++s) {
+            uint32_t v = scan_pk[s];
+            if (v) __builtin_prefetch(
+                &compressed_mer_query.arena_canon[MerQueryManager::dir_off(v)]);
+        }
+        for (int s = 0; s < n_codes; ++s) {
+            int pf = s + kPf;
+            if (pf < n_codes) {
+                uint32_t v = scan_pk[pf];
+                if (v) __builtin_prefetch(
+                    &compressed_mer_query.arena_canon[MerQueryManager::dir_off(v)]);
+            }
+            uint32_t v = scan_pk[s];
+            if (!v) continue;
+            uint32_t fm = (scan_codes[s] <= scan_rcodes[s]) ? 0u : 1u;
+            uint32_t off = MerQueryManager::dir_off(v);
+            uint32_t cnt = MerQueryManager::dir_cnt(v);
+            for (uint32_t a = 0; a < cnt; ++a) {
+                uint32_t row = compressed_mer_query.arena_canon[off + a];
+                int id = MerQueryManager::crow_id(row);
+                if (target_ele_id != -1 && id != target_ele_id) continue;
+                int loci = MerQueryManager::crow_loci(row);
+                if (MerQueryManager::crow_form(row) == fm)
+                    f_hits.push_back({s, id, loci});
+                else
+                    r_hits.push_back({n_codes - 1 - s, id, loci});
+            }
+        }
+        // Reverse hits were appended with position decreasing; the legacy
+        // reverse scan visits them ascending. Reverse the list (the chain only
+        // depends on across-position order, which is now ascending).
+        std::reverse(r_hits.begin(), r_hits.end());
+    } else {
+        scan_raw(scan_codes, f_hits);
+        // Reverse strand: encode the reverse-complement codes of the forward
+        // k-mers, then scan in ascending rc-read position order.
+        thread_local std::vector<uint32_t> rc_codes;
+        rc_codes.assign(n_codes, UINT32_MAX);
+        {
+            uint32_t rolling = 0, rc_rolling = 0;
+            int valid_run = 0;
+            for (int i = 0; i < chain_len; ++i) {
+                int8_t bits = base_lookup[static_cast<unsigned char>(seq[i])];
+                if (bits < 0) { valid_run = 0; rolling = 0; rc_rolling = 0; continue; }
+                rolling = ((rolling << 2) | static_cast<uint32_t>(bits)) & mer_mask;
+                rc_rolling = (rc_rolling >> 2) |
+                             (static_cast<uint32_t>(3 - bits) << (2 * k - 2));
+                ++valid_run;
+                if (valid_run >= k) rc_codes[chain_len - k - (i - k + 1)] = rc_rolling;
+            }
+        }
+        scan_raw(rc_codes, r_hits);
+    }
 
+    if (_vp) {
+        g_val_profile.rd_scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - _t0).count();
+        _t1 = std::chrono::steady_clock::now();
+    }
+
+    // Vote + gate matrix (T1 OR T2 ...) for one strand frame.
+    thread_local std::vector<int> frame_ids;
+    auto eval_frame = [&](const std::vector<std::array<int, 3>>& hits,
+                          int& r_ele, int& r_votes) -> std::pair<int, int> {
+        if (hits.empty()) return {-1, 0};
+        frame_ids.clear();
+        frame_ids.reserve(hits.size());
+        for (const auto& h : hits) frame_ids.push_back(h[1]);
+        VoteTally tally = tally_votes(frame_ids);
         auto chain_of = [&](int confi_id) -> std::pair<int, int> {
             int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
-            for (size_t i = 0; i < match_ids.size(); ++i) {
-                if (match_ids[i] != confi_id) continue;
-                int x = match_starts[i];
-                int l = match_loci[i];
+            for (const auto& h : hits) {
+                if (h[1] != confi_id) continue;
+                int x = h[0], l = h[2];
                 if (first < 0) first = x;
                 else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
                 prev_x = x; prev_l = l; last = x; ++m;
@@ -602,31 +717,25 @@ inline std::pair<int, int> validate_read_verified(
             if (m == 0) return {0, 0};
             return {passing, last - first + mer_size};
         };
-
         int passing = 0, span = 0;
         const bool gate_ok = gate_pass(tally, cfg, chain_of, passing, span);
         if (!gate_ok) {
             auto rg = rescue_gate(tally, cfg, chain_of);
-            if (rg.first >= 0) {
-                r_ele = rg.first;
-                r_votes = rg.second;
-            }
+            if (rg.first >= 0) { r_ele = rg.first; r_votes = rg.second; }
+            return {-1, 0};
         }
-        if (_vp) {
-            g_val_profile.rd_gate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - _t2).count();
-            g_val_profile.rd_reads += 1;
-        }
-        if (!gate_ok) return {-1, 0};
         return {tally.best_id, static_cast<int>(tally.n)};
     };
 
     int f_ele = -1, f_votes = 0, r_ele = -1, r_votes = 0;
-    auto [forward_id, forward_count] = validate_chain(seq, f_ele, f_votes);
+    auto [forward_id, forward_count] = eval_frame(f_hits, f_ele, f_votes);
+    auto [reverse_id, reverse_count] = eval_frame(r_hits, r_ele, r_votes);
 
-    thread_local std::string _rc_buf;
-    reverse_complement(seq, _rc_buf);
-    auto [reverse_id, reverse_count] = validate_chain(_rc_buf, r_ele, r_votes);
+    if (_vp) {
+        g_val_profile.rd_gate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - _t1).count();
+        g_val_profile.rd_reads += 1;
+    }
 
     if (forward_id == -1 && reverse_id == -1) {
         if (cfg.verify.enabled) {
@@ -678,15 +787,6 @@ inline std::pair<int, int> validate_read(
 // looked up only once (its forward and reverse-complement ranges are cached), instead
 // of re-hashing the 125/150 overlapping positions of neighbouring windows.
 // `emit(start, strand, element_id)` is called for every accepted window.
-
-inline uint32_t rc_code_2bit(uint32_t code, int k) {
-    uint32_t res = 0;
-    for (int i = 0; i < k; ++i) {
-        uint32_t b = (code >> (2 * i)) & 0x3u;
-        res = (res << 2) | (b ^ 0x3u);
-    }
-    return res;
-}
 
 template <typename Emit, typename Verify>
 inline void validate_sequence_segmented(
