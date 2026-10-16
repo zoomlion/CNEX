@@ -65,6 +65,22 @@ cnex validate genome.fa --mers mers_table.tsv -t 16 -o out/
 cnex assemble out/ --mers mers_table.tsv -o contigs.fa
 ```
 
+### Input formats
+
+`--cne` expects a `###`-delimited block MSA (each block a FASTA alignment,
+headers `>Species.contig[+-]:start-end`). Whole-genome alignments in **MAF**
+format (UCSC Multiz/TBA, or Cactus exported with `hal2maf`) are also
+supported: convert them first with
+
+```bash
+python3 utils/maf_convert.py alignment.maf          # -> most-cons-cne.fa (.maf.gz ok)
+python3 src/00.filter_msa.py most-cons-cne.fa       # -> most-cons-cne.filtered.fa
+cnex pipeline genomes/ --cne most-cons-cne.filtered.fa ...
+```
+
+`maf_convert.py` rewrites each MAF block as a `###`-delimited FASTA block
+(coordinates preserved); use `-o FILE` to change the output path.
+
 ## Phylogeny Pipeline
 
 ### Workflow
