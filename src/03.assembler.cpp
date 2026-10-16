@@ -34,7 +34,6 @@ struct Args {
     bool trim = true;
     bool trim_set = false;
     bool no_trim_set = false;
-    bool sw_trim = false;
     double repeat_ratio = 1.2;
     bool output_snp = false;
     bool help_requested = false;
@@ -150,8 +149,6 @@ Args parse_args(int argc, char* argv[]) {
             args.repeat_ratio = std::stod(argv[i]);
         } else if (arg == "--snp") {
             args.output_snp = true;
-        } else if (arg == "--sw-trim") {
-            args.sw_trim = true;
         } else if (arg == "--cne-ref") {
             if (++i >= argc) throw std::runtime_error("Missing value for --cne-ref");
             args.cne_ref_path = argv[i];
@@ -449,63 +446,6 @@ std::unordered_map<int, std::string> load_cne_refs(const std::string& path) {
     return refs;
 }
 
-void sw_align(const std::string& ref, const std::string& seq,
-              int& r_start, int& r_end, int& score,
-              int* out_matches = nullptr, int* out_alen = nullptr) {
-    int m = (int)ref.size(), n = (int)seq.size();
-    const int match_score = 5, mismatch_score = -4;
-    const int gap_open = 15, gap_extend = 1;
-
-    std::vector<std::vector<int>> M(m + 1, std::vector<int>(n + 1, 0));
-    std::vector<std::vector<int>> Ix(m + 1, std::vector<int>(n + 1, 0));
-    std::vector<std::vector<int>> Iy(m + 1, std::vector<int>(n + 1, 0));
-
-    score = 0;
-    int max_i = 0, max_j = 0;
-
-    for (int i = 1; i <= m; ++i) {
-        for (int j = 1; j <= n; ++j) {
-            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
-            M[i][j] = std::max({M[i - 1][j - 1] + d, Ix[i - 1][j - 1] + d,
-                                Iy[i - 1][j - 1] + d, 0});
-            Ix[i][j] = std::max({M[i - 1][j] - gap_open, Ix[i - 1][j] - gap_extend, 0});
-            Iy[i][j] = std::max({M[i][j - 1] - gap_open, Iy[i][j - 1] - gap_extend, 0});
-            int cur = std::max({M[i][j], Ix[i][j], Iy[i][j]});
-            if (cur > score) { score = cur; max_i = i; max_j = j; }
-        }
-    }
-    if (score == 0) { r_start = 0; r_end = n; return; }
-
-    // Traceback from (max_i, max_j) to find start position in seq
-    int i = max_i, j = max_j;
-    int cur = std::max({M[i][j], Ix[i][j], Iy[i][j]});
-    int n_matches = 0, n_alen = 0;
-    while (i > 0 && j > 0 && cur > 0) {
-        if (cur == M[i][j]) {
-            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
-            int prev = std::max({M[i - 1][j - 1], Ix[i - 1][j - 1], Iy[i - 1][j - 1]});
-            if (M[i][j] == prev + d) cur = M[i - 1][j - 1];
-            else cur = std::max({M[i - 1][j - 1], Ix[i - 1][j - 1], Iy[i - 1][j - 1]});
-            if (ref[i - 1] == seq[j - 1]) ++n_matches;
-            ++n_alen;
-            --i; --j;
-        } else if (cur == Ix[i][j]) {
-            cur = Ix[i - 1][j];
-            ++n_alen;
-            --i;
-        } else {
-            cur = Iy[i][j - 1];
-            ++n_alen;
-            --j;
-        }
-        if (cur <= 0) break;
-    }
-    r_start = j;
-    r_end = max_j;
-    if (out_matches) *out_matches = n_matches;
-    if (out_alen) *out_alen = n_alen;
-}
-
 // Local SW identity with the evaluation scoring (match +2, mismatch -1,
 // linear gap 1/base). Returns matches / alignment length of the best local
 // alignment, 0.0 when no positive-scoring alignment exists.
@@ -558,54 +498,6 @@ static double sw_identity_2m1(const std::string& ref, const std::string& seq) {
     return alen > 0 ? static_cast<double>(matches) / alen : 0.0;
 }
 
-void trim_contig_sw(std::string& seq, const std::string& ref,
-                    const MerQueryManager& mqm, int ele_id) {
-    if (seq.size() < 26 || ref.empty()) return;
-    int mer_size = mqm.get_mer_size();
-    int n = static_cast<int>(seq.size()) - mer_size + 1;
-
-    // Phase 1: 13-mer扫描确认核心区
-    int first_hit = -1, last_hit = -1;
-    for (int i = 0; i < n; ++i) {
-        try {
-            auto code = dna_encoder(seq.substr(i, 13));
-            auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-                if (first_hit < 0) first_hit = i;
-                last_hit = i;
-            }
-        } catch (...) { continue; }
-    }
-    if (first_hit < 0) return;
-
-    // Phase 2: SW 扩展边界
-    const int extend = 100;
-    int L = std::max(0, first_hit - extend);
-    int R = std::min((int)seq.size(), last_hit + mer_size + extend);
-    if (R - L < 20) return;
-
-    std::string candidate = seq.substr(L, R - L);
-    int r_start, r_end, score;
-    sw_align(ref, candidate, r_start, r_end, score);
-    if (score == 0) return;
-
-    int sw_start = L + r_start;
-    int sw_end = L + r_end + 1;
-
-    // 保底下界：只扩展，不内缩
-    int old_start = first_hit - 6;
-    int old_end = last_hit + mer_size + 6;
-    int new_start = std::min(sw_start, old_start);
-    int new_end = std::max(sw_end, old_end);
-
-    new_start = std::max(0, new_start);
-    new_end = std::min((int)seq.size(), new_end);
-
-    if (new_end - new_start < 20) return;
-    seq = seq.substr(new_start, new_end - new_start);
-}
-
-
 struct GenomeResult {
     int ele_id;
     std::string display_id;
@@ -615,7 +507,6 @@ struct GenomeResult {
 static void process_genome_element(
     const std::vector<Read>& all_reads, size_t begin, size_t end,
     const Args& args, const MerQueryManager& mqm,
-    const std::unordered_map<int, std::string>& cne_refs,
     std::vector<GenomeResult>& out)
 {
     const int cur_ele = all_reads[begin].ele_id;
@@ -677,14 +568,7 @@ static void process_genome_element(
     auto consider = [&](std::string contig, int cluster_start,
                         const EleRead& first_r, const EleRead& last_r, size_t pos) {
         if (contig.empty()) return;
-        if (args.trim) {
-            auto it = cne_refs.find(cur_ele);
-            if (it != cne_refs.end()) {
-                trim_contig_sw(contig, it->second, mqm, cur_ele);
-            } else {
-                trim_contig(contig, mqm, cur_ele);
-            }
-        }
+        if (args.trim) trim_contig(contig, mqm, cur_ele);
         if (contig.size() < 20) return;
         ContigScore sc = score_contig(contig, mqm, cur_ele);
         bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
@@ -860,7 +744,8 @@ int main(int argc, char* argv[]) {
                       << "  --no-trim             Disable trimming\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
                        << "  --snp                 Scan for candidate SNPs from validated reads\n"
-                       << "  --cne-ref <file>      CNE reference FASTA for SW-based trimming (ref.fa)\n";
+                       << "  --cne-ref <file>      CNE reference FASTA (ref.fa): identity verification of\n"
+                      << "                        low-distinct claims (reads mode)\n";
             return 1;
         }
 
@@ -1059,14 +944,7 @@ int main(int argc, char* argv[]) {
                                                           gfa_out_ptr);
                         if (c.empty()) continue;
                         ++dbg_cand;
-                        if (args.trim) {
-                            auto it = cne_refs.find(cur_ele);
-                            if (it != cne_refs.end() && args.sw_trim) {
-                                trim_contig_sw(c, it->second, mqm, cur_ele);
-                            } else {
-                                trim_contig(c, mqm, cur_ele);
-                            }
-                        }
+                        if (args.trim) trim_contig(c, mqm, cur_ele);
                         if (c.size() < 20) continue;
                         ++dbg_trim20;
                         ContigScore sc = score_contig(c, mqm, cur_ele);
@@ -1151,14 +1029,7 @@ int main(int argc, char* argv[]) {
                     }
                     if (best_dist >= kMinFallbackDistinct) {
                         contig = std::move(reads[best_idx]);
-                        if (args.trim) {
-                            auto it = cne_refs.find(cur_ele);
-                            if (it != cne_refs.end() && args.sw_trim) {
-                                trim_contig_sw(contig, it->second, mqm, cur_ele);
-                            } else {
-                                trim_contig(contig, mqm, cur_ele);
-                            }
-                        }
+                        if (args.trim) trim_contig(contig, mqm, cur_ele);
                         if (contig.size() < 20) { dbg_bail("fb_short", best_dist); continue; }
                     } else {
                         // T3 rescue handoff: validate already SW-verified these
@@ -1219,7 +1090,7 @@ int main(int argc, char* argv[]) {
             const int nthreads = std::max(1, args.threads);
             if (nthreads == 1) {
                 for (const auto& b : blocks) {
-                    process_genome_element(all_reads, b.first, b.second, args, mqm, cne_refs, grs);
+                    process_genome_element(all_reads, b.first, b.second, args, mqm, grs);
                 }
             } else {
                 std::atomic<size_t> next_block{0};
@@ -1232,7 +1103,7 @@ int main(int argc, char* argv[]) {
                             size_t bi = next_block.fetch_add(1);
                             if (bi >= blocks.size()) break;
                             process_genome_element(all_reads, blocks[bi].first, blocks[bi].second,
-                                                   args, mqm, cne_refs, per_thread[t]);
+                                                   args, mqm, per_thread[t]);
                         }
                     });
                 }
