@@ -66,7 +66,6 @@ struct Args {
 struct Read {
     std::string seq_id;
     std::string seq;
-    std::string qua;
     bool is_fasta = false;
     int offset = 0;
 };
@@ -146,7 +145,7 @@ public:
         while (true) {
             auto nl = buffer_.find('\n', pos_);
             if (nl != std::string::npos) {
-                line = buffer_.substr(pos_, nl - pos_);
+                line.assign(buffer_.data() + pos_, nl - pos_);
                 pos_ = nl + 1;
                 return true;
             }
@@ -160,6 +159,34 @@ public:
             if (bytes_read == 0) {
                 if (!buffer_.empty()) {
                     line = std::move(buffer_);
+                    buffer_.clear();
+                    return true;
+                }
+                return false;
+            }
+            buffer_.append(raw_, bytes_read);
+        }
+    }
+
+    // Consume one line without materializing it (FASTQ '+'/quality lines).
+    // Mirrors readline's EOF behavior: a trailing line without '\n' counts
+    // as one line, an empty remainder does not.
+    bool skip_line() {
+        while (true) {
+            auto nl = buffer_.find('\n', pos_);
+            if (nl != std::string::npos) {
+                pos_ = nl + 1;
+                return true;
+            }
+            if (pos_ < buffer_.size()) {
+                buffer_ = buffer_.substr(pos_);
+            } else {
+                buffer_.clear();
+            }
+            pos_ = 0;
+            size_t bytes_read = fread(raw_, 1, sizeof(raw_), fp_);
+            if (bytes_read == 0) {
+                if (!buffer_.empty()) {
                     buffer_.clear();
                     return true;
                 }
@@ -202,8 +229,12 @@ FileType detect_file_type(const std::string& path, const std::string& pigz_path)
 }
 
 // ─── Reader thread: streams reads into the chunk queue ───
+//
+// One instance per input shard (paired files run in parallel, so the gz
+// decompression + line parsing of R1 and R2 overlap). It no longer calls
+// queue.finish(): main joins all readers first, then closes the queue.
 
-void reader_thread(const std::vector<std::string>& files,
+void reader_thread(std::vector<std::string> files,
                    ChunkQueue& queue,
                    int chunk_size,
                    int window_size,
@@ -243,9 +274,8 @@ void reader_thread(const std::vector<std::string>& files,
                 if (!reader.readline(read.seq_id)) break;
                 if (read.seq_id.empty()) continue;
                 if (!reader.readline(read.seq)) break;
-                if (!reader.readline(read.qua)) break;
-                if (!reader.readline(read.qua)) break;
-                read.qua.clear();
+                if (!reader.skip_line()) break;
+                if (!reader.skip_line()) break;
                 chunk.push_back(std::move(read));
                 count++;
                 if (static_cast<int>(chunk.size()) >= chunk_size) {
@@ -317,8 +347,7 @@ void reader_thread(const std::vector<std::string>& files,
         }
     }
 
-    total_reads.store(count);
-    queue.finish();
+    total_reads.fetch_add(count, std::memory_order_relaxed);
 }
 
 // ─── T3 rescue verification (SIMD SW vs element panels) ───
@@ -773,15 +802,34 @@ int main(int argc, char* argv[]) {
                                  std::ref(processed));
         }
 
-        // Start reader thread (reads and pushes chunks)
+        // Start reader thread(s). Paired/multiple inputs get one reader each
+        // (capped), so decompression + parsing run in parallel. --depth keeps
+        // the historical sequential single-reader semantics.
         std::cerr << "Reading and processing reads ...\n";
-        std::thread reader(reader_thread, std::cref(args.reads_files), std::ref(queue),
-                           args.chunk_size, args.window_size, args.step_size,
-                           args.depth, std::cref(args.pigz_path), std::ref(total_reads),
-                           args.input_type);
+        std::vector<std::thread> readers;
+        if (args.depth > 0 || args.reads_files.size() <= 1) {
+            readers.emplace_back(reader_thread, args.reads_files, std::ref(queue),
+                                 args.chunk_size, args.window_size, args.step_size,
+                                 args.depth, std::cref(args.pigz_path),
+                                 std::ref(total_reads), args.input_type);
+        } else {
+            constexpr size_t kMaxReaders = 4;
+            const size_t nreaders = std::min(args.reads_files.size(), kMaxReaders);
+            std::vector<std::vector<std::string>> per_reader(nreaders);
+            for (size_t fi = 0; fi < args.reads_files.size(); ++fi) {
+                per_reader[fi % nreaders].push_back(args.reads_files[fi]);
+            }
+            for (auto& files : per_reader) {
+                readers.emplace_back(reader_thread, std::move(files), std::ref(queue),
+                                     args.chunk_size, args.window_size, args.step_size,
+                                     args.depth, std::cref(args.pigz_path),
+                                     std::ref(total_reads), args.input_type);
+            }
+        }
 
-        // Wait for reader to finish (all chunks in queue)
-        reader.join();
+        // Wait for all readers to finish (remaining chunks are in the queue)
+        for (auto& r : readers) r.join();
+        queue.finish();
         int64_t n_total = total_reads.load();
         std::cerr << "  Total reads to process: " << n_total << "\n";
 
