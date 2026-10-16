@@ -37,6 +37,7 @@ struct Args {
     int threads = 4;
     tsl::robin_set<int> debug_eles;
     bool trim = true;
+    bool polish = true;   // reads-mode post-assembly consensus polish
     bool trim_set = false;
     bool no_trim_set = false;
     double repeat_ratio = 1.2;
@@ -166,6 +167,8 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--no-trim") {
             args.trim = false;
             args.no_trim_set = true;
+        } else if (arg == "--no-polish") {
+            args.polish = false;
         } else if (arg == "--repeat-ratio") {
             if (++i >= argc) throw std::runtime_error("Missing value for --repeat-ratio");
             args.repeat_ratio = std::stod(argv[i]);
@@ -382,6 +385,103 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
     auto trimmed = seq.substr(start, end + mer_size - 1 - start);
     if (trimmed.size() >= 20) {
         seq = std::move(trimmed);
+    }
+}
+
+// Post-assembly consensus polish. The de Bruijn contig is a single graph path
+// (no base voting), so a low-count edge can survive into it. Re-align the
+// element's reads to the assembled contig (k-mer-anchored placement, both
+// strands) and take a per-position majority vote, iterated. Reads vote only if
+// they place at >= min_ident over their overlap, so divergent/paralog reads do
+// not corrupt the contig.
+static void polish_contig(std::string& contig, const std::vector<std::string>& reads,
+                          int iters = 1, double min_ident = 0.95, int k = 13) {
+    const int L = static_cast<int>(contig.size());
+    if (L < k + 5 || reads.size() < 2) return;
+    static const char BASES[4] = {'A', 'C', 'G', 'T'};
+    auto bidx = [](char c) -> int {
+        switch (c) { case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; default: return -1; }
+    };
+    auto comp = [](char c) -> char {
+        switch (c) { case 'A': return 'T'; case 'C': return 'G'; case 'G': return 'C'; case 'T': return 'A'; default: return 'N'; }
+    };
+    std::unordered_map<uint32_t, std::vector<int>> idx;
+    std::string rcbuf;
+    // Flat, epoch-stamped offset counters: offset d lies in [-base, L-k], so a
+    // dense array replaces the per-read hash map (no allocation per read).
+    thread_local std::vector<int> offcnt, offstamp;
+    thread_local std::vector<int> touched;
+    thread_local int offep = 0;
+    for (int it = 0; it < iters; ++it) {
+        idx.clear();
+        for (int i = 0; i + k <= L; ++i) {
+            uint32_t code;
+            if (encode_mer_at(contig, static_cast<size_t>(i), k, code)) idx[code].push_back(i);
+        }
+        std::vector<std::array<int, 4>> cnt(L);
+        for (int i = 0; i < L; ++i) {
+            cnt[i] = {0, 0, 0, 0};
+            int b = bidx(contig[i]);
+            if (b >= 0) cnt[i][b] = 1;   // contig base seeds the vote (tie-break)
+        }
+        auto place = [&](const std::string& q, int& m, int& ov, int& d) {
+            const int n = static_cast<int>(q.size());
+            m = -1; ov = 0; d = 0;
+            if (n < k) return;
+            const int base = n - k;            // offset d_min = -base
+            const int D = (L - k) + base + 1;  // offsets in [-base, L-k]
+            if (static_cast<int>(offcnt.size()) < D) {
+                offcnt.resize(D);
+                offstamp.resize(D, 0);
+            }
+            ++offep;
+            if (offep == 0) { std::fill(offstamp.begin(), offstamp.end(), 0); offep = 1; }
+            touched.clear();
+            for (int i = 0; i + k <= n; ++i) {
+                uint32_t code;
+                if (!encode_mer_at(q, static_cast<size_t>(i), k, code)) continue;
+                auto ii = idx.find(code);
+                if (ii == idx.end()) continue;
+                for (int cp : ii->second) {
+                    int x = cp - i + base;
+                    if (offstamp[x] != offep) { offstamp[x] = offep; offcnt[x] = 0; touched.push_back(x); }
+                    ++offcnt[x];
+                }
+            }
+            if (touched.empty()) return;
+            int bx = touched[0], bc = offcnt[touched[0]];
+            for (int x : touched) if (offcnt[x] > bc) { bc = offcnt[x]; bx = x; }
+            int bd = bx - base;
+            int lo = std::max(0, bd), hi = std::min(L, bd + n);
+            ov = hi - lo;
+            if (ov <= 0) return;
+            int mm = 0;
+            for (int p = lo; p < hi; ++p) if (q[p - bd] == contig[p]) ++mm;
+            m = mm; d = bd;
+        };
+        for (const auto& r : reads) {
+            rcbuf.assign(r.rbegin(), r.rend());
+            for (char& c : rcbuf) c = comp(c);
+            int mf, of, df, mr, orr, dr;
+            place(r, mf, of, df);
+            place(rcbuf, mr, orr, dr);
+            const bool use_rc = (mr * of > mf * orr) ||
+                                (mr * of == mf * orr && mr > mf);
+            const std::string& q = use_rc ? rcbuf : r;
+            const int m = use_rc ? mr : mf, ov = use_rc ? orr : of, d = use_rc ? dr : df;
+            if (m < 0 || m < static_cast<int>(min_ident * ov)) continue;
+            int lo = std::max(0, d), hi = std::min(L, d + static_cast<int>(q.size()));
+            for (int p = lo; p < hi; ++p) {
+                int b = bidx(q[p - d]);
+                if (b >= 0) ++cnt[p][b];
+            }
+        }
+        for (int i = 0; i < L; ++i) {
+            int b = bidx(contig[i]);
+            int bb = (b >= 0) ? b : 0;
+            for (int x = 0; x < 4; ++x) if (cnt[i][x] > cnt[i][bb]) bb = x;
+            if (cnt[i][bb] > 0) contig[i] = BASES[bb];
+        }
     }
 }
 
@@ -768,6 +868,7 @@ int main(int argc, char* argv[]) {
                       << "  -t, --threads <n>     Worker threads for genome-mode assembly (default: 4)\n"
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
+                      << "  --no-polish           Disable reads-mode post-assembly polish\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
                        << "  --snp                 Scan for candidate SNPs from validated reads\n"
                        << "  --cne-ref <file>      CNE reference FASTA (ref.fa): identity verification of\n"
@@ -1107,6 +1208,7 @@ int main(int argc, char* argv[]) {
                                  final_sc.distinct, best_support,
                                  last_total_reads, last_groups, last_second_hits);
                 }
+                if (args.polish) polish_contig(contig, reads);
                 return contig;
         };
 
