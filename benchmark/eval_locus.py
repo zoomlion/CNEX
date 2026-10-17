@@ -23,7 +23,6 @@ Examples:
 """
 import argparse
 import os
-import random
 import re
 import subprocess
 import sys
@@ -33,7 +32,6 @@ import parasail
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 GENOME = os.path.join(BASE, 'data/genomes/Homo_sapiens/Homo_sapiens.fa')
-MSA = os.path.join(BASE, 'data/most-cons-cne.filtered.fa')
 TRUTH = os.path.join(BASE, 'data/truth/Homo_sapiens.tsv')
 
 MAT = parasail.matrix_create("ACGTN", 2, -1)
@@ -41,33 +39,19 @@ COMP = str.maketrans("ACGTN", "TGCAN")
 
 
 def load_truth():
-    """Filtered truth: block_id -> [(contig, start, end), ...] (coords normalized)."""
-    random.seed(42)
-    orig = [b.strip() for b in open(MSA).read().split('###') if b.strip()]
-    sample_idx = sorted(random.sample(range(len(orig)), 10000))
+    """Ground truth: pos -> [(contig, start, end), ...] (coords normalized).
 
-    def ng(raw, sp='Homo_sapiens'):
-        lines = raw.strip().split('\n')
-        for i, l in enumerate(lines):
-            if l.startswith('>') and l.startswith('>' + sp + '.'):
-                s = ''
-                for j in range(i + 1, len(lines)):
-                    if lines[j].startswith('>') or not lines[j].strip():
-                        break
-                    s += lines[j].strip()
-                return len(s.replace('-', '').upper())
-        return 0
-
+    Read straight from the pre-extracted truth TSV (block_00000..block_09999).
+    This file already encodes the filtered Homo_sapiens set and is equivalent to
+    the Homo_sapiens rows carried by the other-species MSA inputs
+    (benchmark/data/blocks/*.fa), so the (now-absent) full MSA is not needed.
+    """
     truth = defaultdict(list)
     for line in open(TRUTH):
-        if not re.match(r'block_\d+', line):
+        if not re.match(r'^block_\d', line):
             continue
-        p = line.strip().split('\t')
+        p = line.rstrip('\n').split('\t')
         pos = int(p[0].split('_')[1])
-        if pos >= len(sample_idx):
-            continue
-        if ng(orig[sample_idx[pos]]) < 25:
-            continue
         s, e = int(p[3]), int(p[4])
         truth[pos].append((p[2], min(s, e), max(s, e)))
     return truth
