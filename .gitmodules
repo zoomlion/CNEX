@@ -7,3 +7,6 @@
 [submodule "src/pigz"]
 	path = src/pigz
 	url = https://github.com/madler/pigz.git
+[submodule "src/zlib-ng"]
+	path = src/zlib-ng
+	url = https://github.com/zlib-ng/zlib-ng.git

@@ -13,6 +13,9 @@ src/parasail/build/
 src/parasail/lib/
 src/parasail/include/
 
+# zlib-ng build outputs (git submodule src/zlib-ng)
+build/
+
 # Python cache
 __pycache__/
 *.pyc
