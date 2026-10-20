@@ -1,5 +1,8 @@
 #include <hip/debruijn_core.hpp>
+#include <hip/panel_core.hpp>
 #include <hip/validator_core.hpp>
+
+#include <parasail.h>
 
 #include <tsl/robin_set.h>
 #include <algorithm>
@@ -25,11 +28,9 @@ struct Args {
     std::string mers_file;
     std::string output = "assembled.fasta";
     int kmer = 19;
-    // Reads-mode default: assemble each element with every k in the list and
-    // keep the best-scoring contig (long k separates paralogs, short k bridges
-    // low-coverage seams). `-k` clears this to force a single k; --multi-k
-    // overrides the list; --no-multi-k disables it.
-    std::vector<int> multi_k = {27, 19};
+    // Reads-mode default: single k=27. `--multi-k` opts into multi-k assembly;
+    // `-k` or `--no-multi-k` forces single-k mode.
+    std::vector<int> multi_k = {27};
     int min_count = 1;
     int max_reads = 200;
     int max_loci_gap = 5000;
@@ -37,6 +38,7 @@ struct Args {
     int threads = 4;
     tsl::robin_set<int> debug_eles;
     bool trim = true;
+    int trim_margin = 20;   // bp kept beyond the first/last element-specific k-mer
     bool polish = true;   // reads-mode post-assembly consensus polish
     bool trim_set = false;
     bool no_trim_set = false;
@@ -44,6 +46,18 @@ struct Args {
     bool output_snp = false;
     bool help_requested = false;
     std::string cne_ref_path;
+    // Rescue/panel path (reads mode): score candidate contigs and low-support
+    // reads against the element's leave-one-out panels. Disabled when empty.
+    std::string panels_path;
+    double rescue_tau = 0.65;
+    int rescue_min_distinct = 2;
+    int rescue_min_span = 30;
+    int min_output_distinct = 12;
+    int min_fallback_distinct = 16;
+    bool rescue_lowconf = true;
+    int rescue_min_support = 3;
+    double min_rescue_score = 1.0;    // 0 = keep all T3 rescue-tagged reads
+    bool rescue_enabled = true;
 };
 
 struct Read {
@@ -167,6 +181,9 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--no-trim") {
             args.trim = false;
             args.no_trim_set = true;
+        } else if (arg == "--trim-margin") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --trim-margin");
+            args.trim_margin = std::stoi(argv[i]);
         } else if (arg == "--no-polish") {
             args.polish = false;
         } else if (arg == "--repeat-ratio") {
@@ -177,6 +194,34 @@ Args parse_args(int argc, char* argv[]) {
         } else if (arg == "--cne-ref") {
             if (++i >= argc) throw std::runtime_error("Missing value for --cne-ref");
             args.cne_ref_path = argv[i];
+        } else if (arg == "--panels") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --panels");
+            args.panels_path = argv[i];
+        } else if (arg == "--rescue-tau") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --rescue-tau");
+            args.rescue_tau = std::stod(argv[i]);
+        } else if (arg == "--rescue-min-distinct") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --rescue-min-distinct");
+            args.rescue_min_distinct = std::stoi(argv[i]);
+        } else if (arg == "--rescue-min-span") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --rescue-min-span");
+            args.rescue_min_span = std::stoi(argv[i]);
+        } else if (arg == "--min-output-distinct") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --min-output-distinct");
+            args.min_output_distinct = std::stoi(argv[i]);
+        } else if (arg == "--min-fallback-distinct") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --min-fallback-distinct");
+            args.min_fallback_distinct = std::stoi(argv[i]);
+        } else if (arg == "--rescue-lowconf") {
+            args.rescue_lowconf = true;
+        } else if (arg == "--rescue-min-support") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --rescue-min-support");
+            args.rescue_min_support = std::stoi(argv[i]);
+        } else if (arg == "--min-rescue-score") {
+            if (++i >= argc) throw std::runtime_error("Missing value for --min-rescue-score");
+            args.min_rescue_score = std::stod(argv[i]);
+        } else if (arg == "--no-rescue") {
+            args.rescue_enabled = false;
         } else if (arg[0] != '-') {
             if (args.input_dir.empty()) args.input_dir = arg;
             else throw std::runtime_error("Unexpected argument: " + arg);
@@ -273,9 +318,65 @@ bool parse_genome_id(const std::string& seq_id, GenomePos& pos) {
     return false;
 }
 
+struct PanelScore {
+    double max_id = -1.0;
+    double mean_id = -1.0;
+    double median_id = -1.0;
+    int n_ge80 = 0;
+    int n_ge90 = 0;
+    int n_used = 0;
+};
+
+struct PanelScorer {
+    const std::unordered_map<int, std::vector<std::string>>* panels = nullptr;
+    parasail_matrix_t* mat = nullptr;
+
+    bool enabled() const { return panels != nullptr && mat != nullptr && !panels->empty(); }
+
+    PanelScore score(int ele, const std::string& seq, double min_cov = 0.5) const {
+        PanelScore out;
+        if (!enabled() || seq.empty()) return out;
+        auto it = panels->find(ele);
+        if (it == panels->end()) return out;
+        std::vector<double> ids;
+        ids.reserve(it->second.size());
+        for (const std::string& ref : it->second) {
+            if (ref.empty()) continue;
+            parasail_result_t* r = parasail_sw_stats_striped_16(
+                seq.c_str(), static_cast<int>(seq.size()),
+                ref.c_str(), static_cast<int>(ref.size()), 2, 1, mat);
+            if (r->stats->length > 0) {
+                const int mn = static_cast<int>(std::min(seq.size(), ref.size()));
+                const double cov = mn > 0 ? static_cast<double>(r->stats->length) / mn : 0.0;
+                if (cov >= min_cov) {
+                    ids.push_back(static_cast<double>(r->stats->matches) / r->stats->length);
+                }
+            }
+            parasail_result_free(r);
+        }
+        if (ids.empty()) return out;
+        std::sort(ids.begin(), ids.end());
+        out.n_used = static_cast<int>(ids.size());
+        out.max_id = ids.back();
+        double sum = 0.0;
+        for (double v : ids) {
+            sum += v;
+            if (v >= 0.80) ++out.n_ge80;
+            if (v >= 0.90) ++out.n_ge90;
+        }
+        out.mean_id = sum / ids.size();
+        out.median_id = ids[ids.size() / 2];
+        return out;
+    }
+
+    double identity(int ele, const std::string& seq, double min_cov = 0.5) const {
+        return score(ele, seq, min_cov).max_id;
+    }
+};
+
 struct ContigScore {
-    int hits = 0;            // raw matched positions
-    int distinct = 0;        // distinct matched mers
+    int hits = 0;
+    int distinct = 0;
 };
 
 ContigScore score_contig(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
@@ -324,8 +425,9 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
                                std::ofstream* gfa_out = nullptr,
                                bool debug = false)
 {
+    const bool need_kcounts = (gfa_out != nullptr);
     auto [graph, kmer_counts, e_counts] =
-        de_bruijn_graph(reads, k, min_count, gfa_out != nullptr, snp_out != nullptr);
+        de_bruijn_graph(reads, k, min_count, need_kcounts, snp_out != nullptr);
     if (graph.empty()) return "";
 
     std::unordered_map<std::string, int> node_scores = build_node_scores(graph, mqm, ele_id, k);
@@ -361,7 +463,22 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
     return contig;
 }
 
-void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
+static int target_span(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
+    const int mer_size = mqm.get_mer_size();
+    int first = -1, last = -1;
+    for (size_t i = 0; i + mer_size <= seq.size(); ++i) {
+        uint32_t code;
+        if (!encode_mer_at(seq, i, mer_size, code)) continue;
+        auto it = mqm.compressed_mer_query.find(code);
+        if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
+            if (first < 0) first = static_cast<int>(i);
+            last = static_cast<int>(i);
+        }
+    }
+    return first < 0 ? 0 : last - first + mer_size;
+}
+
+void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id, int margin) {
     if (seq.size() < 26) return;
     int mer_size = mqm.get_mer_size();
     int n = static_cast<int>(seq.size()) - mer_size + 1;
@@ -379,7 +496,6 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id) {
 
     if (first_hit < 0) return;
 
-    int margin = 6;
     int start = std::max(0, first_hit - margin);
     int end = std::min(n, last_hit + margin);
     auto trimmed = seq.substr(start, end + mer_size - 1 - start);
@@ -495,7 +611,8 @@ static void polish_contig(std::string& contig, const std::vector<std::string>& r
 static constexpr double kClusterMinScore = 2.0;
 
 static std::vector<int> cluster_reads_by_shared_kmers(
-    const std::vector<std::string>& reads, int k)
+    const std::vector<std::string>& reads, int k,
+    double min_score = kClusterMinScore, bool count_mode = false)
 {
     const int n = static_cast<int>(reads.size());
     std::vector<int> parent(n);
@@ -528,7 +645,7 @@ static std::vector<int> cluster_reads_by_shared_kmers(
     for (const auto& kv : occ) {
         const auto& lst = kv.second;
         if (lst.size() < 2 || lst.size() > 128) continue;
-        const double w = 1.0 / static_cast<double>(lst.size());
+        const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(lst.size());
         for (size_t a = 0; a + 1 < lst.size(); ++a) {
             for (size_t b = a + 1; b < lst.size(); ++b) {
                 int x = lst[a], y = lst[b];
@@ -539,7 +656,7 @@ static std::vector<int> cluster_reads_by_shared_kmers(
         }
     }
     for (const auto& kv : pair_score) {
-        if (kv.second < kClusterMinScore) continue;
+        if (kv.second < min_score) continue;
         int a = find_root(static_cast<int>(kv.first >> 32));
         int b = find_root(static_cast<int>(kv.first & 0xffffffffu));
         if (a != b) parent[b] = a;
@@ -690,7 +807,7 @@ static void process_genome_element(
     auto consider = [&](std::string contig, int cluster_start,
                         const EleRead& first_r, const EleRead& last_r, size_t pos) {
         if (contig.empty()) return;
-        if (args.trim) trim_contig(contig, mqm, cur_ele);
+        if (args.trim) trim_contig(contig, mqm, cur_ele, args.trim_margin);
         if (contig.size() < 20) return;
         ContigScore sc = score_contig(contig, mqm, cur_ele);
         bool repeat_chimera = sc.hits >= 10 && sc.distinct > 0 &&
@@ -858,8 +975,8 @@ int main(int argc, char* argv[]) {
                       << "  -k, --kmer <n>        K-mer length, single-k mode (default: 19)\n"
                       << "  --multi-k <k1,k2,..>  Reads mode: assemble each element with every k\n"
                       << "                        and keep the best-scoring contig\n"
-                      << "                        (default: 27,19; -k or --no-multi-k disables)\n"
-                      << "  --no-multi-k          Disable the reads-mode multi-k default\n"
+                      << "                        (default: 27; -k or --no-multi-k disables)\n"
+                      << "  --no-multi-k          Force single-k mode\n"
                       << "  --min-count <n>       Min (k+1)-mer occurrence in graph (default: 1)\n"
                       << "  --max-reads <n>       Max reads per element/locus (default: 200)\n"
                       << "  --max-loci-gap <n>    Max gap for locus clustering (default: 5000)\n"
@@ -868,6 +985,7 @@ int main(int argc, char* argv[]) {
                       << "  -t, --threads <n>     Worker threads for genome-mode assembly (default: 4)\n"
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
+                      << "  --trim-margin <n>     bp kept beyond first/last element k-mer (default: 20)\n"
                       << "  --no-polish           Disable reads-mode post-assembly polish\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
                        << "  --snp                 Scan for candidate SNPs from validated reads\n"
@@ -887,6 +1005,23 @@ int main(int argc, char* argv[]) {
         if (!args.cne_ref_path.empty()) {
             std::cerr << "Loading CNE refs from " << args.cne_ref_path << " ...\n";
             cne_refs = load_cne_refs(args.cne_ref_path);
+        }
+
+        // Optional leave-one-out panels for cluster selection / low-support
+        // rescue. The strict path is untouched when this is empty.
+        std::unordered_map<int, std::vector<std::string>> panels;
+        parasail_matrix_t* panel_mat = nullptr;
+        PanelScorer psc;
+        if (args.rescue_enabled && !args.panels_path.empty()) {
+            std::cerr << "Loading rescue panels from " << args.panels_path << " ...\n";
+            panel_core::load_panels(args.panels_path, 3, panels);
+            size_t nseq = 0;
+            for (const auto& kv : panels) nseq += kv.second.size();
+            panel_mat = parasail_matrix_create("ACGTN", 2, -1);
+            psc.panels = &panels;
+            psc.mat = panel_mat;
+            std::cerr << "  panels: " << panels.size() << " elements, " << nseq
+                      << " sequences; rescue tau=" << args.rescue_tau << "\n";
         }
 
         // Phase 1: Read all Assemble.*.reads files
@@ -951,6 +1086,18 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Drop low-scoring T3 rescue reads unless they reach the configured
+        // score threshold.
+        if (args.min_rescue_score > 0.0 && !is_genome) {
+            const double thr = args.min_rescue_score;
+            size_t before = all_reads.size();
+            all_reads.erase(std::remove_if(all_reads.begin(), all_reads.end(),
+                [&](const Read& r) {
+                    return r.rescue > 0.0 && r.rescue < thr;
+                }), all_reads.end());
+            std::cerr << "  rescue filter: kept " << all_reads.size() << "/" << before
+                      << " reads (score>=" << thr << ")\n";
+        }
         std::cerr << "  Loaded " << all_reads.size() << " reads\n";
         if (all_reads.empty()) {
             std::cerr << "No reads found, output empty.\n";
@@ -994,11 +1141,12 @@ int main(int argc, char* argv[]) {
         // Pure w.r.t. shared state (mqm/cne_refs are read-only), so it can run
         // from several threads; the only shared resource is the optional SNP/GFA
         // stream pair, which is why the SNP path stays sequential.
-        auto process_reads_element = [&](size_t begin, size_t end,
+        auto process_reads_element = [&](const std::vector<Read>& pool,
+                                         size_t begin, size_t end,
                                          std::ofstream* snp_out_ptr,
                                          std::ofstream* gfa_out_ptr) -> std::string {
                 size_t idx = begin;
-                int cur_ele = all_reads[idx].ele_id;
+                int cur_ele = pool[idx].ele_id;
 
                 // Reads mode: one group per element
                 std::vector<std::string> reads;
@@ -1007,7 +1155,7 @@ int main(int argc, char* argv[]) {
                 rescues.reserve(args.max_reads);
                 int cnt = 0;
                 while (idx < end && cnt < args.max_reads) {
-                    const auto& r = all_reads[idx];
+                    const auto& r = pool[idx];
                     std::string local_seq = r.seq;
                     normalize_read_seq(local_seq, r.strand);
                     // Repeat ratio check
@@ -1038,12 +1186,23 @@ int main(int argc, char* argv[]) {
                     ++cnt;
                 }
 
-                // Best-cluster assembly (same semantics as genome mode): split
-                // the element's reads into locus-pure clusters, assemble each,
-                // trim, apply the repeat-chimera guard and keep the contig with
-                // the highest element-mer hit count.
+                // Best-cluster assembly: split the element's reads into
+                // locus-pure clusters, assemble each, trim, apply the
+                // repeat-chimera guard and retain the candidates. When panels
+                // are available, choose the panel-best candidate among those
+                // with competitive hit counts (a paralog often wins on raw
+                // element-mer hits but loses on ortholog identity).
+                struct Cand {
+                    std::string seq;
+                    ContigScore sc{0, 0};
+                    size_t support = 0;
+                    double pid = -1.0;
+                };
+                std::vector<Cand> cands;
+                cands.reserve(16);
                 std::string contig;
-                ContigScore contig_sc{0, 0};   // score of `contig` (cluster path)
+                ContigScore contig_sc{0, 0};
+                double contig_pid = -1.0;
                 size_t best_support = 0;
                 int last_second_hits = -1;
                 int last_total_reads = 0;
@@ -1058,8 +1217,6 @@ int main(int argc, char* argv[]) {
                 if (reads.size() >= 2) {
                     std::vector<int> ks = args.multi_k.empty()
                         ? std::vector<int>{args.kmer} : args.multi_k;
-                    double best_score = -1.0;
-                    int second_hits = -1;
                     int total_groups = 0;
                     for (int kk : ks) {
                         std::vector<int> labels =
@@ -1074,12 +1231,13 @@ int main(int argc, char* argv[]) {
                             std::vector<std::string> sub;
                             sub.reserve(kv.second.size());
                             for (int i : kv.second) sub.push_back(reads[i]);
+                            Cand cd;
                             std::string c = debruijn_assemble(sub, kk, args.min_count,
                                                               mqm, cur_ele, snp_out_ptr,
-                                                              gfa_out_ptr);
+                                                              gfa_out_ptr, false);
                             if (c.empty()) continue;
                             ++dbg_cand;
-                            if (args.trim) trim_contig(c, mqm, cur_ele);
+                            if (args.trim) trim_contig(c, mqm, cur_ele, args.trim_margin);
                             if (c.size() < 20) continue;
                             ++dbg_trim20;
                             ContigScore sc = score_contig(c, mqm, cur_ele);
@@ -1087,26 +1245,62 @@ int main(int argc, char* argv[]) {
                                 static_cast<double>(sc.hits) / sc.distinct > 2.0;
                             if (repeat_chimera) continue;
                             ++dbg_chim;
-                            double score = static_cast<double>(sc.hits);
-                            if (score > best_score ||
-                                (score == best_score && kv.second.size() > best_support) ||
-                                (score == best_score && kv.second.size() == best_support &&
-                                 c.size() > contig.size())) {
-                                if (best_score >= 0 &&
-                                    static_cast<int>(best_score) > second_hits)
-                                    second_hits = static_cast<int>(best_score);
-                                contig = std::move(c);
-                                contig_sc = sc;
-                                best_score = score;
-                                best_support = kv.second.size();
-                            } else if (static_cast<int>(score) > second_hits) {
-                                second_hits = static_cast<int>(score);
-                            }
+                            cd.seq = std::move(c);
+                            cd.sc = sc;
+                            cd.support = kv.second.size();
+                            cands.push_back(std::move(cd));
                         }
                     }
-                    last_second_hits = second_hits;
                     last_total_reads = static_cast<int>(reads.size());
                     last_groups = total_groups;
+                }
+
+                if (!cands.empty()) {
+                    size_t best_i = 0;
+                    for (size_t i = 1; i < cands.size(); ++i) {
+                        const Cand& a = cands[i];
+                        const Cand& b = cands[best_i];
+                        auto path_key = [&](const Cand& c) -> double {
+                            return c.sc.hits;
+                        };
+                        double ka = path_key(a), kb = path_key(b);
+                        if (ka > kb ||
+                            (ka == kb && a.support > b.support) ||
+                            (ka == kb && a.support == b.support && a.seq.size() > b.seq.size())) {
+                            best_i = i;
+                        }
+                    }
+                    size_t sel = best_i;
+                    if (psc.enabled()) {
+                        for (auto& cd : cands) {
+                            PanelScore ps = psc.score(cur_ele, cd.seq, 0.5);
+                            cd.pid = ps.median_id;   // robust across panel species
+                        }
+                        // Conservative rescue: only override a hits-best
+                        // candidate when that candidate itself fails the panel
+                        // threshold. This avoids replacing already-correct
+                        // high-identity clusters (the old unconditional
+                        // panel-best rule lost true positives).
+                        if (cands[best_i].pid < args.rescue_tau) {
+                            const double hits_max = static_cast<double>(cands[best_i].sc.hits);
+                            size_t best_pid = best_i;
+                            for (size_t i = 0; i < cands.size(); ++i) {
+                                if (static_cast<double>(cands[i].sc.hits) < 0.5 * hits_max) continue;
+                                if (cands[i].pid > cands[best_pid].pid + 1e-9) best_pid = i;
+                            }
+                            if (best_pid != best_i && cands[best_pid].pid >= args.rescue_tau)
+                                sel = best_pid;
+                        }
+                    }
+                    contig = std::move(cands[sel].seq);
+                    contig_sc = cands[sel].sc;
+                    contig_pid = cands[sel].pid;
+                    best_support = cands[sel].support;
+                    int sh = -1;
+                    for (size_t i = 0; i < cands.size(); ++i)
+                        if (i != sel && static_cast<int>(cands[i].sc.hits) > sh)
+                            sh = static_cast<int>(cands[i].sc.hits);
+                    last_second_hits = sh;
                 }
                 // Output evidence floor: a claim needs at least this many
                 // distinct element mers, otherwise it is a short/repeat junk
@@ -1121,9 +1315,15 @@ int main(int argc, char* argv[]) {
                 if (!contig.empty()) {
                     final_sc = contig_sc;
                     final_sc_valid = true;
-                    if (final_sc.distinct < kMinOutputDistinct) {
+                    if (final_sc.distinct < args.min_output_distinct) {
                         bool keep = false;
-                        if (final_sc.distinct >= kMinOutputDistinctLow &&
+                        if (psc.enabled() && final_sc.distinct >= args.rescue_min_distinct &&
+                            target_span(contig, mqm, cur_ele) >= args.rescue_min_span) {
+                            double pid = contig_pid;
+                            if (pid < 0.0) pid = psc.identity(cur_ele, contig, 0.5);
+                            if (pid >= args.rescue_tau) keep = true;
+                        }
+                        if (!keep && final_sc.distinct >= kMinOutputDistinctLow &&
                             best_support >= kMinOutputSupportLow && !cne_refs.empty()) {
                             auto it = cne_refs.find(cur_ele);
                             if (it != cne_refs.end() &&
@@ -1136,6 +1336,27 @@ int main(int argc, char* argv[]) {
                             final_sc_valid = false;
                             dbg_floor_cleared = true;
                         }
+                    }
+                }
+                if (args.rescue_lowconf && final_sc_valid && !reads.empty()) {
+                    const int cur_dist = final_sc.distinct;
+                    int best_i = -1, best_dist = -1;
+                    std::vector<int> labels = cluster_reads_by_shared_kmers(reads, mqm.get_mer_size());
+                    std::unordered_map<int, std::vector<int>> groups;
+                    for (int i = 0; i < static_cast<int>(labels.size()); ++i)
+                        groups[labels[i]].push_back(i);
+                    for (const auto& kv : groups) {
+                        if (static_cast<int>(kv.second.size()) < args.rescue_min_support) continue;
+                        for (int i : kv.second) {
+                            ContigScore sc = score_contig(reads[i], mqm, cur_ele);
+                            if (sc.distinct > best_dist) { best_dist = sc.distinct; best_i = i; }
+                        }
+                    }
+                    if (best_i >= 0 && best_dist > cur_dist) {
+                        contig = reads[best_i];
+                        final_sc = score_contig(contig, mqm, cur_ele);
+                        final_sc_valid = true;
+                        dbg_floor_cleared = false;
                     }
                 }
                 if (asm_debug_enabled()) {
@@ -1163,10 +1384,48 @@ int main(int argc, char* argv[]) {
                             best_idx = i;
                         }
                     }
-                    if (best_dist >= kMinFallbackDistinct) {
+                    if (best_dist >= args.min_fallback_distinct) {
                         contig = std::move(reads[best_idx]);
-                        if (args.trim) trim_contig(contig, mqm, cur_ele);
+                        if (args.trim) trim_contig(contig, mqm, cur_ele, args.trim_margin);
                         if (contig.size() < 20) { dbg_bail("fb_short", best_dist); return std::string(); }
+                    } else if (psc.enabled()) {
+                        // Panel rescue: a single verified read can be the only
+                        // evidence for a short/low-complexity element. Require
+                        // a strict panel identity and a minimal mer footprint;
+                        // emit the read untrimmed (trimming a sparse-mer read
+                        // would cut it to nothing).
+                        size_t ri = reads.size();
+                        double best_pid = -1.0;
+                        for (size_t i = 0; i < reads.size(); ++i) {
+                            ContigScore sc = score_contig(reads[i], mqm, cur_ele);
+                            if (sc.distinct < args.rescue_min_distinct) continue;
+                            if (target_span(reads[i], mqm, cur_ele) < args.rescue_min_span) continue;
+                            double pid = psc.identity(cur_ele, reads[i], 0.5);
+                            if (pid > best_pid) { best_pid = pid; ri = i; }
+                        }
+                        if (asm_debug_enabled())
+                            std::fprintf(stderr, "ASMDBG2\t%d\tfallback\tbest_dist=%d\tbest_pid=%.4f\tnr=%zu\n",
+                                         cur_ele, best_dist, best_pid, reads.size());
+                        if (ri < reads.size() && best_pid >= args.rescue_tau) {
+                            contig = std::move(reads[ri]);
+                            rescued = true;
+                        } else {
+                            // T3 rescue handoff: validate already SW-verified
+                            // these reads against the element panel.
+                            if (!rescue_handoff_enabled()) { dbg_bail("no_handoff", best_dist); return std::string(); }
+                            size_t rj = reads.size();
+                            double best_rs = 0.0;
+                            for (size_t i = 0; i < reads.size(); ++i) {
+                                if (rescues[i] > best_rs) {
+                                    best_rs = rescues[i];
+                                    rj = i;
+                                }
+                            }
+                            if (rj == reads.size()) { dbg_bail("no_rescue", best_dist); return std::string(); }
+                            contig = std::move(reads[rj]);
+                            rescued = true;
+                            if (contig.size() < 20) { dbg_bail("rc_short", (long)best_rs); return std::string(); }
+                        }
                     } else {
                         // T3 rescue handoff: validate already SW-verified these
                         // reads against the element panel, so the mer-distinct
@@ -1196,7 +1455,7 @@ int main(int argc, char* argv[]) {
                             final_sc = score_contig(contig, mqm, cur_ele);
                     } else {
                         final_sc = score_contig(contig, mqm, cur_ele);
-                        if (final_sc.distinct < kMinOutputDistinct) {
+                        if (final_sc.distinct < args.min_output_distinct) {
                             dbg_bail("out_floor", final_sc.distinct);
                             return std::string();
                         }
@@ -1229,7 +1488,7 @@ int main(int argc, char* argv[]) {
             const int nthreads = std::max(1, args.threads);
             if (args.output_snp || nthreads == 1 || ranges.size() <= 1) {
                 for (const auto& r : ranges) {
-                    std::string c = process_reads_element(r.first, r.second, snp_out_ptr, gfa_out_ptr);
+                    std::string c = process_reads_element(all_reads, r.first, r.second, snp_out_ptr, gfa_out_ptr);
                     if (!c.empty()) eres.emplace_back(all_reads[r.first].ele_id, std::move(c));
                 }
             } else {
@@ -1243,7 +1502,7 @@ int main(int argc, char* argv[]) {
                             size_t ri = next_range.fetch_add(1);
                             if (ri >= ranges.size()) break;
                             const auto rr = ranges[ri];
-                            std::string c = process_reads_element(rr.first, rr.second, nullptr, nullptr);
+                            std::string c = process_reads_element(all_reads, rr.first, rr.second, nullptr, nullptr);
                             if (!c.empty())
                                 per_thread[t].emplace_back(all_reads[rr.first].ele_id, std::move(c));
                         }
@@ -1257,8 +1516,11 @@ int main(int argc, char* argv[]) {
                 [](const std::pair<int, std::string>& a, const std::pair<int, std::string>& b) {
                     return a.first < b.first;
                 });
-            for (auto& p : eres)
-                results.emplace_back(std::to_string(p.first), std::move(p.second));
+            std::map<int, std::string> final_map;
+            for (auto& p : eres) final_map.emplace(p.first, std::move(p.second));
+
+            for (auto& kv : final_map)
+                results.emplace_back(std::to_string(kv.first), std::move(kv.second));
         } else {
             // Element blocks: all_reads is sorted by ele_id
             std::vector<std::pair<size_t, size_t>> blocks;
@@ -1314,6 +1576,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::cerr << "Done. " << results.size() << " sequences written to " << args.output << "\n";
+        if (panel_mat) parasail_matrix_free(panel_mat);
         return 0;
 
     } catch (const std::exception& e) {
