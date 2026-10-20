@@ -51,7 +51,7 @@ struct Args {
     int step_size = 25;
     std::string pigz_path = "pigz/pigz";
     int max_diff = 2;
-    double vote_frac = 0.1;
+    double vote_frac = 0.05;
     // Load-time cap on (element, locus) assignments per k-mer; 0 = keep all.
     int max_assign = 3;
     // Extra gate rows from --tiers (appended on top of T1 and T2).
@@ -691,7 +691,7 @@ int main(int argc, char* argv[]) {
                       << "  --pigz <path>         pigz binary path (default: pigz/pigz)\n"
                       << "  --max-diff <n>        chain gap tolerance, all rows (default: 2)\n"
                       << "  --vote-frac <f>       min fraction of k-mers for top CNE vote, all rows\n"
-                      << "                        (default: 0.1)\n"
+                      << "                        (default: 0.05)\n"
                       << "  --max-assign <n>      Load-time cap: k-mers with more than n (element, locus)\n"
                       << "                        assignments are dropped (default: 3; 0 = keep all)\n"
                       << "  --tiers \"<rv,mc[,ms]> <rv,mc[,ms]> ...\"\n"

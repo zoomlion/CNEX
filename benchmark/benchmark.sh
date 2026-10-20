@@ -69,12 +69,16 @@ print(f'  $T clean queries: {(len(c)-1)//2} sequences')
         echo "=== [$T] CNEX validate ==="
         /usr/bin/time -v -o "$HERE/stats/$T/time_cnex_validate.txt" \
             "$CNEX_BIN/validate" "$GENOME" --mers "$HERE/dbs/$T/cnex/mers_table.tsv" \
-            --type genome -t 16 -o "$HERE/results/$T/cnex/validate_out"
+            --type genome -t 4 \
+            --rescue-panels "$HERE/data/blocks/$T.fa" --rescue-tau 0.90 --t3 "1.5,5,25" \
+            -o "$HERE/results/$T/cnex/validate_out"
 
         echo "=== [$T] CNEX assemble ==="
         /usr/bin/time -v -o "$HERE/stats/$T/time_cnex_assemble.txt" \
             "$CNEX_BIN/assemble" "$HERE/results/$T/cnex/validate_out" \
-            --mers "$HERE/dbs/$T/cnex/mers_table.tsv" --trim -o "$HERE/results/$T/cnex/contigs.fa"
+            --mers "$HERE/dbs/$T/cnex/mers_table.tsv" \
+            --panels "$HERE/data/blocks/$T.fa" --trim \
+            -o "$HERE/results/$T/cnex/contigs.fa"
 
         echo "=== [$T] MMseqs2 search (s=5.7) ==="
         rm -rf "$HERE/results/$T/mmseqs/tmp"

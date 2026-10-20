@@ -117,7 +117,7 @@ def check_tree_deps():
 
 ASSEMBLE_DIR = "assemble"
 
-def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.1,
+def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
                 window_size=None, step_size=None, type_=None, log_dir=None,
                 keep_validate=False, depth=None, cne_ref=None, ssd_dir=None, tiers=None,
                 max_assign=3, trim_margin=20):
@@ -336,7 +336,7 @@ def main():
     p_val.add_argument("-o", "--output-dir", default="out", help="Output directory (default: out)")
     p_val.add_argument("--type", choices=["genome", "fastq"],
                        help="Input type (auto-detected if omitted)")
-    p_val.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
+    p_val.add_argument("--vote-frac", type=float, default=0.05, help="Vote fraction (default: 0.05)")
     p_val.add_argument("--max-assign", type=int, default=3,
                        help="Load-time cap on (element,locus) assignments per k-mer (default: 3; 0 = keep all)")
     p_val.add_argument("--tiers", default=None,
@@ -389,7 +389,7 @@ def main():
                         help="Input type (auto-detected if omitted)")
     p_pipe.add_argument("--window-size", type=int, help="Sliding window size (default: 150)")
     p_pipe.add_argument("--step-size", type=int, help="Sliding window step (default: 25)")
-    p_pipe.add_argument("--vote-frac", type=float, default=0.1, help="Vote fraction (default: 0.1)")
+    p_pipe.add_argument("--vote-frac", type=float, default=0.05, help="Vote fraction (default: 0.05)")
     p_pipe.add_argument("--tiers", default=None,
                         help='Extra OR gate rows, space-separated (e.g. "1.5,12,40 1.2,15,50"), '
                              'appended on top of T1+T2')
