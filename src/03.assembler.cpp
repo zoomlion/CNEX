@@ -15,7 +15,6 @@
 #include <iostream>
 #include <limits>
 #include <map>
-#include <regex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -299,8 +298,6 @@ private:
     size_t pos_ = 0;
 };
 
-const std::regex GENOME_ID_PATTERN(R"(^(\S+):(\d+)-(\d+)$)");
-
 struct GenomePos {
     std::string chr;
     int start;
@@ -308,14 +305,25 @@ struct GenomePos {
 };
 
 bool parse_genome_id(const std::string& seq_id, GenomePos& pos) {
-    std::smatch m;
-    if (std::regex_match(seq_id, m, GENOME_ID_PATTERN)) {
-        pos.chr = m[1];
-        pos.start = std::stoi(m[2]);
-        pos.end = std::stoi(m[3]);
-        return true;
+    const size_t dash = seq_id.rfind('-');
+    if (dash == std::string::npos || dash == 0 || dash + 1 >= seq_id.size())
+        return false;
+    const size_t colon = seq_id.rfind(':', dash);
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= dash)
+        return false;
+    for (size_t i = 0; i < seq_id.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(seq_id[i]);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v')
+            return false;
     }
-    return false;
+    for (size_t i = colon + 1; i < dash; ++i)
+        if (seq_id[i] < '0' || seq_id[i] > '9') return false;
+    for (size_t i = dash + 1; i < seq_id.size(); ++i)
+        if (seq_id[i] < '0' || seq_id[i] > '9') return false;
+    pos.chr = seq_id.substr(0, colon);
+    pos.start = std::stoi(seq_id.substr(colon + 1, dash - colon - 1));
+    pos.end = std::stoi(seq_id.substr(dash + 1));
+    return true;
 }
 
 struct PanelScore {
@@ -400,6 +408,7 @@ std::unordered_map<std::string, int> build_node_scores(
     const Graph& graph, const MerQueryManager& mqm, int ele_id, int k)
 {
     std::unordered_map<std::string, int> scores;
+    scores.reserve(graph.size());
     int mer_size = mqm.get_mer_size();
     for (const auto& [node, _] : graph) {
         if (node.size() < (size_t)mer_size) continue;
@@ -746,6 +755,8 @@ struct GenomeResult {
 static void process_genome_element(
     const std::vector<Read>& all_reads, size_t begin, size_t end,
     const Args& args, const MerQueryManager& mqm,
+    const PanelScorer* psc,
+    const std::unordered_map<int, std::string>* cne_refs,
     std::vector<GenomeResult>& out)
 {
     const int cur_ele = all_reads[begin].ele_id;
@@ -799,13 +810,23 @@ static void process_genome_element(
             return a.read.start < b.read.start;
         });
 
-    std::string best_did;
-    std::string best_seq;
+    struct GenomeCand {
+        std::string seq;
+        std::string did;
+        ContigScore sc{0, 0};
+        size_t support = 0;
+        double pid = -1.0;
+        size_t pos = 0;
+    };
+    std::vector<GenomeCand> cands;
+    cands.reserve(16);
     double best_score = -1.0;
     size_t best_pos = 0;
+    const bool panels_on = psc != nullptr && psc->enabled();
 
     auto consider = [&](std::string contig, int cluster_start,
-                        const EleRead& first_r, const EleRead& last_r, size_t pos) {
+                        const EleRead& first_r, const EleRead& last_r,
+                        size_t pos, size_t support) {
         if (contig.empty()) return;
         if (args.trim) trim_contig(contig, mqm, cur_ele, args.trim_margin);
         if (contig.size() < 20) return;
@@ -818,10 +839,15 @@ static void process_genome_element(
             first_r.read.chr + ":" +
             std::to_string(cluster_start) + "-" +
             std::to_string(last_r.read.end) + "(" + s + ")";
-        if (best_did.empty() || sc.hits > best_score ||
-            (sc.hits == best_score && pos < best_pos)) {
-            best_did = std::move(did);
-            best_seq = std::move(contig);
+        GenomeCand cand;
+        cand.seq = std::move(contig);
+        cand.did = std::move(did);
+        cand.sc = sc;
+        cand.support = support;
+        cand.pos = pos;
+        if (panels_on) cand.pid = psc->score(cur_ele, cand.seq, 0.5).max_id;
+        cands.push_back(std::move(cand));
+        if (sc.hits > best_score || (sc.hits == best_score && pos < best_pos)) {
             best_score = static_cast<double>(sc.hits);
             best_pos = pos;
         }
@@ -903,14 +929,15 @@ static void process_genome_element(
             // weaker ones are left to the T3 rescue handoff.
             const EleRead& er = ele_reads[cr.begin];
             if (er.seen < kMinFallbackDistinct) return;
-            consider(er.seq, er.read.start, er, er, cr.pos);
+            consider(er.seq, er.read.start, er, er, cr.pos, 1);
             return;
         }
         std::vector<std::string> reads_for_graph = sample_cluster(ele_reads, cr.begin, cr.end);
         std::string contig = debruijn_assemble(reads_for_graph, args.kmer, args.min_count,
                                                mqm, cur_ele, nullptr, nullptr, debug_ele);
         consider(std::move(contig), ele_reads[cr.begin].read.start,
-                 ele_reads[cr.begin], ele_reads[cr.end - 1], cr.pos);
+                 ele_reads[cr.begin], ele_reads[cr.end - 1], cr.pos,
+                 cr.end - cr.begin);
     };
 
     std::vector<const ClusterRange*> ties;
@@ -931,7 +958,38 @@ static void process_genome_element(
         try_range(*cr);
     }
 
-    if (best_did.empty() && rescue_handoff_enabled()) {
+    if (!cands.empty()) {
+        size_t best_i = 0;
+        for (size_t i = 1; i < cands.size(); ++i) {
+            if (cands[i].sc.hits > cands[best_i].sc.hits ||
+                (cands[i].sc.hits == cands[best_i].sc.hits &&
+                 cands[i].pos < cands[best_i].pos)) {
+                best_i = i;
+            }
+        }
+        GenomeCand& bc = cands[best_i];
+        if (panels_on && bc.sc.distinct < args.min_output_distinct) {
+            bool keep = false;
+            if (panels_on && bc.sc.distinct >= args.rescue_min_distinct &&
+                target_span(bc.seq, mqm, cur_ele) >= args.rescue_min_span) {
+                double pid = bc.pid;
+                if (pid < 0.0) pid = psc->identity(cur_ele, bc.seq, 0.5);
+                if (pid >= args.rescue_tau) keep = true;
+            }
+            if (!keep && bc.sc.distinct >= kMinOutputDistinctLow &&
+                bc.support >= kMinOutputSupportLow && cne_refs != nullptr &&
+                !cne_refs->empty()) {
+                auto it = cne_refs->find(cur_ele);
+                if (it != cne_refs->end() &&
+                    sw_identity_2m1(it->second, bc.seq) >= min_cne_ref_identity()) {
+                    keep = true;
+                }
+            }
+            if (!keep) bc.seq.clear();
+        }
+        if (!bc.seq.empty())
+            out.push_back(GenomeResult{cur_ele, std::move(bc.did), std::move(bc.seq)});
+    } else if (rescue_handoff_enabled()) {
         // T3 rescue handoff: validate already SW-verified these windows against
         // the element panel; mer-based gates do not apply to them. Emit the
         // best-scoring window as the element's claim.
@@ -955,10 +1013,6 @@ static void process_genome_element(
                 out.push_back(GenomeResult{cur_ele, std::move(did), std::move(seq)});
             }
         }
-    }
-
-    if (!best_did.empty()) {
-        out.push_back(GenomeResult{cur_ele, std::move(best_did), std::move(best_seq)});
     }
 }
 
@@ -1537,7 +1591,7 @@ int main(int argc, char* argv[]) {
             const int nthreads = std::max(1, args.threads);
             if (nthreads == 1) {
                 for (const auto& b : blocks) {
-                    process_genome_element(all_reads, b.first, b.second, args, mqm, grs);
+                    process_genome_element(all_reads, b.first, b.second, args, mqm, &psc, &cne_refs, grs);
                 }
             } else {
                 std::atomic<size_t> next_block{0};
@@ -1550,7 +1604,7 @@ int main(int argc, char* argv[]) {
                             size_t bi = next_block.fetch_add(1);
                             if (bi >= blocks.size()) break;
                             process_genome_element(all_reads, blocks[bi].first, blocks[bi].second,
-                                                   args, mqm, per_thread[t]);
+                                                   args, mqm, &psc, &cne_refs, per_thread[t]);
                         }
                     });
                 }
