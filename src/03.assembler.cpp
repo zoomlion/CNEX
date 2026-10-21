@@ -44,7 +44,6 @@ struct Args {
     double repeat_ratio = 1.2;
     bool output_snp = false;
     bool help_requested = false;
-    std::string cne_ref_path;
     // Rescue/panel path (reads mode): score candidate contigs and low-support
     // reads against the element's leave-one-out panels. Disabled when empty.
     std::string panels_path;
@@ -94,7 +93,6 @@ static inline void normalize_read_seq(std::string& seq, int strand) {
 static constexpr int kMinOutputDistinct = 12;
 static constexpr int kMinOutputDistinctLow = 8;
 static constexpr size_t kMinOutputSupportLow = 4;
-static constexpr double kMinCneRefIdentity = 0.75;
 static constexpr int kMinFallbackDistinct = 16;
 
 static inline bool asm_debug_enabled() {
@@ -107,13 +105,6 @@ static inline bool rescue_handoff_enabled() {
     return enabled;
 }
 
-static inline double min_cne_ref_identity() {
-    static const double v = []() {
-        const char* s = std::getenv("MERCURY_CNE_IDENT");
-        return s ? std::atof(s) : kMinCneRefIdentity;
-    }();
-    return v;
-}
 
 Args parse_args(int argc, char* argv[]) {
     Args args;
@@ -190,9 +181,6 @@ Args parse_args(int argc, char* argv[]) {
             args.repeat_ratio = std::stod(argv[i]);
         } else if (arg == "--snp") {
             args.output_snp = true;
-        } else if (arg == "--cne-ref") {
-            if (++i >= argc) throw std::runtime_error("Missing value for --cne-ref");
-            args.cne_ref_path = argv[i];
         } else if (arg == "--panels") {
             if (++i >= argc) throw std::runtime_error("Missing value for --panels");
             args.panels_path = argv[i];
@@ -674,78 +662,6 @@ static std::vector<int> cluster_reads_by_shared_kmers(
     return parent;
 }
 
-std::unordered_map<int, std::string> load_cne_refs(const std::string& path) {
-    std::unordered_map<int, std::string> refs;
-    BufferedLineReader r(path);
-    std::string line, seq;
-    int id = 0;
-    while (r.readline(line)) {
-        if (line.empty()) continue;
-        if (line[0] == '>') {
-            if (!seq.empty() && id > 0) refs[id] = std::move(seq);
-            seq.clear();
-            id = std::stoi(line.substr(1));
-        } else {
-            seq.append(line);
-        }
-    }
-    if (!seq.empty() && id > 0) refs[id] = std::move(seq);
-    std::cerr << "  Loaded " << refs.size() << " cne refs\n";
-    return refs;
-}
-
-// Local SW identity with the evaluation scoring (match +2, mismatch -1,
-// linear gap 1/base). Returns matches / alignment length of the best local
-// alignment, 0.0 when no positive-scoring alignment exists.
-static double sw_identity_2m1(const std::string& ref, const std::string& seq) {
-    const int m = static_cast<int>(ref.size());
-    const int n = static_cast<int>(seq.size());
-    if (m == 0 || n == 0) return 0.0;
-    const int match_score = 2, mismatch_score = -1, gap = 1;
-    std::vector<std::vector<int>> M(m + 1, std::vector<int>(n + 1, 0));
-    std::vector<std::vector<int>> X(m + 1, std::vector<int>(n + 1, 0));
-    std::vector<std::vector<int>> Y(m + 1, std::vector<int>(n + 1, 0));
-    int best = 0, max_i = 0, max_j = 0, best_state = 0;
-    for (int i = 1; i <= m; ++i) {
-        for (int j = 1; j <= n; ++j) {
-            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
-            X[i][j] = std::max({M[i - 1][j] - gap, X[i - 1][j] - gap, 0});
-            Y[i][j] = std::max({M[i][j - 1] - gap, Y[i][j - 1] - gap, 0});
-            M[i][j] = std::max({0, M[i - 1][j - 1] + d, X[i][j], Y[i][j]});
-            if (M[i][j] > best) { best = M[i][j]; max_i = i; max_j = j; best_state = 0; }
-            if (X[i][j] > best) { best = X[i][j]; max_i = i; max_j = j; best_state = 1; }
-            if (Y[i][j] > best) { best = Y[i][j]; max_i = i; max_j = j; best_state = 2; }
-        }
-    }
-    if (best == 0) return 0.0;
-    int i = max_i, j = max_j, state = best_state;
-    int matches = 0, alen = 0;
-    while (i > 0 && j > 0) {
-        if (state == 0) {
-            if (M[i][j] == 0) break;
-            int d = (ref[i - 1] == seq[j - 1]) ? match_score : mismatch_score;
-            if (M[i][j] == M[i - 1][j - 1] + d) {
-                if (ref[i - 1] == seq[j - 1]) ++matches;
-                ++alen;
-                --i; --j;
-                continue;
-            }
-            if (M[i][j] == X[i][j]) { state = 1; continue; }
-            if (M[i][j] == Y[i][j]) { state = 2; continue; }
-            break;
-        } else if (state == 1) {
-            ++alen;
-            if (X[i][j] == M[i - 1][j] - gap) state = 0;
-            --i;
-        } else {
-            ++alen;
-            if (Y[i][j] == M[i][j - 1] - gap) state = 0;
-            --j;
-        }
-    }
-    return alen > 0 ? static_cast<double>(matches) / alen : 0.0;
-}
-
 struct GenomeResult {
     int ele_id;
     std::string display_id;
@@ -756,7 +672,6 @@ static void process_genome_element(
     const std::vector<Read>& all_reads, size_t begin, size_t end,
     const Args& args, const MerQueryManager& mqm,
     const PanelScorer* psc,
-    const std::unordered_map<int, std::string>* cne_refs,
     std::vector<GenomeResult>& out)
 {
     const int cur_ele = all_reads[begin].ele_id;
@@ -976,15 +891,6 @@ static void process_genome_element(
                 if (pid < 0.0) pid = psc->identity(cur_ele, bc.seq, 0.5);
                 if (pid >= args.rescue_tau) keep = true;
             }
-            if (!keep && bc.sc.distinct >= kMinOutputDistinctLow &&
-                bc.support >= kMinOutputSupportLow && cne_refs != nullptr &&
-                !cne_refs->empty()) {
-                auto it = cne_refs->find(cur_ele);
-                if (it != cne_refs->end() &&
-                    sw_identity_2m1(it->second, bc.seq) >= min_cne_ref_identity()) {
-                    keep = true;
-                }
-            }
             if (!keep) bc.seq.clear();
         }
         if (!bc.seq.empty())
@@ -1042,9 +948,7 @@ int main(int argc, char* argv[]) {
                       << "  --trim-margin <n>     bp kept beyond first/last element k-mer (default: 10)\n"
                       << "  --no-polish           Disable reads-mode post-assembly polish\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
-                       << "  --snp                 Scan for candidate SNPs from validated reads\n"
-                       << "  --cne-ref <file>      CNE reference FASTA (ref.fa): identity verification of\n"
-                      << "                        low-distinct claims (reads mode)\n";
+                       << "  --snp                 Scan for candidate SNPs from validated reads\n";
             return 1;
         }
 
@@ -1053,13 +957,6 @@ int main(int argc, char* argv[]) {
         mqm.load_from_file(args.mers_file, args.max_assign);
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
-
-        // Load CNE refs for SW-based trimming
-        std::unordered_map<int, std::string> cne_refs;
-        if (!args.cne_ref_path.empty()) {
-            std::cerr << "Loading CNE refs from " << args.cne_ref_path << " ...\n";
-            cne_refs = load_cne_refs(args.cne_ref_path);
-        }
 
         // Optional leave-one-out panels for cluster selection / low-support
         // rescue. The strict path is untouched when this is empty.
@@ -1192,7 +1089,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Per-element reads-mode worker: returns the claim sequence ("" = none).
-        // Pure w.r.t. shared state (mqm/cne_refs are read-only), so it can run
+        // Pure w.r.t. shared state (mqm/panels are read-only), so it can run
         // from several threads; the only shared resource is the optional SNP/GFA
         // stream pair, which is why the SNP path stays sequential.
         auto process_reads_element = [&](const std::vector<Read>& pool,
@@ -1376,14 +1273,6 @@ int main(int argc, char* argv[]) {
                             double pid = contig_pid;
                             if (pid < 0.0) pid = psc.identity(cur_ele, contig, 0.5);
                             if (pid >= args.rescue_tau) keep = true;
-                        }
-                        if (!keep && final_sc.distinct >= kMinOutputDistinctLow &&
-                            best_support >= kMinOutputSupportLow && !cne_refs.empty()) {
-                            auto it = cne_refs.find(cur_ele);
-                            if (it != cne_refs.end() &&
-                                sw_identity_2m1(it->second, contig) >= min_cne_ref_identity()) {
-                                keep = true;
-                            }
                         }
                         if (!keep) {
                             contig.clear();
@@ -1591,7 +1480,7 @@ int main(int argc, char* argv[]) {
             const int nthreads = std::max(1, args.threads);
             if (nthreads == 1) {
                 for (const auto& b : blocks) {
-                    process_genome_element(all_reads, b.first, b.second, args, mqm, &psc, &cne_refs, grs);
+                    process_genome_element(all_reads, b.first, b.second, args, mqm, &psc, grs);
                 }
             } else {
                 std::atomic<size_t> next_block{0};
@@ -1604,7 +1493,7 @@ int main(int argc, char* argv[]) {
                             size_t bi = next_block.fetch_add(1);
                             if (bi >= blocks.size()) break;
                             process_genome_element(all_reads, blocks[bi].first, blocks[bi].second,
-                                                   args, mqm, &psc, &cne_refs, per_thread[t]);
+                                                   args, mqm, &psc, per_thread[t]);
                         }
                     });
                 }
