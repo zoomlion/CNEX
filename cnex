@@ -120,7 +120,7 @@ ASSEMBLE_DIR = "assemble"
 def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
                 window_size=None, step_size=None, type_=None, log_dir=None,
                 keep_validate=False, depth=None, cne_ref=None, ssd_dir=None, tiers=None,
-                max_assign=3, trim_margin=20):
+                max_assign=3, trim_margin=10):
     name = genome_name(genome)
     if not name:
         return 0, 1
@@ -253,7 +253,7 @@ def cmd_assemble(args):
         cmd += ["--max-loci-gap", str(args.max_loci_gap)]
     if args.trim:
         cmd.append("--trim")
-        cmd += ["--trim-margin", str(getattr(args, 'trim_margin', 20))]
+        cmd += ["--trim-margin", str(getattr(args, 'trim_margin', 10))]
     if args.snp:
         cmd.append("--snp")
     return run(cmd).returncode
@@ -311,7 +311,7 @@ def cmd_pipeline(args):
                             depth=args.depth, cne_ref=cne_ref, ssd_dir=_SSD_DIR,
                             tiers=getattr(args, 'tiers', None),
                             max_assign=getattr(args, 'max_assign', 3),
-                            trim_margin=getattr(args, 'trim_margin', 20))
+                            trim_margin=getattr(args, 'trim_margin', 10))
             futures[f] = name
 
         for f in as_completed(futures):
@@ -363,7 +363,7 @@ def main():
                             "must match validate (default: 3; 0 = keep all)")
     p_asm.add_argument("--trim", action="store_true",
                        help="Trim contigs to confident region (default: off)")
-    p_asm.add_argument("--trim-margin", type=int, default=20,
+    p_asm.add_argument("--trim-margin", type=int, default=10,
                        help="bp kept beyond first/last element k-mer when trimming (default: 20)")
     p_asm.add_argument("--snp", action="store_true",
                        help="Scan for candidate SNPs from validated reads")
@@ -383,7 +383,7 @@ def main():
     p_pipe.add_argument("-o", "--output-dir", default="out", help="Output root directory (default: out)")
     p_pipe.add_argument("--trim", action="store_true",
                         help="Trim contigs to confident region (default: off)")
-    p_pipe.add_argument("--trim-margin", type=int, default=20,
+    p_pipe.add_argument("--trim-margin", type=int, default=10,
                         help="bp kept beyond first/last element k-mer when trimming (default: 20)")
     p_pipe.add_argument("--type", choices=["genome", "fastq"],
                         help="Input type (auto-detected if omitted)")

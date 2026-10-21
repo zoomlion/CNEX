@@ -37,7 +37,7 @@ struct Args {
     int threads = 4;
     tsl::robin_set<int> debug_eles;
     bool trim = true;
-    int trim_margin = 20;   // bp kept beyond the first/last element-specific k-mer
+    int trim_margin = 10;   // bp kept beyond the first/last element-specific k-mer
     bool polish = true;   // reads-mode post-assembly consensus polish
     bool trim_set = false;
     bool no_trim_set = false;
@@ -1039,7 +1039,7 @@ int main(int argc, char* argv[]) {
                       << "  -t, --threads <n>     Worker threads for genome-mode assembly (default: 4)\n"
                       << "  --trim                Trim contigs to confident k-mer region (default: on)\n"
                       << "  --no-trim             Disable trimming\n"
-                      << "  --trim-margin <n>     bp kept beyond first/last element k-mer (default: 20)\n"
+                      << "  --trim-margin <n>     bp kept beyond first/last element k-mer (default: 10)\n"
                       << "  --no-polish           Disable reads-mode post-assembly polish\n"
                       << "  --repeat-ratio <f>    Max total/unique mers per read (default: 1.2)\n"
                        << "  --snp                 Scan for candidate SNPs from validated reads\n"
