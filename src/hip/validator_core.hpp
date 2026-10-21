@@ -27,14 +27,11 @@
 // setting the VALIDATE_PROFILE environment variable to a non-zero value.
 struct ValidateProfile {
     std::atomic<long long> windows{0};
-    std::atomic<long long> gathers{0};
     std::atomic<long long> emits{0};
-    std::atomic<long long> pushed{0};
     std::atomic<long long> tally_calls{0};
     std::atomic<long long> chain_calls{0};
     std::atomic<long long> prep_ns{0};
     std::atomic<long long> win_ns{0};
-    std::atomic<long long> gather_ns{0};
     std::atomic<long long> tally_ns{0};
     // Reads mode breakdown.
     std::atomic<long long> rd_reads{0};
@@ -820,15 +817,10 @@ inline void validate_sequence_segmented(
     thread_local std::vector<uint64_t> upper_bits;
     thread_local std::vector<uint32_t> codes_fwd;
     thread_local std::vector<uint32_t> codes_rc;
-    // Per-segment match cache: each position's assignment range is expanded
-    // once, and all overlapping windows read contiguous slices of it.
-    thread_local std::vector<uint32_t> off_fwd, off_rc;    // position -> offset
-    thread_local std::vector<uint64_t> pack_fwd, pack_rc;  // (id << 32) | locus
     int cur_o = 0;   // current window origin within the segment
     const bool vp = validate_profile_enabled();
     thread_local long long tl_prep_ns = 0;
     thread_local long long tl_win_ns = 0;
-    thread_local long long tl_gather_ns = 0;
     thread_local long long tl_tally_ns = 0;
 
     // Tally updated directly from the range arrays, without materializing the
@@ -877,23 +869,87 @@ inline void validate_sequence_segmented(
     };
     thread_local TallyAcc tally_acc;
 
-    auto make_chain = [&](const std::vector<uint32_t>* off,
-                          const std::vector<uint64_t>* pack, bool rc_strand) {
-        return [&, off, pack, rc_strand](int confi_id) -> std::pair<int, int> {
+    // Incremental tally for sliding windows. Counts are updated by adding the
+    // new right edge and removing the old left edge. The exact legacy tally is
+    // recomputed only when the top count is tied (the only case where the
+    // first-seen order can change the winning element id).
+    struct SlidingTally {
+        std::vector<int> cnt;
+        std::vector<int> pos;
+        std::vector<int> active;
+        int total = 0;
+
+        void clear() {
+            for (int id : active) { cnt[id] = 0; pos[id] = -1; }
+            active.clear();
+            total = 0;
+        }
+        inline void add(int id) {
+            if (id >= static_cast<int>(cnt.size())) {
+                cnt.resize(id + 1, 0);
+                pos.resize(id + 1, -1);
+            }
+            if (cnt[id]++ == 0) {
+                pos[id] = static_cast<int>(active.size());
+                active.push_back(id);
+            }
+            ++total;
+        }
+        inline void remove(int id) {
+            --total;
+            if (--cnt[id] == 0) {
+                int p = pos[id];
+                int last = active.back();
+                active[p] = last;
+                pos[last] = p;
+                active.pop_back();
+                pos[id] = -1;
+            }
+        }
+        VoteTally finish(bool& tied) const {
+            VoteTally r;
+            r.n = total;
+            int best = 0, second = 0, best_id = -1, ties = 0;
+            for (int id : active) {
+                int c = cnt[id];
+                if (c > best) {
+                    second = best;
+                    best = c;
+                    best_id = id;
+                    ties = 1;
+                } else if (c == best) {
+                    ++ties;
+                    second = best;
+                } else if (c > second) {
+                    second = c;
+                }
+            }
+            r.best_id = best_id;
+            r.best_cnt = best;
+            r.second_cnt = second;
+            tied = ties > 1;
+            return r;
+        }
+    };
+    thread_local SlidingTally slide_f, slide_r;
+
+    auto make_chain = [&](const std::vector<uint64_t>* ranges, bool rc_strand) {
+        return [&, ranges, rc_strand](int confi_id) -> std::pair<int, int> {
             if (vp) ++g_val_profile.chain_calls;
             int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
             for (int x = 0; x < nspan; ++x) {
                 // The RC strand enumerates k-mer starts backwards (its first
-                // match is the window's last position), so map x to the cache
+                // match is the window's last position), so map x to the range
                 // position in that order.
                 int p = rc_strand ? (cur_o + (nspan - 1 - x)) : (cur_o + x);
-                uint32_t b = (*off)[p];
-                uint32_t e = (*off)[p + 1];
-                for (uint32_t j = b; j < e; ++j) {
-                    uint64_t v = (*pack)[j];
-                    int id = static_cast<int>(v >> 32);
+                uint64_t r = (*ranges)[p];
+                uint32_t off = MerQueryManager::range_off(r);
+                uint32_t cnt = MerQueryManager::range_cnt(r);
+                for (uint32_t a = 0; a < cnt; ++a) {
+                    const auto& pr = mqm.assign_arena[off + a];
+                    int id = pr.first;
                     if (id != confi_id) continue;
-                    int l = static_cast<int>(static_cast<uint32_t>(v));
+                    int l = pr.second;
                     if (first < 0) first = x;
                     else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
                     prev_x = x; prev_l = l; last = x; ++m;
@@ -903,8 +959,8 @@ inline void validate_sequence_segmented(
             return {passing, last - first + k};
         };
     };
-    auto chain_fwd = make_chain(&off_fwd, &pack_fwd, false);
-    auto chain_rc = make_chain(&off_rc, &pack_rc, true);
+    auto chain_fwd = make_chain(&fwd_ranges, false);
+    auto chain_rc = make_chain(&rc_ranges, true);
 
     const int seg_stride = SEG - (window_size - 1);
     for (int seg_start = 0; seg_start < L; seg_start += seg_stride) {
@@ -1000,61 +1056,6 @@ inline void validate_sequence_segmented(
                 std::chrono::steady_clock::now() - _t_prep).count();
         }
 
-        // Expand every position's assignment range once for the whole segment;
-        // all overlapping windows then share contiguous slices of this cache.
-        off_fwd.assign(seg_len + 1, 0);
-        off_rc.assign(seg_len + 1, 0);
-        pack_fwd.clear();
-        pack_rc.clear();
-        {
-            auto _t_cache = vp ? std::chrono::steady_clock::now()
-                               : std::chrono::steady_clock::time_point{};
-            for (int p = 0; p < seg_len; ++p) {
-                constexpr int kCachePrefetch = 32;
-                if (p + kCachePrefetch < seg_len) {
-                    uint64_t rp = fwd_ranges[p + kCachePrefetch];
-                    if (rp)
-                        __builtin_prefetch(&mqm.assign_arena[MerQueryManager::range_off(rp)]);
-                }
-                uint64_t rf = fwd_ranges[p];
-                if (rf) {
-                    uint32_t off = MerQueryManager::range_off(rf);
-                    uint32_t cnt = MerQueryManager::range_cnt(rf);
-                    for (uint32_t a = 0; a < cnt; ++a) {
-                        const auto& pr = mqm.assign_arena[off + a];
-                        pack_fwd.push_back(
-                            (static_cast<uint64_t>(static_cast<uint32_t>(pr.first)) << 32) |
-                            static_cast<uint32_t>(pr.second));
-                    }
-                }
-                off_fwd[p + 1] = static_cast<uint32_t>(pack_fwd.size());
-            }
-            for (int p = 0; p < seg_len; ++p) {
-                constexpr int kCachePrefetch = 32;
-                if (p + kCachePrefetch < seg_len) {
-                    uint64_t rp = rc_ranges[p + kCachePrefetch];
-                    if (rp)
-                        __builtin_prefetch(&mqm.assign_arena[MerQueryManager::range_off(rp)]);
-                }
-                uint64_t rr = rc_ranges[p];
-                if (rr) {
-                    uint32_t off = MerQueryManager::range_off(rr);
-                    uint32_t cnt = MerQueryManager::range_cnt(rr);
-                    for (uint32_t a = 0; a < cnt; ++a) {
-                        const auto& pr = mqm.assign_arena[off + a];
-                        pack_rc.push_back(
-                            (static_cast<uint64_t>(static_cast<uint32_t>(pr.first)) << 32) |
-                            static_cast<uint32_t>(pr.second));
-                    }
-                }
-                off_rc[p + 1] = static_cast<uint32_t>(pack_rc.size());
-            }
-            if (vp) {
-                tl_gather_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - _t_cache).count();
-                g_val_profile.pushed += (long long)(pack_fwd.size() + pack_rc.size());
-            }
-        }
         auto _t_win = std::chrono::steady_clock::now();
 
         int s0 = seg_start;
@@ -1063,6 +1064,56 @@ inline void validate_sequence_segmented(
             if (rem != 0) s0 += step_size - rem;
         }
         const int last_start = seg_end - window_size;
+        double min_gate_ratio = 1e9;
+        for (const auto& tier : cfg.tiers)
+            min_gate_ratio = std::min(min_gate_ratio, tier.vote_ratio);
+        if (cfg.verify.enabled)
+            min_gate_ratio = std::min(min_gate_ratio, cfg.verify.t3.vote_ratio);
+        const bool tie_needs_exact = min_gate_ratio <= 1.0;
+
+        auto add_pos = [&](int p, bool rc, SlidingTally& st) {
+            const auto& ranges = rc ? rc_ranges : fwd_ranges;
+            uint64_t r = ranges[p];
+            uint32_t off = MerQueryManager::range_off(r);
+            uint32_t cnt = MerQueryManager::range_cnt(r);
+            for (uint32_t a = 0; a < cnt; ++a)
+                st.add(mqm.assign_arena[off + a].first);
+        };
+        auto remove_pos = [&](int p, bool rc, SlidingTally& st) {
+            const auto& ranges = rc ? rc_ranges : fwd_ranges;
+            uint64_t r = ranges[p];
+            uint32_t off = MerQueryManager::range_off(r);
+            uint32_t cnt = MerQueryManager::range_cnt(r);
+            for (uint32_t a = 0; a < cnt; ++a)
+                st.remove(mqm.assign_arena[off + a].first);
+        };
+        auto rebuild_slide = [&](int o, bool rc, SlidingTally& st) {
+            st.clear();
+            for (int p = o; p < o + nspan; ++p) add_pos(p, rc, st);
+        };
+        auto full_tally = [&](int o, bool rc) {
+            tally_acc.begin();
+            if (!rc) {
+                for (int p = o; p < o + nspan; ++p) {
+                    uint64_t r = fwd_ranges[p];
+                    uint32_t off = MerQueryManager::range_off(r);
+                    uint32_t cnt = MerQueryManager::range_cnt(r);
+                    for (uint32_t a = 0; a < cnt; ++a)
+                        tally_acc.add(mqm.assign_arena[off + a].first);
+                }
+            } else {
+                for (int p = o + nspan - 1; p >= o; --p) {
+                    uint64_t r = rc_ranges[p];
+                    uint32_t off = MerQueryManager::range_off(r);
+                    uint32_t cnt = MerQueryManager::range_cnt(r);
+                    for (uint32_t a = 0; a < cnt; ++a)
+                        tally_acc.add(mqm.assign_arena[off + a].first);
+                }
+            }
+            return tally_acc.finish();
+        };
+
+        bool slide_init = false;
         for (int s = s0; s <= last_start; s += step_size) {
             if (vp) ++g_val_profile.windows;
             // soft-mask skip: window must contain at least one uppercase base
@@ -1078,25 +1129,32 @@ inline void validate_sequence_segmented(
                 }
                 if (word) { has_upper = true; break; }
             }
-            if (!has_upper) continue;
+            if (!has_upper) { slide_init = false; continue; }
 
-            // forward strand: tally a contiguous slice of the segment cache;
-            // chain evaluation runs only when the ratio pre-check can pass.
             cur_o = o;
             if (vp) ++g_val_profile.tally_calls;
             auto _tt = vp ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
-            tally_acc.begin();
-            for (uint32_t j = off_fwd[o]; j < off_fwd[o + nspan]; ++j) {
-                tally_acc.add(static_cast<int>(pack_fwd[j] >> 32));
-            }
-            if (vp) {
-                tl_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - _tt).count();
+            if (!slide_init || step_size >= window_size) {
+                rebuild_slide(o, false, slide_f);
+                rebuild_slide(o, true, slide_r);
+                slide_init = true;
+            } else {
+                const int prev_o = o - step_size;
+                for (int p = prev_o; p < prev_o + step_size; ++p) {
+                    remove_pos(p, false, slide_f);
+                    remove_pos(p, true, slide_r);
+                }
+                for (int p = prev_o + nspan; p < prev_o + nspan + step_size; ++p) {
+                    add_pos(p, false, slide_f);
+                    add_pos(p, true, slide_r);
+                }
             }
             int fwd_id = -1, fwd_count = 0;
             bool fwd_ok = false;
-            VoteTally fwd_t = tally_acc.finish();
+            bool tie_f = false;
+            VoteTally fwd_t = slide_f.finish(tie_f);
+            if (tie_f && tie_needs_exact) fwd_t = full_tally(o, false);
             if (gate_ratio_precheck(fwd_t, cfg)) {
                 int passing = 0, span = 0;
                 if (gate_pass(fwd_t, cfg, chain_fwd, passing, span)) {
@@ -1106,24 +1164,11 @@ inline void validate_sequence_segmented(
                 }
             }
 
-            // reverse-complement strand: same slice, but matches are enumerated
-            // backwards (window's last k-mer position first) to preserve the
-            // legacy match order for tally tie-breaking.
-            if (vp) ++g_val_profile.tally_calls;
-            _tt = vp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            tally_acc.begin();
-            for (int p = o + nspan - 1; p >= o; --p) {
-                for (uint32_t j = off_rc[p]; j < off_rc[p + 1]; ++j) {
-                    tally_acc.add(static_cast<int>(pack_rc[j] >> 32));
-                }
-            }
-            if (vp) {
-                tl_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - _tt).count();
-            }
             int rev_id = -1, rev_count = 0;
             bool rev_ok = false;
-            VoteTally rev_t = tally_acc.finish();
+            bool tie_r = false;
+            VoteTally rev_t = slide_r.finish(tie_r);
+            if (tie_r && tie_needs_exact) rev_t = full_tally(o, true);
             if (gate_ratio_precheck(rev_t, cfg)) {
                 int passing = 0, span = 0;
                 if (gate_pass(rev_t, cfg, chain_rc, passing, span)) {
@@ -1136,7 +1181,6 @@ inline void validate_sequence_segmented(
                 tl_tally_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - _tt).count();
             }
-
             if (fwd_ok || rev_ok) {
                 if (vp) ++g_val_profile.emits;
                 if (!fwd_ok) emit(s, -1, rev_id, 0.0);
@@ -1173,11 +1217,9 @@ inline void validate_sequence_segmented(
     if (vp) {
         g_val_profile.prep_ns += tl_prep_ns;
         g_val_profile.win_ns += tl_win_ns;
-        g_val_profile.gather_ns += tl_gather_ns;
         g_val_profile.tally_ns += tl_tally_ns;
         tl_prep_ns = 0;
         tl_win_ns = 0;
-        tl_gather_ns = 0;
         tl_tally_ns = 0;
     }
 }
