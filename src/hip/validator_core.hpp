@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -877,11 +878,13 @@ inline void validate_sequence_segmented(
         std::vector<int> cnt;
         std::vector<int> pos;
         std::vector<int> active;
+        std::deque<int> pos_hits;   // non-empty k-mer positions, ascending
         int total = 0;
 
         void clear() {
             for (int id : active) { cnt[id] = 0; pos[id] = -1; }
             active.clear();
+            pos_hits.clear();
             total = 0;
         }
         inline void add(int id) {
@@ -933,15 +936,17 @@ inline void validate_sequence_segmented(
     };
     thread_local SlidingTally slide_f, slide_r;
 
-    auto make_chain = [&](const std::vector<uint64_t>* ranges, bool rc_strand) {
-        return [&, ranges, rc_strand](int confi_id) -> std::pair<int, int> {
+    auto make_chain = [&](const std::vector<uint64_t>* ranges,
+                          const SlidingTally* slide, bool rc_strand) {
+        return [&, ranges, slide, rc_strand](int confi_id) -> std::pair<int, int> {
             if (vp) ++g_val_profile.chain_calls;
             int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
-            for (int x = 0; x < nspan; ++x) {
-                // The RC strand enumerates k-mer starts backwards (its first
-                // match is the window's last position), so map x to the range
-                // position in that order.
-                int p = rc_strand ? (cur_o + (nspan - 1 - x)) : (cur_o + x);
+            const auto& positions = slide->pos_hits;
+            for (size_t qi = 0; qi < positions.size(); ++qi) {
+                int p = rc_strand
+                    ? positions[positions.size() - 1 - qi]
+                    : positions[qi];
+                int x = rc_strand ? (nspan - 1 - (p - cur_o)) : (p - cur_o);
                 uint64_t r = (*ranges)[p];
                 uint32_t off = MerQueryManager::range_off(r);
                 uint32_t cnt = MerQueryManager::range_cnt(r);
@@ -959,8 +964,8 @@ inline void validate_sequence_segmented(
             return {passing, last - first + k};
         };
     };
-    auto chain_fwd = make_chain(&fwd_ranges, false);
-    auto chain_rc = make_chain(&rc_ranges, true);
+    auto chain_fwd = make_chain(&fwd_ranges, &slide_f, false);
+    auto chain_rc = make_chain(&rc_ranges, &slide_r, true);
 
     const int seg_stride = SEG - (window_size - 1);
     for (int seg_start = 0; seg_start < L; seg_start += seg_stride) {
@@ -1078,6 +1083,7 @@ inline void validate_sequence_segmented(
             uint32_t cnt = MerQueryManager::range_cnt(r);
             for (uint32_t a = 0; a < cnt; ++a)
                 st.add(mqm.assign_arena[off + a].first);
+            if (cnt > 0) st.pos_hits.push_back(p);
         };
         auto remove_pos = [&](int p, bool rc, SlidingTally& st) {
             const auto& ranges = rc ? rc_ranges : fwd_ranges;
@@ -1086,6 +1092,8 @@ inline void validate_sequence_segmented(
             uint32_t cnt = MerQueryManager::range_cnt(r);
             for (uint32_t a = 0; a < cnt; ++a)
                 st.remove(mqm.assign_arena[off + a].first);
+            if (cnt > 0 && !st.pos_hits.empty() && st.pos_hits.front() == p)
+                st.pos_hits.pop_front();
         };
         auto rebuild_slide = [&](int o, bool rc, SlidingTally& st) {
             st.clear();
