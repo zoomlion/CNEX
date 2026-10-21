@@ -703,7 +703,10 @@ inline std::pair<int, int> validate_read_verified(
         frame_ids.reserve(hits.size());
         for (const auto& h : hits) frame_ids.push_back(h[1]);
         VoteTally tally = tally_votes(frame_ids);
+        std::pair<int, int> cached_chain{0, 0};
+        int cached_chain_id = -1;
         auto chain_of = [&](int confi_id) -> std::pair<int, int> {
+            if (confi_id == cached_chain_id) return cached_chain;
             int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
             for (const auto& h : hits) {
                 if (h[1] != confi_id) continue;
@@ -712,8 +715,12 @@ inline std::pair<int, int> validate_read_verified(
                 else if (std::abs((x - prev_x) - (l - prev_l)) <= cfg.max_diff) ++passing;
                 prev_x = x; prev_l = l; last = x; ++m;
             }
-            if (m == 0) return {0, 0};
-            return {passing, last - first + mer_size};
+            cached_chain_id = confi_id;
+            cached_chain = (m == 0)
+                ? std::pair<int,int>{0, 0}
+                : std::pair<int,int>{passing, last - first + mer_size};
+            if (m == 0) return cached_chain;
+            return cached_chain;
         };
         int passing = 0, span = 0;
         const bool gate_ok = gate_pass(tally, cfg, chain_of, passing, span);
