@@ -1,63 +1,104 @@
 # CNEX Benchmark
 
-多物种 benchmark:CNEX vs MMseqs2 vs BLASTN,5 个目标基因组
-(Homo_sapiens, Mus_musculus, Gallus_gallus, Xenopus_tropicalis, Callorhinchus_milii)。
+多物种 genome benchmark，以及 reads 深度 / MSA 物种数消融实验。
 
-## 原理
+## Active 目录
 
-从 `most-cons-cne.filtered.fa`(26k 块多物种 MSA)按 seed=42 采样 10,000 块。
-对每个目标物种 T:
-- queries = 所有非 T、非 ref 物种的序列(149k 量级)
-- ground truth = T 在各块的基因组坐标(过滤:非-gap ≥ 25bp)
-- CNEX mer 表由"剔除 T"的比对块构建(leave-one-out,公平的同源搜索)
-- 评估:命中与 truth 的 **contig 名精确匹配** + 重叠 ≥30% 最短区间
+```text
+benchmark/
+  README.md
+  Makefile
+  benchmark.sh
+  01_extract.py          # 采样 MSA，按 target 生成 queries/truth/blocks
+  02_m8extract.py        # 每 block 取最佳命中
+  03_analyze.py          # 多物种评估
+  04_plot.py             # genome benchmark 图
+  clean_queries.py       # query FASTA 清洗
+  eval_locus.py          # reads locus 评估（Python）
+  eval_locus.cpp         # eval_locus 源码（需编译）
+  extract_m8_regions.py  # MMseqs m8 → regions
+  reads_speed.py         # reads 计时采集
+  run_reads_speed.sh     # CNEX reads validate+assemble 计时
+  depth_experiment.py    # reads 深度主图 + S1/S2
+  msa_ablation.py        # MSA 物种数消融
+  msa_figure.py          # 附图 S3
+  data/ dbs/ results/ stats/ figures/   # 生成物（gitignored）
+```
 
-## Usage
+## Genome benchmark
+
+5 个 target：
+
+```text
+Homo_sapiens, Mus_musculus, Gallus_gallus,
+Scyliorhinus_canicula, Callorhinchus_milii
+```
 
 ```bash
-make all                # 完整流程(5 物种)
-bash benchmark.sh all   # 同上
+make all
+# 或分步
+bash benchmark.sh extract Gallus_gallus
+bash benchmark.sh dbs Gallus_gallus
+bash benchmark.sh search Gallus_gallus
+bash benchmark.sh m8extract Gallus_gallus
+bash benchmark.sh analyze Gallus_gallus
 
-# 分步(可指定物种子集)
-bash benchmark.sh extract Gallus_gallus        # 采样+按物种出 queries/truth/blocks
-bash benchmark.sh dbs Gallus_gallus            # 建 3 个库
-bash benchmark.sh search Gallus_gallus         # CNEX + MMseqs2 + BLASTN
-bash benchmark.sh m8extract Gallus_gallus      # 每 block 最佳命中
-bash benchmark.sh sensitivity                  # MMseqs2 s=1.0,4.0,7.5,5.7(仅人类)
-bash benchmark.sh querylib Homo_sapiens        # CNEX query-库子采样 sweep (10/20/40/60/80%+100%)
-bash benchmark.sh analyze Gallus_gallus        # 汇总 results → stats/summary.tsv
-python3 04_plot.py                             # figures/benchmark_multi.pdf
-
-make clean              # 清理衍生数据(backup_human_* 保留)
+python3 04_plot.py            # → figures/benchmark_multi.pdf
 ```
 
-querylib 分步: `querylib-extract` / `querylib-search` / `querylib-analyze` / `querylib-plot`
+评估：命中与 truth 的 contig 名匹配，重叠 ≥30% 最短区间；MSA 用 seed=42
+采样 10,000 blocks，CNEX mer 表 leave-one-out 构建（`-k 13 -c 4`）。
 
-## 目录结构
+## Reads benchmark（head2head）
 
-```
-data/genomes/{Species}/{Species}.fa(.fai)   # 目标基因组(RefSeq 命名,与 MSA 版本一致)
-data/queries/{Species}.fa                   # 物种专属 query
-data/truth/{Species}.tsv                    # 物种专属 ground truth
-data/blocks/{Species}.fa                    # 剔除目标物种的比对块(CNEX mer 表输入)
-data/querylib/{Species}/bf{frac}/           # query-库子采样产物(queries/blocks/kept_blocks.tsv)
-dbs/{Species}/{mmseqs,blast,cnex}/          # 每物种数据库
-results/{Species}/{mmseqs,blastn,cnex}/     # 每物种搜索结果
-results/querylib/{Species}/bf{frac}/cnex/   # 子采样级别搜索结果(CNEX)
-stats/{Species}/time_*.txt                  # /usr/bin/time -v 日志
-stats/summary.tsv                           # 汇总表(每物种 × 3 工具)
-stats/querylib_summary.tsv                  # query-库 sweep 汇总
-figures/benchmark_multi.pdf                 # 统计图
-figures/querylib_recall.pdf                 # query-库 sweep 图
-backup_human_20260801/                      # 旧单物种(人类)产物备份
+工作目录默认 `~/temp/head2head`，reads 为 0.25x–8x WGS 模拟数据。
+
+```bash
+CACHE=cold REPS=1 bash run_reads_speed.sh   # CNEX validate+assemble 计时
+python3 reads_speed.py                      # → stats/reads_speed.tsv
+python3 depth_experiment.py                 # → 主图 + S1/S2 + stats/depth_experiment.tsv
 ```
 
-## 文件说明
+评估器 `eval_locus` 由 `eval_locus.cpp` 编译，依赖仓库的 `src/parasail`
+submodule；二进制不进入 git。评估规则见 `stats/reads_locus_report.md`。
 
-- `01_extract.py` — 采样、按 `--target` 提取 queries/truth/blocks(支持 `--block-frac` 嵌套子采样)
-- `02_m8extract.py` — 每物种、每 block 取 evalue<1e-5 最佳命中
-- `03_analyze.py` — 多物种评估、出表
-- `04_plot.py` — 多物种统计图
-- `05_querylib_analyze.py` — query-库子采样评估(相对/绝对 recall、恢复率、bootstrap CI)
-- `06_querylib_plot.py` — query-库子采样图
-- `benchmark.sh` — 统一调用入口
+## MSA 物种数消融
+
+人类 target，5x reads；4/8/12/16/19 个物种按 far → near 累积添加。
+
+```bash
+python3 msa_ablation.py       # 重建表 + validate + assemble（较慢）
+python3 msa_figure.py         # → figures/msa_ablation_supp.pdf
+```
+
+4-species 点是 distant-only baseline；S3b 为 species composition 点阵。
+
+## 图
+
+```text
+figures/benchmark_multi.pdf          # genome benchmark
+figures/depth_experiment.pdf         # 主图：a recall / b recall vs cost
+                                     #       c precision / d 5x memory
+figures/depth_experiment_supp1.pdf   # S1：S-a–S-d
+figures/depth_experiment_supp2.pdf   # S2：S-e–S-h
+figures/msa_ablation_supp.pdf        # S3：MSA 物种数消融
+```
+
+## 软件与线程
+
+- Megahit 1.2.9
+- MMseqs2 18.8cc5c
+- wgsim 1.0
+- BLASTN 2.16.0
+- SPAdes 4.3.0（已安装，未纳入结果）
+- CNEX：仓库 commit + `bin/{validate,assemble,mertable}`
+
+CNEX reads 计时用 `-t 4`，Megahit 用 `-t 64`。**core-hours 是主要计算量指标；
+wall time 未按线程数归一化**，图和文中不要把它当作同线程对比。
+
+## 数据与产物
+
+`data/`、`dbs/`、`results/`、`stats/`、`figures/` 均为生成物并已 gitignore。
+`src/parasail` 是 submodule；编译产物不提交。旧版 querylib / megahit_test /
+backup 数据已移到 repo 外的
+`/43T/home/zhengjiangmin/Software/CNEX_benchmark_archive_20261022/`。

@@ -55,6 +55,7 @@ benchmark/*
 !benchmark/*.sh
 !benchmark/Makefile
 !benchmark/README.md
+!benchmark/*.cpp
 ipynb/
 most-cons-cne.fa
 most-cons-cne.filtered.fa
