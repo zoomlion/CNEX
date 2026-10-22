@@ -2,7 +2,7 @@
 
 Fast identification of conserved non-coding elements (CNEs) from whole-genome sequences. Supports both sequencing reads and direct genome FASTA input. Key features:
 
-- **Ultra-fast sliding-window genome mode** (~3 min for human genome at 6X, 16 threads)
+- **Ultra-fast sliding-window genome mode** (~33 s validation for human at 6X/16 threads; full validate+assemble pipeline ~3 min)
 - **k-mer guided assembly** — De Bruijn graph with element-specific k-mer prior
 - **SNP/INDEL detection** via De Bruijn bubble scanning
 - **Phylogeny pipeline** — concat with IQ-TREE 3 / RAXML-NG
@@ -64,6 +64,46 @@ For a single genome instead of a whole set:
 cnex validate genome.fa --mers mers_table.tsv -t 16 -o out/
 cnex assemble out/ --mers mers_table.tsv -o contigs.fa
 ```
+
+For paired-end reads, the validated reads are written as `Assemble.*.reads`
+and can be assembled directly:
+
+```bash
+cnex validate reads_R1.fq.gz reads_R2.fq.gz \
+  --mers mers_table.tsv --type fastq -t 4 \
+  --rescue-panels blocks.fa --rescue-tau 0.90 --t3 "1.5,5,25" \
+  -o out/
+cnex assemble out/ --mers mers_table.tsv -o contigs.fa
+```
+
+`blocks.fa` is the leave-one-out block MSA used for the T3 panel rescue;
+`--rescue-tau` is required when `--rescue-panels` is given.
+
+### Key CLI parameters
+
+`cnex` passes only explicit overrides to the C++ binaries; the defaults below
+are the binary defaults.
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `validate -t` | 4 | threads |
+| `validate --type` | auto | `genome` or `fastq` |
+| `validate --vote-frac` | 0.05 | minimum vote fraction for the top element |
+| `validate --max-assign` | 3 | drop k-mers with more than this many element/locus assignments |
+| `validate --t3` | `1.5,5,25` | T3 near-miss gate row (`rv,mc,ms`) |
+| `validate --tiers` | none | extra OR-gate rows appended to T1+T2 |
+| `validate --rescue-panels` | off | per-element panels for SW rescue |
+| `validate --rescue-tau` | — | normalized SW threshold; required with panels |
+| `validate --window-size` / `--step-size` | 150 / 25 | genome sliding window (~6X) |
+| `assemble -k` | 19 | single-k mode; reads mode uses `--multi-k` by default |
+| `assemble --multi-k` | 27 | reads-mode k list |
+| `assemble --min-count` | 1 | minimum (k+1)-mer occurrence |
+| `assemble --trim` | on | trim to confident k-mer region; use `--no-trim` to disable |
+| `assemble --trim-margin` | 10 | bp kept beyond the first/last element k-mer |
+| `assemble --max-assign` | 3 | must match validate |
+| `assemble --max-reads` | 200 | max reads per element/locus |
+| `assemble --max-loci-gap` | 5000 | max gap for genome-mode locus clustering |
+| `assemble --snp` | off | scan candidate SNPs from validated reads |
 
 ### Input formats
 
@@ -165,9 +205,11 @@ and an independent supermatrix.
 
 ## Benchmark
 
-Genome mode processes the human genome in ~3 min (16 threads). The full
-benchmark (sensitivity and timing against MMseqs2 / BLASTN) lives in
-`benchmark/` — see `benchmark/README.md`.
+Genome-mode validation takes ~33 s for the human genome at 6X with 16 threads
+in our benchmark; the full validate+assemble pipeline is ~3 min. The full
+benchmark (accuracy and timing against MMseqs2 / BLASTN) and the reads-depth
+benchmark against Megahit+MMseqs2 live in `benchmark/` — see
+`benchmark/README.md`.
 
 ## License
 

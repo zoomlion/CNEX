@@ -120,7 +120,9 @@ ASSEMBLE_DIR = "assemble"
 def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
                 window_size=None, step_size=None, type_=None, log_dir=None,
                 keep_validate=False, depth=None, cne_ref=None, ssd_dir=None, tiers=None,
-                max_assign=3, trim_margin=10):
+                max_assign=3, trim_margin=None, rescue_panels=None, rescue_tau=None,
+                t3=None, multi_k=None, no_multi_k=False, min_count=None,
+                max_reads=None, max_loci_gap=None, snp=False):
     name = genome_name(genome)
     if not name:
         return 0, 1
@@ -141,6 +143,10 @@ def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
                "--max-assign", str(max_assign)]
     if tiers:
         val_cmd += ["--tiers", tiers]
+    if t3:
+        val_cmd += ["--t3", t3]
+    if rescue_panels:
+        val_cmd += ["--rescue-panels", rescue_panels, "--rescue-tau", str(rescue_tau)]
     if os.path.isdir(genome) and type_ == "fastq":
         fastqs = sorted(glob.glob(os.path.join(genome, "*.fastq*")) +
                         glob.glob(os.path.join(genome, "*.fq*")))
@@ -193,9 +199,24 @@ def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
     asm_out = os.path.join(val_dir, "contigs.fa")
     asm_cmd = [ASSEMBLE, val_dir + "/", "--mers", mers, "-o", asm_out,
                "--max-assign", str(max_assign)]
-    if trim:
+    if trim is True:
         asm_cmd.append("--trim")
+    elif trim is False:
+        asm_cmd.append("--no-trim")
+    if trim_margin is not None:
         asm_cmd += ["--trim-margin", str(trim_margin)]
+    if multi_k:
+        asm_cmd += ["--multi-k", multi_k]
+    if no_multi_k:
+        asm_cmd.append("--no-multi-k")
+    if min_count is not None:
+        asm_cmd += ["--min-count", str(min_count)]
+    if max_reads is not None:
+        asm_cmd += ["--max-reads", str(max_reads)]
+    if max_loci_gap is not None:
+        asm_cmd += ["--max-loci-gap", str(max_loci_gap)]
+    if snp:
+        asm_cmd.append("--snp")
     if cne_ref:
         asm_cmd += ["--cne-ref", cne_ref]
     result_rc = _run(asm_cmd, log)
@@ -214,6 +235,8 @@ def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
 
 def cmd_validate(args):
     check_binaries()
+    if getattr(args, 'rescue_panels', None) and getattr(args, 'rescue_tau', None) is None:
+        sys.exit("Error: --rescue-panels requires --rescue-tau")
     cmd = [VALIDATE] + args.files + [
         "--mers", args.mers,
         "-t", str(args.threads),
@@ -224,6 +247,11 @@ def cmd_validate(args):
     ]
     if getattr(args, 'tiers', None):
         cmd += ["--tiers", args.tiers]
+    if getattr(args, 't3', None):
+        cmd += ["--t3", args.t3]
+    if getattr(args, 'rescue_panels', None):
+        cmd += ["--rescue-panels", args.rescue_panels,
+                "--rescue-tau", str(args.rescue_tau)]
     if args.window_size:
         cmd += ["--window_size", str(args.window_size)]
     if args.step_size:
@@ -239,21 +267,27 @@ def cmd_assemble(args):
     check_binaries()
     cmd = [ASSEMBLE, args.input_dir,
            "--mers", args.mers,
-           "-o", args.output,
-           "--max-assign", str(args.max_assign)]
-    if args.kmer:
+           "-o", args.output]
+    if args.max_assign is not None:
+        cmd += ["--max-assign", str(args.max_assign)]
+    if args.kmer is not None:
         cmd += ["-k", str(args.kmer)]
-    if args.min_c:
-        cmd += ["--min-c", str(args.min_c)]
-    if args.min_count:
+    if args.multi_k:
+        cmd += ["--multi-k", args.multi_k]
+    if args.no_multi_k:
+        cmd.append("--no-multi-k")
+    if args.min_count is not None:
         cmd += ["--min-count", str(args.min_count)]
-    if args.max_reads:
+    if args.max_reads is not None:
         cmd += ["--max-reads", str(args.max_reads)]
-    if args.max_loci_gap:
+    if args.max_loci_gap is not None:
         cmd += ["--max-loci-gap", str(args.max_loci_gap)]
-    if args.trim:
+    if args.trim is True:
         cmd.append("--trim")
-        cmd += ["--trim-margin", str(getattr(args, 'trim_margin', 10))]
+    elif args.trim is False:
+        cmd.append("--no-trim")
+    if args.trim_margin is not None:
+        cmd += ["--trim-margin", str(args.trim_margin)]
     if args.snp:
         cmd.append("--snp")
     return run(cmd).returncode
@@ -282,7 +316,11 @@ def cmd_pipeline(args):
                         filtered, "-k", "13", "-c", "4", "-o", mers])
         cne_ref = os.path.join(args.output_dir, "ref.fa")
 
-    trim = getattr(args, 'trim', False)
+    trim = getattr(args, 'trim', None)
+    rescue_panels = getattr(args, 'rescue_panels', None)
+    rescue_tau = getattr(args, 'rescue_tau', None)
+    if rescue_panels and rescue_tau is None:
+        sys.exit("Error: --rescue-panels requires --rescue-tau")
 
     # ── ssd-dir cache init: clear stale dirs + register signal handlers ──
     global _SSD_DIR
@@ -311,7 +349,16 @@ def cmd_pipeline(args):
                             depth=args.depth, cne_ref=cne_ref, ssd_dir=_SSD_DIR,
                             tiers=getattr(args, 'tiers', None),
                             max_assign=getattr(args, 'max_assign', 3),
-                            trim_margin=getattr(args, 'trim_margin', 10))
+                            trim_margin=getattr(args, 'trim_margin', None),
+                            rescue_panels=rescue_panels,
+                            rescue_tau=rescue_tau,
+                            t3=getattr(args, 't3', None),
+                            multi_k=getattr(args, 'multi_k', None),
+                            no_multi_k=getattr(args, 'no_multi_k', False),
+                            min_count=getattr(args, 'min_count', None),
+                            max_reads=getattr(args, 'max_reads', None),
+                            max_loci_gap=getattr(args, 'max_loci_gap', None),
+                            snp=getattr(args, 'snp', False))
             futures[f] = name
 
         for f in as_completed(futures):
@@ -344,6 +391,12 @@ def main():
                             'appended on top of T1+T2')
     p_val.add_argument("--depth", type=int, default=None,
                        help="Max reads to process (default: unlimited)")
+    p_val.add_argument("--rescue-panels", default=None,
+                       help="MSA with per-element panels for T3 rescue")
+    p_val.add_argument("--rescue-tau", type=float, default=None,
+                       help="Normalized SW threshold for --rescue-panels")
+    p_val.add_argument("--t3", default=None,
+                       help='Near-miss gate row (default: 1.5,5,25)')
     p_val.add_argument("--window-size", type=int, help="Genome sliding window size (default: 150)")
     p_val.add_argument("--step-size", type=int, help="Genome sliding window step (default: 25)")
 
@@ -352,19 +405,27 @@ def main():
     p_asm.add_argument("input_dir", help="Directory with Assemble.*.reads files")
     p_asm.add_argument("--mers", required=True, help="Confident k-mer table")
     p_asm.add_argument("-o", "--output", default="assembled.fasta", help="Output FASTA (default: assembled.fasta)")
-    p_asm.add_argument("-k", "--kmer", type=int, default=21, help="K-mer length (default: 21)")
-    p_asm.add_argument("--min-c", type=int, default=3, help="Min k-mer matches for validation (default: 3)")
-    p_asm.add_argument("--min-count", type=int, default=2, help="Min (k+1)-mer occurrence (default: 2)")
-    p_asm.add_argument("--max-reads", type=int, default=200, help="Max reads per element/locus (default: 200)")
-    p_asm.add_argument("--max-loci-gap", type=int, default=5000,
-                       help="Max gap for locus clustering in genome mode (default: 5000)")
-    p_asm.add_argument("--max-assign", type=int, default=3,
-                       help="Load-time cap on (element,locus) assignments per k-mer, "
-                            "must match validate (default: 3; 0 = keep all)")
-    p_asm.add_argument("--trim", action="store_true",
-                       help="Trim contigs to confident region (default: off)")
-    p_asm.add_argument("--trim-margin", type=int, default=10,
-                       help="bp kept beyond first/last element k-mer when trimming (default: 20)")
+    p_asm.add_argument("-k", "--kmer", type=int, default=None,
+                       help="Single-k length (default: binary 19; reads mode uses --multi-k 27)")
+    p_asm.add_argument("--multi-k", default=None,
+                       help="Reads mode: comma-separated k list (default: binary 27)")
+    p_asm.add_argument("--no-multi-k", action="store_true",
+                       help="Force single-k mode")
+    p_asm.add_argument("--min-count", type=int, default=None,
+                       help="Min (k+1)-mer occurrence (default: binary 1)")
+    p_asm.add_argument("--max-reads", type=int, default=None,
+                       help="Max reads per element/locus (default: binary 200)")
+    p_asm.add_argument("--max-loci-gap", type=int, default=None,
+                       help="Max gap for locus clustering in genome mode (default: binary 5000)")
+    p_asm.add_argument("--max-assign", type=int, default=None,
+                       help="Load-time cap on (element,locus) assignments per k-mer "
+                            "(default: binary 3; 0 = keep all)")
+    p_asm.add_argument("--trim", dest="trim", action="store_true", default=None,
+                       help="Trim contigs to confident region (default: on)")
+    p_asm.add_argument("--no-trim", dest="trim", action="store_false",
+                       help="Disable trimming")
+    p_asm.add_argument("--trim-margin", type=int, default=None,
+                       help="bp kept beyond first/last element k-mer when trimming (default: 10)")
     p_asm.add_argument("--snp", action="store_true",
                        help="Scan for candidate SNPs from validated reads")
 
@@ -381,10 +442,24 @@ def main():
     p_pipe.add_argument("-t", "--threads", type=int, default=4, help="Threads per genome (default: 4)")
     p_pipe.add_argument("-j", "--jobs", type=int, default=4, help="Parallel genomes (default: 4)")
     p_pipe.add_argument("-o", "--output-dir", default="out", help="Output root directory (default: out)")
-    p_pipe.add_argument("--trim", action="store_true",
-                        help="Trim contigs to confident region (default: off)")
-    p_pipe.add_argument("--trim-margin", type=int, default=10,
-                        help="bp kept beyond first/last element k-mer when trimming (default: 20)")
+    p_pipe.add_argument("--trim", dest="trim", action="store_true", default=None,
+                        help="Trim contigs to confident region (default: on)")
+    p_pipe.add_argument("--no-trim", dest="trim", action="store_false",
+                        help="Disable trimming")
+    p_pipe.add_argument("--trim-margin", type=int, default=None,
+                        help="bp kept beyond first/last element k-mer when trimming (default: 10)")
+    p_pipe.add_argument("--multi-k", default=None,
+                        help="Reads mode: comma-separated k list (default: binary 27)")
+    p_pipe.add_argument("--no-multi-k", action="store_true",
+                        help="Force single-k mode")
+    p_pipe.add_argument("--min-count", type=int, default=None,
+                        help="Min (k+1)-mer occurrence (default: binary 1)")
+    p_pipe.add_argument("--max-reads", type=int, default=None,
+                        help="Max reads per element/locus (default: binary 200)")
+    p_pipe.add_argument("--max-loci-gap", type=int, default=None,
+                        help="Max gap for locus clustering in genome mode (default: binary 5000)")
+    p_pipe.add_argument("--snp", action="store_true",
+                        help="Scan for candidate SNPs from validated reads")
     p_pipe.add_argument("--type", choices=["genome", "fastq"],
                         help="Input type (auto-detected if omitted)")
     p_pipe.add_argument("--window-size", type=int, help="Sliding window size (default: 150)")
@@ -395,6 +470,12 @@ def main():
                              'appended on top of T1+T2')
     p_pipe.add_argument("--depth", type=int, default=None,
                         help="Max reads to process per genome (default: unlimited)")
+    p_pipe.add_argument("--rescue-panels", default=None,
+                        help="MSA with per-element panels for T3 rescue")
+    p_pipe.add_argument("--rescue-tau", type=float, default=None,
+                        help="Normalized SW threshold for --rescue-panels")
+    p_pipe.add_argument("--t3", default=None,
+                        help='Near-miss gate row (default: 1.5,5,25)')
     p_pipe.add_argument("--keep-validate", action="store_true",
                         help="Keep intermediate validate output (Assemble.*.reads)")
     p_pipe.add_argument("--ssd-dir", default=None,

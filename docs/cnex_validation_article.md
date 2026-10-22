@@ -16,9 +16,19 @@ A read is assigned to the element with the largest vote count. It is accepted on
 
 Both strands of each read are processed independently through the same chain, and the strand with the most matches is kept. Reads that pass these checks are assigned to the element and provide the material for sequence assembly.
 
+## T3 rescue
+
+In the production reads pipeline, near-miss reads can be recovered by
+Smith-Waterman verification against per-element panels derived from the
+leave-one-out block MSA (`--rescue-panels blocks.fa --rescue-tau 0.90`).
+The near-miss gate is controlled by `--t3` (default `1.5,5,25`); additional
+OR-gate rows can be supplied with `--tiers`. Rescued reads are written with
+their normalized SW score and handed to assembly, where they are kept only if
+they pass the assembly-level rescue checks.
+
 ## De Bruijn assembly
 
-For each element, the validated reads are assembled into a De Bruijn graph. Nodes are 19-mers, and an edge connects a node to its overlapping successor when the longer context that spans them appears in the reads; edges seen fewer than a minimum number of times (default 2) are removed. Each node is scored by the number of element-specific 13-mers from the CNE k-mer table that it contains, so the graph carries a prior over which paths are likely to belong to the element. A greedy traversal starts from the pair of nodes with the largest in-degree and out-degree imbalances, walks through the BFS distances between candidate starts and ends, and extends forward and backward while choosing the neighbor with the longest remaining distance, breaking ties by the element-specific score. The contig is reconstructed by reading off overlapping k-mers along the path, so no alignment step is required. Because edges supported by fewer than two reads are removed, sporadic sequencing errors carried by single reads do not persist into the assembled sequence; the validated reads fold into one consensus sequence per locus rather than propagating their individual errors. Over the five-species benchmark, the combined validation and assembly pipeline reached a precision of 97.7-99.0% and a recall of 79.1-93.5%, consistent with the per-read false-positive bound derived below.
+For each element, the validated reads are assembled into a De Bruijn graph. In single-k genome mode the graph uses 19-mers; the reads pipeline uses multi-k assembly with k=27 by default. An edge connects a node to its overlapping successor when the longer context that spans them appears in the reads; edges seen fewer than a minimum number of times (default 1) are removed. Each node is scored by the number of element-specific 13-mers from the CNE k-mer table that it contains, so the graph carries a prior over which paths are likely to belong to the element. A greedy traversal starts from the pair of nodes with the largest in-degree and out-degree imbalances, walks through the BFS distances between candidate starts and ends, and extends forward and backward while choosing the neighbor with the longest remaining distance, breaking ties by the element-specific score. The contig is reconstructed by reading off overlapping k-mers along the path, so no alignment step is required. Because edges supported by fewer than the configured minimum (default 1) are removed, sporadic sequencing errors carried by single reads do not persist into the assembled sequence; the validated reads fold into one consensus sequence per locus rather than propagating their individual errors. Over the five-species benchmark, the combined validation and assembly pipeline reached a precision of 98.0-99.3% and a recall of 84.3-96.5%, consistent with the per-read false-positive bound derived below.
 
 ## False-positive probability of a random read
 
