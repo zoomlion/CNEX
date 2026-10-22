@@ -4,6 +4,7 @@
 [submodule "src/parasail"]
 	path = src/parasail
 	url = https://github.com/jeffdaily/parasail.git
+	ignore = untracked
 [submodule "src/pigz"]
 	path = src/pigz
 	url = https://github.com/madler/pigz.git
