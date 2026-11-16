@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="docs/figures/banner.svg" width="660" alt="CNEX">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/banner-dark.svg">
+  <img src="docs/figures/banner-light.svg" width="380" alt="CNEX">
+</picture>
 
 **Conserved Non-coding Element eXplorer**
 
@@ -123,9 +126,13 @@ cnex pipeline genomes/*.fa --cne most-cons-cne.fa -t 16 -j 4 -o results --trim
 
 ## How it works
 
-<p align="center">
-  <img src="docs/figures/pipeline.svg" width="860" alt="input → validate → assemble → map → phylogeny">
-</p>
+```mermaid
+flowchart LR
+    A["input<br/>genome / reads"] --> B["validate<br/>element assignment"]
+    B --> C["assemble<br/>per-element contigs"]
+    C --> D["map<br/>per-element FASTA"]
+    D --> E["phylogeny<br/>MAFFT → trees"]
+```
 
 `cnex pipeline` covers **validate → assemble** (stages 02–03, plus 00–01 when
 `--cne` is given). Mapping and phylogeny are separate scripts, so each step can
