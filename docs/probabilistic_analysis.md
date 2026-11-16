@@ -40,12 +40,12 @@ all pass for the winning element:
 1. **Hit count.** $n$ = number of the read's k-mers present in the k-mer
    table. (Rolling-hash lookup; mismatching k-mers contribute nothing.)
 2. **Vote majority.** The per-element vote histogram $c_1 \ge c_2 \ge \cdots$
-   must satisfy $c_1 > f\thinspace n$ and $c_1 \ge r\thinspace c_2$, with the fraction
+   must satisfy $c_1 > fn$ and $c_1 \ge rc_2$, with the fraction
    threshold $f = 0.1$ and ratio $r = 3$.
 3. **Collinearity.** The $m$ matched k-mers of the winning element are
    scanned in read order (their loci are *not* sorted); among the $m-1$
    consecutive pairs, at least $\mu = 7$ must satisfy
-   $\left|\thinspace (\text{read pos}_{i+1} - \text{read pos}_{i}) - (\text{loci}_{i+1} - \text{loci}_i)\right| \le 2$,
+   $\left|(\text{read pos}_{i+1} - \text{read pos}_{i}) - (\text{loci}_{i+1} - \text{loci}_i)\right| \le 2$,
    so read order and locus order must roughly agree
    (`gate_pass()`, `hip/validator_core.hpp`).
 4. **Span.** The matched positions of the winning element must span at
@@ -98,7 +98,7 @@ the resulting caveats are stated in Lemma 3 and §4.
 
 ### Lemma 1 — hit count
 
-$$n \sim \mathrm{Binomial}(n_w,\thinspace \rho).$$
+$$n \sim \mathrm{Binomial}(n_w,\rho).$$
 
 ### Lemma 2 — vote concentration (voting filters)
 
@@ -108,26 +108,26 @@ k-mers; we bound the corresponding vote event (winning element holding
 $m_0 = 8$ of the $n$ hits) by the union bound, ignoring the ratio
 condition on the remaining votes (a relaxation, hence an upper bound):
 
-$$\Pr(\exists\thinspace e : c_e \ge m_0 \mid n) \thickspace \le\thickspace  \binom{n}{m_0}\thickspace  S_{m_0}, \qquad S_{a} = \sum_{e=1}^{N_{ele}} p_e^{\thinspace a}.$$
+$$\Pr(\exists e : c_e \ge m_0 \mid n) \le\binom{n}{m_0}S_{m_0}, \qquad S_{a} = \sum_{e=1}^{N_{ele}} p_e^{a}.$$
 
 This is a **relaxation** of the true vote rule
 (`VoteTally`, `hip/validator_core.hpp`), which also
-requires $c_1 > 0.1\thinspace n$ and $c_1 \ge 3\thinspace c_2$: with $c_1 = 8$ votes the
+requires $c_1 > 0.1n$ and $c_1 \ge 3c_2$: with $c_1 = 8$ votes the
 fraction condition holds only for $n \le 79$, and the ratio condition
 further restricts the runner-up. Dropping both conditions can only enlarge
 the probability, so the result is an upper bound, not an exact
 probability — it certifies only the *necessary condition* $c_1 \ge 8$.
 The full acceptance event for element $e$ is
 
-$$c_1 \ge 8 \thickspace \wedge\thickspace  c_1 > 0.1\thinspace n \thickspace \wedge\thickspace  c_1 \ge 3\thinspace c_2 \thickspace \wedge\thickspace  \text{collinear} \thickspace \wedge\thickspace  \text{span},$$
+$$c_1 \ge 8 \wedge c_1 > 0.1n \wedge c_1 \ge 3c_2 \wedge\text{collinear} \wedge\text{span},$$
 
 with $c_1, c_2$ the two largest per-element vote counts; every term except
 $c_1 \ge 8$ is deliberately relaxed in the Theorem. The ratio rule
-$c_1 \ge 3\thinspace c_2$ deserves emphasis: it is what stops a giant element
+$c_1 \ge 3c_2$ deserves emphasis: it is what stops a giant element
 from winning on hit count alone when a second element shares many of its
 k-mers ($p_A \approx p_B$); a split like $c_A = 8$, $c_B = 6$ fails
 ($8 < 3 \cdot 6$). $S_a$ is the $a$-th power sum of the ownership shares; for
-$a \ge 3$, $S_a \le p_{\max}^{\thinspace a-2}\thinspace S_2$, so the tail collapses once
+$a \ge 3$, $S_a \le p_{\max}^{a-2}S_2$, so the tail collapses once
 $m_0$ exceeds a few votes.
 
 ### Lemma 3 — collinearity and span
@@ -140,7 +140,7 @@ read order and never sorted** (`gate_pass()`) —
 consecutive differences $l_{i+1}-l_i$ may be negative or arbitrarily
 large. The collinearity indicators are
 
-$$I_i \thickspace =\thickspace  \mathbf{1}\left\lbrace\left|(x_{i+1}-x_i) - (l_{i+1}-l_i)\right| \le 2 \right\rbrace, \qquad i = 1,\dots,m-1,$$
+$$I_i =\mathbf{1}\left\lbrace\left|(x_{i+1}-x_i) - (l_{i+1}-l_i)\right| \le 2 \right\rbrace, \qquad i = 1,\dots,m-1,$$
 
 and the chain passes iff $\sum_i I_i \ge \mu = 7$ and the span
 $x_m - x_1 + k \ge 25$ (see `gate_pass()`). The effective requirement is
@@ -148,7 +148,7 @@ therefore that read order and locus order roughly agree; an
 exponential-gap approximation (used in an earlier draft) does not
 correspond to this implementation and is abandoned. The span
 half-condition alone is exact and simple: with $k = 13$ it is
-$x_8 - x_1 \ge 12$ for 8 read order statistics of $[0,\thinspace R-k]$.
+$x_8 - x_1 \ge 12$ for 8 read order statistics of $[0,R-k]$.
 
 **Validator-matched Monte-Carlo protocol (subset level).** For element
 $e$, the sampling frame is its $m_e$ table rows — pairs (k-mer, locus),
@@ -167,13 +167,13 @@ implementation never performs.
 
 Applying the chain decomposition,
 
-$$P_{\mathrm{FP}}(R) \thickspace \le\thickspace  \sum_{n=0}^{n_w} \binom{n_w}{n}\thinspace \rho^{n}\thinspace (1-\rho)^{n_w-n} \cdot \binom{n}{8}\thinspace S_{8} \cdot P_{\mathrm{coll}} .$$
+$$P_{\mathrm{FP}}(R) \le\sum_{n=0}^{n_w} \binom{n_w}{n}\rho^{n}(1-\rho)^{n_w-n} \cdot \binom{n}{8}S_{8} \cdot P_{\mathrm{coll}} .$$
 
 The sum factors through the binomial identity
 $\sum_n \binom{n_w}{n} \rho^n (1-\rho)^{n_w-n} \binom{n}{8} = \binom{n_w}{8} \rho^8$, so with
 $\rho^8 S_8 = \sum_e (m_e/4^k)^8$,
 
-$$P_{\mathrm{FP}}(R) \thickspace \le\thickspace  \binom{n_w}{8}\thickspace  \sum_{e} \left(\frac{m_e}{4^{k}}\right)^{\negthinspace 8} \thickspace  P_{\mathrm{coll}} .$$
+$$P_{\mathrm{FP}}(R) \le\binom{n_w}{8}\sum_{e} \left(\frac{m_e}{4^{k}}\right)^{8} P_{\mathrm{coll}} .$$
 
 In this last form **$N_t$ and $\rho$ have cancelled completely** — the
 bound depends only on the elements' own k-mer contents $\lbrace m_e\rbrace$, the
@@ -181,7 +181,7 @@ k-mer space size $4^k$, and the collinearity/span factor.
 $P_{\mathrm{coll}}$ is the subset-level probability of Lemma 3 (one
 specific 8-match subset passing collinearity and span; $m = 8$ is the
 dominant least-count term); each additional matched k-mer contributes a
-further factor of order $\rho\thinspace p_e$, so the $m_0 = 8$ term dominates. Both strands run the same chain independently
+further factor of order $\rho p_e$, so the $m_0 = 8$ term dominates. Both strands run the same chain independently
 (`validate_read()`, `hip/validator_core.hpp`) and are identically distributed for a
 random read; the read-level probability is exactly $2p - p^2 \le 2p$, and
 this is the quantity used in §4. Because the fraction and ratio rules are
@@ -198,14 +198,14 @@ least $m_0 = 8$ hits is bounded by the vote-concentration term, and the
 collinearity/span filter multiplies it by the subset probability
 $P_{\mathrm{coll}}$. Summing over elements and over both strands gives
 
-$$P_{\mathrm{FP}}(R) \thickspace \le\thickspace  2\thinspace \binom{n_w}{8}\thinspace \rho^{8} S_{8}\thinspace P_{\mathrm{coll}} \thickspace =\thickspace  2\thinspace \binom{n_w}{8}\thinspace \sum_{e} \left(\frac{m_e}{4^{k}}\right)^{8} P_{\mathrm{coll}} ,$$
+$$P_{\mathrm{FP}}(R) \le2\binom{n_w}{8}\rho^{8} S_{8}P_{\mathrm{coll}} =2\binom{n_w}{8}\sum_{e} \left(\frac{m_e}{4^{k}}\right)^{8} P_{\mathrm{coll}} ,$$
 
 with $n_w = R-k+1$ read k-mers, $\rho = N_t/4^k$, $S_8 = \sum_e p_e^8$ and
 $p_e = m_e/N_t$. The first form shows where library occupancy enters; the
 second uses $\rho^8 S_8 = \sum_e (m_e/4^k)^8$ and shows that it cancels.
 The expected count for a genome of length $G$ follows as
 
-$$\mathbb{E}[\mathrm{FP}] \thickspace \le\thickspace  \frac{G}{R}\thinspace P_{\mathrm{FP}}(R) .$$
+$$\mathbb{E}[\mathrm{FP}] \le\frac{G}{R}P_{\mathrm{FP}}(R) .$$
 
 Both expressions are upper bounds: the vote term relaxes the fraction and
 ratio rules of Lemma 2, and $P_{\mathrm{coll}}$ bounds a single $m_0$-hit
@@ -227,7 +227,7 @@ how much k-mer content individual elements contribute, not through its size.
    agree within 2 bp. That second requirement is what makes the bound small:
    a random read must both land repeatedly on the same element and preserve
    that element's coordinate ordering.
-2. **The vote-ratio rule ($c_1 \ge 3\thinspace c_2$) breaks the "longest element
+2. **The vote-ratio rule ($c_1 \ge 3c_2$) breaks the "longest element
    dominates" inference.** The $\sum_e (m_e/4^k)^8$ term ranks which
    elements are most likely to collect the required hits, but acceptance also
    demands a 3:1 separation from the runner-up (Lemma 2), a condition the
