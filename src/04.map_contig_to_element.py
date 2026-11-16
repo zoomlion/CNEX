@@ -27,8 +27,8 @@ def parse_args():
                    help="Directory with per-species assembly results (default: results/assemble)")
     p.add_argument("--results-dir", default="results",
                    help="Results root directory (for backward compat, deprecated)")
-    p.add_argument("--max-elements", type=int, default=100,
-                   help="Max number of CNE elements to process (0=all)")
+    p.add_argument("--max-elements", type=int, default=0,
+                   help="Max number of CNE elements to process (default: 0 = all)")
     p.add_argument("--min-species", type=int, default=3,
                    help="Min number of species required per element")
     p.add_argument("-o", "--outdir", default="results/fasta",

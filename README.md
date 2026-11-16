@@ -1,216 +1,318 @@
-# CNEX — Conserved Non-coding Element Discovery
+<div align="center">
 
-Fast identification of conserved non-coding elements (CNEs) from whole-genome sequences. Supports both sequencing reads and direct genome FASTA input. Key features:
+<img src="docs/figures/banner.svg" width="660" alt="CNEX">
 
-- **Ultra-fast sliding-window genome mode** (~33 s validation for human at 6X/16 threads; full validate+assemble pipeline ~3 min)
-- **k-mer guided assembly** — De Bruijn graph with element-specific k-mer prior
-- **SNP/INDEL detection** via De Bruijn bubble scanning
-- **Phylogeny pipeline** — concat with IQ-TREE 3 / RAXML-NG
+**Conserved Non-coding Element eXplorer**
+
+<sub>Fast, reproducible CNE discovery from whole genomes or sequencing reads</sub>
+
+<br>
+
+[![release](https://img.shields.io/github/v/tag/zoomlion/CNEX?label=release&color=1f2937)](https://github.com/zoomlion/CNEX/tags)
+[![license](https://img.shields.io/badge/license-MIT-1f2937)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-linux-6b7280)]()
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-6b7280)]()
+
+<br>
+
+[**Install**](#install) · [Quick start](#quick-start) · [How it works](#how-it-works) ·
+[Commands](#commands) · [Reads mode](#reads-mode) · [Phylogeny](#phylogeny) ·
+[Docs](docs/) · [Benchmark](benchmark/README.md)
+
+</div>
+
+---
+
+<table>
+<tr>
+<td align="center" width="33%">
+
+**k-mer primed**
+
+Element-specific confident k-mers steer the de Bruijn graph, so contigs stay on target.
+
+</td>
+<td align="center" width="33%">
+
+**One pipeline, two inputs**
+
+Multi-species genome FASTA or paired-end reads — same validate → assemble path.
+
+</td>
+<td align="center" width="33%">
+
+**SNP / INDEL in the same pass**
+
+`--snp` walks the de Bruijn bubbles and writes `variants.tsv` plus a GFA of
+alternative paths — no separate variant-calling step.
+
+</td>
+</tr>
+</table>
 
 ## Install
+
+**Requirements:** Linux · C++17 compiler · Python ≥ 3.8 · optional phylogeny
+tools (see [Dependencies](#dependencies)).
 
 ```bash
 git clone --recurse-submodules git@github.com:zoomlion/CNEX.git
 cd CNEX
-make && make install
-cnex setup
+make -j && make install
+cp config.example.py config.py     # required: cnex imports config.py
+cnex setup                         # checks binaries and optional tools
 ```
 
-## Configuration
+`make install` places `mertable`, `validate`, `assemble` and `pigz` in `bin/`.
+`config.py` is local and git-ignored; `config.example.py` holds the tracked
+defaults and tool paths.
+
+## Quick start
+
+**1 · Build the k-mer table**
 
 ```bash
-cp config.example.py config.py
+bin/mertable most-cons-cne.filtered.fa -k 13 -c 4 -t 16 -o mers_table.tsv
 ```
 
-`config.py` is a local file (git-ignored); `config.example.py` holds the tracked
-defaults.
-
-Key settings in `config.py`:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `THREADS` | 20 | Worker count: MAFFT parallelism, IQ-TREE / RAXML-NG threads |
-| `MIN_CNE_PER_SPECIES` | 100 | Minimum CNEs per species to retain |
-| `DEFAULT_METHOD` | `concat` | `concat`, `astral`, or `both` |
-| `MAFFT_MODE` | `auto` | MAFFT mode: `ginsi` (high precision) / `auto` / `fftn2` (fastest) |
-| `IQTREE_MODEL` | `MFP` | IQ-TREE model when `--species-file` is used (small set, model search) |
-| `IQTREE_MODEL_FULL` | `GTR+F+R4` | IQ-TREE model for the full species run (large set, FreeRate) |
-| `RAXML_MODEL` | `GTR+R4` | RAXML-NG single model (unpartitioned) |
-| `RAXML_BS` | 200 | RAXML-NG bootstrap replicates |
-| `ELEMENT_TAGS_FILE` | `""` | Path to element_tags.tsv for per-type filtering |
-| `PARTITION` | `True` | Output partition file for IQ-TREE |
-| `DRY_RUN` | `True` | Generate scripts only; use `--submit` to execute |
-
-## Quick Start
+**2 · Validate and assemble every genome**
 
 ```bash
-# 1. Multi-species: validate + assemble
-#    --cne builds the k-mer table from a reference CNE MSA; alternatively
-#    pass an existing table with --mers mers_table.tsv
-cnex pipeline genomes/ --cne blocks_10k.fa -t 16 -j 8 -o results --trim
-
-# 2. Group per-species contigs into per-element multi-species FASTAs
-#    (--max-elements 0 = all elements; the default processes only the first 100)
-python3 src/04.map_contig_to_element.py --max-elements 0 --parallel 8
-
-# 3. Align + build trees
-python3 src/05.element_phylo.py --max-elements 0            # dry-run: write run.sh scripts
-python3 src/05.element_phylo.py --max-elements 0 --submit   # execute
+cnex pipeline genomes/*.fa --mers mers_table.tsv -t 16 -j 4 -o results --trim
 ```
 
-For a single genome instead of a whole set:
+**3 · Group per-species contigs into per-element FASTA**
 
 ```bash
-cnex validate genome.fa --mers mers_table.tsv -t 16 -o out/
-cnex assemble out/ --mers mers_table.tsv -o contigs.fa
+python3 src/04.map_contig_to_element.py \
+    --assemble-dir results/assemble -o results/fasta \
+    --min-species 3 --parallel 8
 ```
 
-For paired-end reads, the validated reads are written as `Assemble.*.reads`
-and can be assembled directly:
+**4 · Align and build trees**
 
 ```bash
-cnex validate reads_R1.fq.gz reads_R2.fq.gz \
-  --mers mers_table.tsv --type fastq -t 4 \
-  --rescue-panels blocks.fa --rescue-tau 0.90 --t3 "1.5,5,25" \
-  -o out/
-cnex assemble out/ --mers mers_table.tsv -o contigs.fa
+# dry-run: writes run.sh scripts
+python3 src/05.element_phylo.py --elements-dir results/fasta -t 16
+# execute
+python3 src/05.element_phylo.py --elements-dir results/fasta -t 16 --submit
 ```
 
-`blocks.fa` is the leave-one-out block MSA used for the T3 panel rescue;
-`--rescue-tau` is required when `--rescue-panels` is given.
+Expected output:
 
-### Key CLI parameters
+```text
+results/
+├── assemble/<genome>/contigs.fa
+├── assemble/<genome>/Assemble.*.reads
+├── fasta/<element>.fasta
+├── aln/*.trimmed.aln
+└── iqtree/all/full/{supermatrix.fa, partitions.txt, iqtree.treefile}
+```
 
-`cnex` passes only explicit overrides to the C++ binaries; the defaults below
-are the binary defaults.
+> Both scripts process every element by default; pass `--max-elements N` to
+> preview a subset.
 
-| Parameter | Default | Meaning |
+Starting from an MSA instead of a prebuilt table:
+
+```bash
+cnex pipeline genomes/*.fa --cne most-cons-cne.fa -t 16 -j 4 -o results --trim
+```
+
+`--cne` runs `src/00.filter_msa.py` (`--min-species 8 --min-avg-len 50`) and then
+`mertable` before validation. Pass `--mers` to skip both steps.
+
+## How it works
+
+<p align="center">
+  <img src="docs/figures/pipeline.svg" width="860" alt="input → validate → assemble → map → phylogeny">
+</p>
+
+`cnex pipeline` covers **validate → assemble** (stages 02–03, plus 00–01 when
+`--cne` is given). Mapping and phylogeny are separate scripts, so each step can
+be re-run or swapped independently.
+
+Every read or genome window is matched against the confident k-mer table; hits
+whose offsets agree on the same element are chained and must pass the vote
+threshold before an element is called. Assembly then walks the de Bruijn graph
+restricted to that element's k-mers.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `cnex validate` | assign reads or genome windows to CNE elements |
+| `cnex assemble` | per-element de Bruijn assembly |
+| `cnex pipeline` | validate + assemble across many genomes |
+| `cnex setup` | check binaries and optional phylogeny tools |
+| `mertable` | build the confident k-mer table from a block MSA |
+
+<details>
+<summary><b>Common options</b></summary>
+
+| Option | Default | Meaning |
 |---|---:|---|
 | `validate -t` | 4 | threads |
 | `validate --type` | auto | `genome` or `fastq` |
-| `validate --vote-frac` | 0.05 | minimum vote fraction for the top element |
-| `validate --max-assign` | 3 | drop k-mers with more than this many element/locus assignments |
-| `validate --t3` | `1.5,5,25` | T3 near-miss gate row (`rv,mc,ms`) |
-| `validate --tiers` | none | extra OR-gate rows appended to T1+T2 |
-| `validate --rescue-panels` | off | per-element panels for SW rescue |
-| `validate --rescue-tau` | — | normalized SW threshold; required with panels |
+| `validate --max-assign` | 3 | drop k-mers with more element/locus assignments |
+| `validate --t3` | `1.5,5,25` | near-miss gate row `rv,mc,ms` |
+| `validate --rescue-panels` | off | leave-one-out panels for SW rescue |
+| `validate --rescue-tau` | — | normalized SW threshold (required with panels) |
 | `validate --window-size` / `--step-size` | 150 / 25 | genome sliding window (~6X) |
-| `assemble -k` | 19 | single-k mode; reads mode uses `--multi-k` by default |
+| `assemble -k` | 19 | single-k mode |
 | `assemble --multi-k` | 27 | reads-mode k list |
-| `assemble --min-count` | 1 | minimum (k+1)-mer occurrence |
-| `assemble --trim` | on | trim to confident k-mer region; use `--no-trim` to disable |
-| `assemble --trim-margin` | 10 | bp kept beyond the first/last element k-mer |
-| `assemble --max-assign` | 3 | must match validate |
+| `assemble -t` | 4 | threads |
 | `assemble --max-reads` | 200 | max reads per element/locus |
-| `assemble --max-loci-gap` | 5000 | max gap for genome-mode locus clustering |
-| `assemble --snp` | off | scan candidate SNPs from validated reads |
+| `assemble --max-loci-gap` | 5000 | genome-mode locus clustering gap |
+| `assemble --trim` / `--trim-margin` | on / 10 | trim to confident k-mer region |
+| `assemble --snp` | off | emit `variants.tsv` + GFA bubbles |
 
-### Input formats
+Full reference: **[docs/cli.md](docs/cli.md)**.
 
-`--cne` expects a `###`-delimited block MSA (each block a FASTA alignment,
-headers `>Species.contig[+-]:start-end`). Whole-genome alignments in **MAF**
-format (UCSC Multiz/TBA, or Cactus exported with `hal2maf`) are also
-supported: convert them first with
+</details>
 
-```bash
-python3 utils/maf_convert.py alignment.maf          # -> most-cons-cne.fa (.maf.gz ok)
-python3 src/00.filter_msa.py most-cons-cne.fa       # -> most-cons-cne.filtered.fa
-cnex pipeline genomes/ --cne most-cons-cne.filtered.fa ...
-```
-
-`maf_convert.py` rewrites each MAF block as a `###`-delimited FASTA block
-(coordinates preserved); use `-o FILE` to change the output path.
-
-## Phylogeny Pipeline
-
-### Workflow
-
-```
-per-element FASTA
-    → MAFFT              (one MSA per element,  results/aln/all/)
-    → trimal             (drop gap-rich columns → *.trimmed.aln)
-    → concat_msa         (supermatrix per tag: all / intergenic / intron)
-    → IQ-TREE 3 + RAXML-NG
-```
-
-`--species-whitelist FILE` (one species per line) restricts tree building to a
-subset of species; empty = use all species.
-
-### Per-Tag Supermatrix
-
-One supermatrix per tag (all/intergenic/intron), built without quantile filtering.
-Per-element species-coverage filtering (`--concat-cov`, default 75) keeps only
-elements present in ≥75% of species; `--concat-cov 0` disables the filter. Each
-tag emits a `full/` supermatrix and (when the filter is on) a `cov75/` one:
-
-- `--concat-tool` (default `both`): write IQ-TREE 3 and/or RAXML-NG commands into
-  `run.sh`. IQ-TREE keeps `-p` partitions with model selection (`MFP`, or
-  `GTR+F+R4` for large sets); RAXML-NG runs one unpartitioned model
-  (`--raxml-model`, default `GTR+R4`) with `--raxml-bs` bootstrap replicates
-  (default 200).
-- Tree outputs are prefixed per tool: `iqtree.*` / `raxml.*`.
-
-```
-results/iqtree/{type}/
-├── all/full/run.sh      # full supermatrix
-├── all/cov75/run.sh     # coverage-filtered supermatrix
-└── run_all.sh
-```
-
-### Element Tags (Optional)
-
-Classify elements as intron vs intergenic (elements overlapping exons are dropped):
+## Reads mode
 
 ```bash
-# --gff-dir is optional: GFF3 files named by species (*.gff3, .gz ok)
-python3 utils/classify_elements.py \
-    --msa blocks_10k.fa \
-    --gff-dir gff/ \
-    -o element_tags.tsv
+cnex validate reads_R1.fq.gz reads_R2.fq.gz \
+    --mers mers_table.tsv --type fastq -t 16 \
+    --rescue-panels blocks.fa --rescue-tau 0.90 --t3 "1.5,5,25" \
+    -o out/
+cnex assemble out/ --mers mers_table.tsv -t 16 -o contigs.fa
 ```
 
-Without `--gff-dir` (or if no GFF matches), every element is labeled
-`intergenic`. Then set `ELEMENT_TAGS_FILE = "element_tags.tsv"` in `config.py`,
-or pass `--element-tags element_tags.tsv` on the CLI.
+- `--rescue-panels` requires `--rescue-tau`; panels are the leave-one-out block MSA.
+- Assembly tries every k in `--multi-k` (default `27`) and keeps the best-scoring
+  contig per element. `-k N` or `--no-multi-k` forces single-k mode.
+- `--snp` writes `variants.tsv` and `snp_elements.gfa`.
+- `--no-polish` disables the reads-mode consensus polish.
 
-With tags, each type (`all`, `intergenic`, `intron`) gets its own subdirectory
-and an independent supermatrix.
+## Input formats
 
-### Run Modes
+`--cne` and `mertable` expect a `###`-delimited block MSA: each block is a FASTA
+alignment with headers `>Species.contig[+-]:start-end`.
 
-| Mode | Behavior |
-|------|----------|
-| **dry-run** (default) | Generate `run.sh` + `run_all.sh` only; execute via `bash run_all.sh` |
-| **`--submit`** | Generate and execute immediately |
+Whole-genome alignments in MAF (UCSC Multiz/TBA, Cactus `hal2maf`) can be
+converted first:
+
+```bash
+python3 utils/maf_convert.py alignment.maf        # -> most-cons-cne.fa
+python3 src/00.filter_msa.py most-cons-cne.fa     # -> most-cons-cne.filtered.fa
+```
+
+## Phylogeny
+
+```text
+per-element FASTA → MAFFT → trimAl → supermatrix → IQ-TREE 3 / RAxML-NG
+                                            └──► ASTRAL (gene trees)
+```
+
+| Option | Effect |
+|---|---|
+| `--method` | `concat` (default), `astral`, or `both` |
+| `--mafft-mode` | `auto` (default), `ginsi` (high precision), `fftn2` (fastest) |
+| `--concat-cov` | min species coverage per element (default 75; `0` = off) |
+| `--concat-tool` | `iqtree`, `raxml`, or `both` (default) |
+| `--element-tags` | split supermatrices by element type (all / intergenic / intron) |
+| `--submit` | execute the generated `run.sh` (default: dry-run) |
+
+### Species groups: `--species-file`
+
+Build **one tree per species subset** instead of a single tree over all species.
+
+```text
+#birds
+Gallus_gallus
+GCA_951394365.1
+GCA_036873955.1
+
+#mammals
+Homo_sapiens
+Mus_musculus
+```
+
+- `#name` starts a group; every other line is a species ID that must match the
+  FASTA headers exactly. A file without `#` lines is a single group named after
+  the file stem.
+- Each group gets a re-filtered alignment set in `aln/<group>/`, then a
+  supermatrix and tree under `iqtree/<group>/all/{full,cov75}/`.
+- Groups with fewer than 2 usable species are skipped (a notice is printed).
+- **No `all` tree is produced** unless you define a group containing every
+  species.
+- In this mode element tags are ignored.
+- Not to be confused with `--species-whitelist`, which filters species for a
+  single tree instead of producing several.
 
 ## Output
 
-| File | Description |
-|------|-------------|
-| `results/aln/*.trimmed.aln` | Per-element trimmed alignments (trimal) |
-| `results/iqtree/{type}/all/full/iqtree.treefile` | IQ-TREE tree (prefix `iqtree.`) |
-| `results/iqtree/{type}/all/full/raxml.raxml.bestTree` | RAXML-NG tree (prefix `raxml.`) |
-| `variants.tsv` | SNP/INDEL candidates (from `--snp`) |
-| `snp_elements.gfa` | GFA 1.0 graph with bubble paths |
+| Path | Content |
+|---|---|
+| `msa.filtered.fa` | filtered block MSA (`--cne` only) |
+| `mers_table.tsv` | confident k-mer table (`--cne` only) |
+| `results/assemble/<genome>/Assemble.*.reads` | validated reads or windows (internal format) |
+| `results/assemble/<genome>/contigs.fa` | assembled contigs |
+| `results/fasta/<element>.fasta` | per-element multi-species FASTA |
+| `results/aln/*.trimmed.aln` | per-element trimmed alignments |
+| `results/iqtree/.../iqtree.treefile` | IQ-TREE output |
+| `results/iqtree/.../raxml.raxml.bestTree` | RAxML-NG output |
+| `variants.tsv`, `snp_elements.gfa` | `--snp` output |
+
+## Reproducibility
+
+Assembly is deterministic: the same input produces the same contigs regardless
+of thread count or how validated reads are split into files. Reads-mode contigs
+are byte-identical to `v1.0.0` on the reference benchmark (see `benchmark/`).
+
+A k-mer table may be accompanied by a `.cnexidx` sidecar — a memory-mapped cache
+of the parsed index. Set `CNEX_NO_BIN_CACHE=1` to disable it.
 
 ## Dependencies
 
-| Tool | Method | Default path |
-|------|--------|-------------|
-| MAFFT | phylogeny | `mafft` (aligner; `--mafft-mode`: ginsi high-precision / auto default / fftn2 fastest) |
-| IQ-TREE 3 | phylogeny | `iqtree3` |
-| RAXML-NG | phylogeny | `raxml-ng` (single unpartitioned model; `--raxml-model` GTR+R4, `--raxml-bs` 200; https://github.com/amkozlov/raxml-ng) |
-| trimal | phylogeny | `trimal` (alignment trimming) |
-| bedtools | classification | `bedtools` (for `classify_elements.py`) |
+| Tool | Role | Default |
+|---|---|---|
+| MAFFT | per-element alignment | `mafft` |
+| trimAl | alignment trimming | `trimal` |
+| IQ-TREE 3 | concatenation trees | `iqtree3` |
+| RAxML-NG | concatenation trees (alternative) | `raxml-ng` |
+| FastTree | ASTRAL input gene trees | `FastTree` |
+| ASTRAL | coalescent trees | `astral` |
+| bedtools | element classification | `bedtools` |
+
+Bundled as submodules: **parasail** (SIMD alignment), **pigz** + **zlib-ng**
+(compression), **robin-map**. Tool paths live in `config.py`.
+
+## Troubleshooting
+
+<details>
+<summary><b>Common problems</b></summary>
+
+| Symptom | Cause / fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'config'` | `cp config.example.py config.py` |
+| `no valid groups from species file` | species IDs must match the FASTA headers exactly, and each group needs ≥2 species |
+| Validation finds nothing | the k-mer table and `--max-assign` must match between `validate` and `assemble`; check `-k` used by `mertable` |
+| Empty table after `--cne` | filter thresholds too strict — `--min-species 8` can drop most blocks on small MSAs; filter manually first |
+| `IQ-TREE 3 not found` / `FastTree not found` | install the tool or set its path in `config.py`; `cnex setup` lists everything |
+
+</details>
 
 ## Benchmark
 
-Genome-mode validation takes ~33 s for the human genome at 6X with 16 threads
-in our benchmark; the full validate+assemble pipeline is ~3 min. The full
-benchmark (accuracy and timing against MMseqs2 / BLASTN) and the reads-depth
-benchmark against Megahit+MMseqs2 live in `benchmark/` — see
-`benchmark/README.md`.
+Accuracy and timing against MMseqs2 / BLASTN, plus the reads-depth benchmark
+against Megahit + MMseqs2, are in [`benchmark/`](benchmark/README.md).
+Background notes are in [`docs/`](docs/).
+
+## Citation
+
+```bibtex
+@software{cnex,
+  title   = {CNEX: Conserved Non-coding Element eXplorer},
+  author  = {Zheng, Jiangmin and Wang, Kun},
+  year    = {2026},
+  url     = {https://github.com/zoomlion/CNEX},
+  license = {MIT}
+}
+```
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

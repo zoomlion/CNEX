@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 170" width="860" height="170" role="img" aria-label="CNEX pipeline">
+  <rect width="860" height="170" fill="#ffffff"/>
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7280"/>
+    </marker>
+  </defs>
+  <g font-family="Arial, Liberation Sans, Helvetica, sans-serif">
+    <!-- boxes -->
+    <g>
+      <rect x="45"  y="42" width="130" height="62" rx="8" fill="#f3f4f6" stroke="#cbd5e1"/>
+      <text x="110" y="70" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2937">input</text>
+      <text x="110" y="90" text-anchor="middle" font-size="11.5" fill="#6b7280">genome / reads</text>
+    </g>
+    <g>
+      <rect x="205" y="42" width="130" height="62" rx="8" fill="#f3f4f6" stroke="#cbd5e1"/>
+      <text x="270" y="70" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2937">validate</text>
+      <text x="270" y="90" text-anchor="middle" font-size="11.5" fill="#6b7280">element assignment</text>
+    </g>
+    <g>
+      <rect x="365" y="42" width="130" height="62" rx="8" fill="#f3f4f6" stroke="#cbd5e1"/>
+      <text x="430" y="70" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2937">assemble</text>
+      <text x="430" y="90" text-anchor="middle" font-size="11.5" fill="#6b7280">per-element contigs</text>
+    </g>
+    <g>
+      <rect x="525" y="42" width="130" height="62" rx="8" fill="#f3f4f6" stroke="#cbd5e1"/>
+      <text x="590" y="70" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2937">map</text>
+      <text x="590" y="90" text-anchor="middle" font-size="11.5" fill="#6b7280">per-element FASTA</text>
+    </g>
+    <g>
+      <rect x="685" y="42" width="130" height="62" rx="8" fill="#eef4ff" stroke="#93b4f5"/>
+      <text x="750" y="70" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2937">phylogeny</text>
+      <text x="750" y="90" text-anchor="middle" font-size="11.5" fill="#6b7280">MAFFT &#8594; trees</text>
+    </g>
+
+    <!-- arrows -->
+    <line x1="178" y1="73" x2="201" y2="73" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arw)"/>
+    <line x1="338" y1="73" x2="361" y2="73" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arw)"/>
+    <line x1="498" y1="73" x2="521" y2="73" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arw)"/>
+    <line x1="658" y1="73" x2="681" y2="73" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arw)"/>
+
+    <!-- stage labels -->
+    <g font-size="11" fill="#9ca3af">
+      <text x="110" y="132" text-anchor="middle">00/01 optional</text>
+      <text x="270" y="132" text-anchor="middle">02</text>
+      <text x="430" y="132" text-anchor="middle">03</text>
+      <text x="590" y="132" text-anchor="middle">04</text>
+      <text x="750" y="132" text-anchor="middle">05</text>
+    </g>
+    <text x="45" y="155" font-size="11.5" fill="#6b7280">
+      cnex pipeline covers input &#8594; assemble; mapping and phylogeny are separate scripts
+    </text>
+  </g>
+</svg>

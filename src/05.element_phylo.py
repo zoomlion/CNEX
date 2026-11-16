@@ -73,7 +73,8 @@ def parse_args():
     p.add_argument("--min-site-occupancy", type=float, default=0.5)
     p.add_argument("-t", "--threads", type=int, default=C.THREADS,
                    help="Worker count: MAFFT/FastTree parallelism, IQ-TREE/ASTRAL threads")
-    p.add_argument("--max-elements", type=int, default=100)
+    p.add_argument("--max-elements", type=int, default=0,
+                   help="Max elements to process (default: 0 = all)")
     p.add_argument("--resume", action="store_true", default=True)
     p.add_argument("--no-resume", action="store_false", dest="resume")
     p.add_argument("--submit", dest="dry_run", action="store_false",
