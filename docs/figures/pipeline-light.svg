@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 132" width="860" height="132" role="img" aria-label="CNEX pipeline: input, validate, assemble, map, phylogeny">
+  <g font-family="Arial, Liberation Sans, Helvetica, sans-serif">
+    <defs><marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#656d76"/></marker></defs>
+    <rect x="45" y="30" width="130" height="62" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="110" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">input</text>
+    <text x="110" y="77" text-anchor="middle" font-size="11.5" fill="#656d76">genome / reads</text>
+    <text x="110" y="116" text-anchor="middle" font-size="10.5" fill="#656d76">00/01 optional</text>
+    <rect x="205" y="30" width="130" height="62" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="270" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">validate</text>
+    <text x="270" y="77" text-anchor="middle" font-size="11.5" fill="#656d76">element assignment</text>
+    <text x="270" y="116" text-anchor="middle" font-size="10.5" fill="#656d76">02</text>
+    <rect x="365" y="30" width="130" height="62" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="430" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">assemble</text>
+    <text x="430" y="77" text-anchor="middle" font-size="11.5" fill="#656d76">per-element contigs</text>
+    <text x="430" y="116" text-anchor="middle" font-size="10.5" fill="#656d76">03</text>
+    <rect x="525" y="30" width="130" height="62" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+    <text x="590" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">map</text>
+    <text x="590" y="77" text-anchor="middle" font-size="11.5" fill="#656d76">per-element FASTA</text>
+    <text x="590" y="116" text-anchor="middle" font-size="10.5" fill="#656d76">04</text>
+    <rect x="685" y="30" width="130" height="62" rx="8" fill="#ddf4ff" stroke="#54aeff"/>
+    <text x="750" y="58" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">phylogeny</text>
+    <text x="750" y="77" text-anchor="middle" font-size="11.5" fill="#656d76">MAFFT &#8594; trees</text>
+    <text x="750" y="116" text-anchor="middle" font-size="10.5" fill="#656d76">05</text>
+    <line x1="179" y1="61" x2="201" y2="61" stroke="#656d76" stroke-width="1.6" marker-end="url(#arw)"/>
+    <line x1="339" y1="61" x2="361" y2="61" stroke="#656d76" stroke-width="1.6" marker-end="url(#arw)"/>
+    <line x1="499" y1="61" x2="521" y2="61" stroke="#656d76" stroke-width="1.6" marker-end="url(#arw)"/>
+    <line x1="659" y1="61" x2="681" y2="61" stroke="#656d76" stroke-width="1.6" marker-end="url(#arw)"/>
+  </g>
+</svg>
