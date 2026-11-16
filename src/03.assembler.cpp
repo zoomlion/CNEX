@@ -721,83 +721,47 @@ static std::vector<int> cluster_reads_by_shared_kmers(
     // Matches encode_mer_at(..., uint32_t&) wraparound semantics when k > 16.
     const uint32_t mask = (k >= 16) ? 0xFFFFFFFFu : ((1u << (2 * k)) - 1u);
 
-    thread_local std::vector<std::pair<uint32_t, int>> occ_pairs;
-    occ_pairs.clear();
+    // Deliberately the same container type / insertion order as the pre-optimisation
+    // implementation: bucket iteration order fixes the floating-point accumulation
+    // order below, which decides borderline merges at kClusterMinScore. Reproducing
+    // it is what keeps the assembly output bit-for-bit identical to the old release.
+    // Do NOT add reserve(): it would change bucket_count and therefore the order.
+    std::unordered_map<uint32_t, std::vector<int>> occ;
     for (int i = 0; i < n; ++i) {
         const std::string& s = reads[i];
         const int slen = static_cast<int>(s.size());
         uint32_t rolling = 0;
         int valid_run = 0;
         for (int p = 0; p < slen; ++p) {
-            int8_t b = base_lut[static_cast<unsigned char>(s[p])];
+            const int8_t b = base_lut[static_cast<unsigned char>(s[p])];
             if (b < 0) { valid_run = 0; rolling = 0; continue; }
             rolling = ((rolling << 2) | static_cast<uint32_t>(b)) & mask;
-            if (++valid_run >= k) {
-                occ_pairs.emplace_back(rolling, i);
+            if (++valid_run < k) continue;
+            auto& lst = occ[rolling];
+            if (!lst.empty() && lst.back() == i) continue;
+            lst.push_back(i);
+        }
+    }
+
+    std::unordered_map<uint64_t, double> pair_score;
+    for (const auto& kv : occ) {
+        const auto& lst = kv.second;
+        if (lst.size() < 2 || lst.size() > 128) continue;
+        const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(lst.size());
+        for (size_t a = 0; a + 1 < lst.size(); ++a) {
+            for (size_t b = a + 1; b < lst.size(); ++b) {
+                int x = lst[a], y = lst[b];
+                if (x > y) std::swap(x, y);
+                pair_score[(static_cast<uint64_t>(x) << 32) |
+                           static_cast<uint32_t>(y)] += w;
             }
         }
     }
-    std::sort(occ_pairs.begin(), occ_pairs.end());
-    occ_pairs.erase(std::unique(occ_pairs.begin(), occ_pairs.end()), occ_pairs.end());
-
-    if (n <= 512) {
-        thread_local std::vector<double> pair_mat;
-        pair_mat.assign(static_cast<size_t>(n) * static_cast<size_t>(n), 0.0);
-        size_t r0 = 0;
-        const size_t m = occ_pairs.size();
-        while (r0 < m) {
-            uint32_t code = occ_pairs[r0].first;
-            size_t r1 = r0 + 1;
-            while (r1 < m && occ_pairs[r1].first == code) ++r1;
-            const size_t cnt = r1 - r0;
-            if (cnt >= 2 && cnt <= 128) {
-                const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(cnt);
-                for (size_t a = r0; a + 1 < r1; ++a) {
-                    int x = occ_pairs[a].second;
-                    double* row = pair_mat.data() + static_cast<size_t>(x) * static_cast<size_t>(n);
-                    for (size_t b = a + 1; b < r1; ++b) {
-                        row[occ_pairs[b].second] += w;
-                    }
-                }
-            }
-            r0 = r1;
-        }
-        for (int x = 0; x + 1 < n; ++x) {
-            const double* row = pair_mat.data() + static_cast<size_t>(x) * static_cast<size_t>(n);
-            for (int y = x + 1; y < n; ++y) {
-                if (row[y] < min_score) continue;
-                int a = find_root(x);
-                int b = find_root(y);
-                if (a != b) parent[b] = a;
-            }
-        }
-    } else {
-        tsl::robin_map<uint64_t, double> pair_score;
-        size_t r0 = 0;
-        const size_t m = occ_pairs.size();
-        while (r0 < m) {
-            uint32_t code = occ_pairs[r0].first;
-            size_t r1 = r0 + 1;
-            while (r1 < m && occ_pairs[r1].first == code) ++r1;
-            const size_t cnt = r1 - r0;
-            if (cnt >= 2 && cnt <= 128) {
-                const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(cnt);
-                for (size_t a = r0; a + 1 < r1; ++a) {
-                    for (size_t b = a + 1; b < r1; ++b) {
-                        int x = occ_pairs[a].second, y = occ_pairs[b].second;
-                        pair_score[(static_cast<uint64_t>(x) << 32) |
-                                   static_cast<uint32_t>(y)] += w;
-                    }
-                }
-            }
-            r0 = r1;
-        }
-        for (const auto& kv : pair_score) {
-            if (kv.second < min_score) continue;
-            int a = find_root(static_cast<int>(kv.first >> 32));
-            int b = find_root(static_cast<int>(kv.first & 0xffffffffu));
-            if (a != b) parent[b] = a;
-        }
+    for (const auto& kv : pair_score) {
+        if (kv.second < min_score) continue;
+        int a = find_root(static_cast<int>(kv.first >> 32));
+        int b = find_root(static_cast<int>(kv.first & 0xffffffffu));
+        if (a != b) parent[b] = a;
     }
     for (int i = 0; i < n; ++i) parent[i] = find_root(i);
     return parent;
