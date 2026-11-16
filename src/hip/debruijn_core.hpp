@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -285,8 +286,9 @@ inline void extend_backward(
     tsl::robin_map<std::string, int> visited;
     for (const auto& n : path) visited[n] = 1;
 
+    std::vector<std::string> bwd;
     std::string current = path.front();
-    while (path.size() < max_path_length) {
+    while (path.size() + bwd.size() < max_path_length) {
         auto it = rev.find(current);
         if (it == rev.end() || it->second.empty()) break;
 
@@ -310,8 +312,14 @@ inline void extend_backward(
         }
         if (best_prev.empty()) break;
         visited[best_prev] = 1;
-        path.insert(path.begin(), best_prev);
+        bwd.push_back(best_prev);
         current = best_prev;
+    }
+    if (!bwd.empty()) {
+        std::reverse(bwd.begin(), bwd.end());
+        path.insert(path.begin(),
+                    std::make_move_iterator(bwd.begin()),
+                    std::make_move_iterator(bwd.end()));
     }
 }
 
@@ -692,6 +700,636 @@ inline bool scan_snps(  // returns true if any variant was found
             const char* type = (branch_len == 1) ? "SNP" : "INDEL";
             char ref_base = next_main.back();
             char alt_base = branch.back();
+
+            out << ele_id << "\t" << contig_pos
+                << "\t" << ref_base << "\t" << alt_base
+                << "\t" << ref_cov << "\t" << alt_cov
+                << "\t" << af << "\t" << branch_len
+                << "\t" << type << "\n";
+            has_var = true;
+        }
+    }
+    return has_var;
+}
+
+
+// ─── Indexed integer-ID De Bruijn graph (zero string allocations during traversal) ───
+
+struct IndexedGraph {
+    int V = 0;
+    std::vector<std::string_view> nodes;   // node id -> k-mer view into caller's reads
+    std::vector<int> adj_off;              // size V + 1
+    std::vector<int> adj_dst;              // size E (sorted ascending per node)
+    std::vector<int> rev_off;              // size V + 1
+    std::vector<int> rev_dst;              // size E
+    std::vector<int> in_deg;               // size V
+    std::vector<int> out_deg;              // size V
+    std::vector<int> kmer_counts;          // populated when need_kcounts
+    std::vector<int> edge_counts;          // populated when need_ecounts (indexed by adj_dst slot)
+
+    bool empty() const { return V == 0; }
+
+    int find_edge(int u, int v) const {
+        int b = adj_off[u], e = adj_off[u + 1];
+        for (int ei = b; ei < e; ++ei) {
+            if (adj_dst[ei] == v) return ei;
+        }
+        return -1;
+    }
+};
+
+inline IndexedGraph build_indexed_graph(
+    const std::vector<std::string>& reads, uint64_t k, int min_count = 1,
+    bool need_kcounts = false, bool need_ecounts = false
+) {
+    IndexedGraph g;
+    tsl::robin_map<std::string_view, int> sv_raw;
+    sv_raw.reserve(reads.size() * 10);
+
+    tsl::robin_map<std::string_view, int> raw_kcounts;
+    if (need_kcounts) raw_kcounts.reserve(reads.size() * 2);
+
+    for (const auto& read : reads) {
+        if (read.length() < (k + 1)) continue;
+        std::string_view sv(read);
+        if (need_kcounts) {
+            for (size_t i = 0; i <= read.length() - k; ++i) {
+                raw_kcounts[sv.substr(i, k)]++;
+            }
+        }
+        for (size_t i = 0; i <= read.length() - (k + 1); ++i) {
+            sv_raw[sv.substr(i, k + 1)]++;
+        }
+    }
+
+    std::vector<std::pair<std::string_view, std::string_view>> valid_edges;
+    valid_edges.reserve(sv_raw.size());
+    for (const auto& kv : sv_raw) {
+        if (kv.second < min_count) continue;
+        valid_edges.emplace_back(kv.first.substr(0, k), kv.first.substr(1, k));
+    }
+    if (valid_edges.empty()) return g;
+
+    std::sort(valid_edges.begin(), valid_edges.end());
+    valid_edges.erase(std::unique(valid_edges.begin(), valid_edges.end()),
+                      valid_edges.end());
+
+    std::vector<std::string_view> all_nodes;
+    all_nodes.reserve(valid_edges.size() * 2);
+    for (const auto& e : valid_edges) {
+        all_nodes.push_back(e.first);
+        all_nodes.push_back(e.second);
+    }
+    std::sort(all_nodes.begin(), all_nodes.end());
+    all_nodes.erase(std::unique(all_nodes.begin(), all_nodes.end()), all_nodes.end());
+
+    g.V = static_cast<int>(all_nodes.size());
+    tsl::robin_map<std::string_view, int> id_of;
+    id_of.reserve(static_cast<size_t>(g.V) * 2);
+
+    static const bool use_lex_order = (std::getenv("CNEX_LEX_GRAPH") != nullptr);
+    if (use_lex_order) {
+        g.nodes = std::move(all_nodes);
+        for (int i = 0; i < g.V; ++i) {
+            id_of.emplace(g.nodes[i], i);
+        }
+    } else {
+        // Assign active source IDs in std::unordered_map<string_view> bucket order
+        // so tie-breaks in find_farthest_start_end_nodes / anchored_trace / extend_backward
+        // match baseline's Graph without any std::string or per-node vector allocation.
+        std::unordered_map<std::string_view, int> ukeys;
+        ukeys.reserve(valid_edges.size());
+        for (const auto& e : valid_edges) {
+            ukeys.try_emplace(e.first, 0);
+        }
+        g.nodes.reserve(g.V);
+        for (const auto& kv : ukeys) {
+            int id = static_cast<int>(g.nodes.size());
+            g.nodes.push_back(kv.first);
+            id_of.emplace(kv.first, id);
+        }
+        for (const auto& s : all_nodes) {
+            if (id_of.find(s) == id_of.end()) {
+                int id = static_cast<int>(g.nodes.size());
+                g.nodes.push_back(s);
+                id_of.emplace(s, id);
+            }
+        }
+    }
+
+    const size_t E = valid_edges.size();
+    std::vector<std::pair<int, int>> int_edges;
+    int_edges.reserve(E);
+    g.out_deg.assign(g.V, 0);
+    g.in_deg.assign(g.V, 0);
+    for (const auto& e : valid_edges) {
+        int u = id_of.find(e.first)->second;
+        int v = id_of.find(e.second)->second;
+        int_edges.emplace_back(u, v);
+        ++g.out_deg[u];
+        ++g.in_deg[v];
+    }
+
+    g.adj_off.resize(g.V + 1);
+    g.rev_off.resize(g.V + 1);
+    g.adj_off[0] = 0;
+    g.rev_off[0] = 0;
+    for (int i = 0; i < g.V; ++i) {
+        g.adj_off[i + 1] = g.adj_off[i] + g.out_deg[i];
+        g.rev_off[i + 1] = g.rev_off[i] + g.in_deg[i];
+    }
+    g.adj_dst.resize(E);
+    g.rev_dst.resize(E);
+    std::vector<int> adj_cur = g.adj_off;
+    for (const auto& uv : int_edges) {
+        g.adj_dst[adj_cur[uv.first]++] = uv.second;
+    }
+    std::vector<int> rev_cur = g.rev_off;
+    for (int u = 0; u < g.V; ++u) {
+        for (int ei = g.adj_off[u]; ei < g.adj_off[u + 1]; ++ei) {
+            g.rev_dst[rev_cur[g.adj_dst[ei]]++] = u;
+        }
+    }
+
+    if (need_kcounts) {
+        g.kmer_counts.assign(g.V, 0);
+        for (int i = 0; i < g.V; ++i) {
+            auto kit = raw_kcounts.find(g.nodes[i]);
+            if (kit != raw_kcounts.end()) g.kmer_counts[i] = kit->second;
+        }
+    }
+
+    if (need_ecounts) {
+        g.edge_counts.assign(E, 0);
+        std::vector<uint32_t> edge_epoch(E, 0);
+        uint32_t epoch = 0;
+        for (const auto& read : reads) {
+            if (read.length() < (k + 1)) continue;
+            if (++epoch == 0) {
+                std::fill(edge_epoch.begin(), edge_epoch.end(), 0);
+                epoch = 1;
+            }
+            std::string_view sv(read);
+            for (size_t i = 0; i <= read.length() - (k + 1); ++i) {
+                auto uit = id_of.find(sv.substr(i, k));
+                if (uit == id_of.end()) continue;
+                auto vit = id_of.find(sv.substr(i + 1, k));
+                if (vit == id_of.end()) continue;
+                int ei = g.find_edge(uit->second, vit->second);
+                if (ei >= 0 && edge_epoch[ei] != epoch) {
+                    edge_epoch[ei] = epoch;
+                    ++g.edge_counts[ei];
+                }
+            }
+        }
+    }
+
+    return g;
+}
+
+inline void bfs_distances_idx(const IndexedGraph& g, int start, std::vector<int>& dist,
+                              std::vector<int>& q) {
+    dist.assign(g.V, -1);
+    q.clear();
+    dist[start] = 0;
+    q.push_back(start);
+    for (size_t qi = 0; qi < q.size(); ++qi) {
+        int u = q[qi];
+        int d = dist[u] + 1;
+        for (int ei = g.adj_off[u]; ei < g.adj_off[u + 1]; ++ei) {
+            int v = g.adj_dst[ei];
+            if (dist[v] < 0) {
+                dist[v] = d;
+                q.push_back(v);
+            }
+        }
+    }
+}
+
+inline std::pair<int, int> find_farthest_start_end_nodes_idx(const IndexedGraph& g) {
+    std::vector<std::pair<int, int>> start_scores, end_scores;
+    int first_active = -1;
+    for (int u = 0; u < g.V; ++u) {
+        if (g.out_deg[u] == 0) continue;   // matches Graph iteration (keys have out_deg > 0)
+        if (first_active < 0) first_active = u;
+        int diff = g.out_deg[u] - g.in_deg[u];
+        if (diff > 0) start_scores.emplace_back(u, diff);
+        else if (diff < 0) end_scores.emplace_back(u, -diff);
+    }
+    auto by_score_desc = [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+        return a.second > b.second;
+    };
+    std::sort(start_scores.begin(), start_scores.end(), by_score_desc);
+    std::sort(end_scores.begin(), end_scores.end(), by_score_desc);
+
+    int n_start = std::min(3, static_cast<int>(start_scores.size()));
+    int n_end = std::min(3, static_cast<int>(end_scores.size()));
+    if (n_start == 0 || n_end == 0) {
+        int fallback = (first_active >= 0) ? first_active : 0;
+        return {fallback, fallback};
+    }
+
+    int best_start = -1, best_end = -1, max_dist = -1;
+    std::vector<int> dist, q;
+    q.reserve(g.V);
+    for (int si = 0; si < n_start; ++si) {
+        int st = start_scores[si].first;
+        bfs_distances_idx(g, st, dist, q);
+        for (int ei = 0; ei < n_end; ++ei) {
+            int en = end_scores[ei].first;
+            if (dist[en] > max_dist) {
+                max_dist = dist[en];
+                best_start = st;
+                best_end = en;
+            }
+        }
+    }
+    if (best_start < 0 || best_end < 0) {
+        return {start_scores[0].first, end_scores[0].first};
+    }
+    return {best_start, best_end};
+}
+
+inline std::vector<int> trace_longest_path_idx(
+    const IndexedGraph& g, int start, int end, uint64_t max_path_length,
+    const std::vector<int>* node_scores
+) {
+    std::vector<int> start_dists, q;
+    q.reserve(g.V);
+    bfs_distances_idx(g, start, start_dists, q);
+
+    std::vector<int> path;
+    std::vector<uint8_t> visited(g.V, 0);
+    int current = start;
+    visited[current] = 1;
+
+    while (true) {
+        path.push_back(current);
+        if (path.size() > max_path_length) break;
+        if (current == end) break;
+        int b = g.adj_off[current], e = g.adj_off[current + 1];
+        if (b == e) break;
+
+        int best_next = -1, best_dist = -1, best_score = -1;
+        for (int ei = b; ei < e; ++ei) {
+            int nb = g.adj_dst[ei];
+            if (visited[nb]) continue;
+            int dist = start_dists[nb];
+            if (dist < 0) continue;
+            int sc = node_scores ? (*node_scores)[nb] : 0;
+            if (dist > best_dist || (dist == best_dist && sc > best_score)) {
+                best_dist = dist;
+                best_score = sc;
+                best_next = nb;
+            }
+        }
+        if (best_next < 0) break;
+        current = best_next;
+        visited[current] = 1;
+    }
+
+    // extend_forward
+    current = path.back();
+    while (path.size() < max_path_length) {
+        int b = g.adj_off[current], e = g.adj_off[current + 1];
+        if (b == e) break;
+        int best_next = -1, best_score = -1, best_out = 0;
+        for (int ei = b; ei < e; ++ei) {
+            int nb = g.adj_dst[ei];
+            if (visited[nb]) continue;
+            int sc = node_scores ? (*node_scores)[nb] : 0;
+            int od = g.out_deg[nb];
+            if (sc > best_score || (sc == best_score && od > best_out)) {
+                best_score = sc;
+                best_out = od;
+                best_next = nb;
+            }
+        }
+        if (best_next < 0) break;
+        visited[best_next] = 1;
+        path.push_back(best_next);
+        current = best_next;
+    }
+
+    // extend_backward
+    if (path.size() < max_path_length) {
+        std::vector<int> bwd;
+        current = path.front();
+        while (path.size() + bwd.size() < max_path_length) {
+            int b = g.rev_off[current], e = g.rev_off[current + 1];
+            if (b == e) break;
+            int best_prev = -1, best_score = -1, best_in = 0;
+            for (int ei = b; ei < e; ++ei) {
+                int pv = g.rev_dst[ei];
+                if (visited[pv]) continue;
+                int sc = node_scores ? (*node_scores)[pv] : 0;
+                int idg = g.in_deg[pv];
+                if (sc > best_score || (sc == best_score && idg > best_in)) {
+                    best_score = sc;
+                    best_in = idg;
+                    best_prev = pv;
+                }
+            }
+            if (best_prev < 0) break;
+            visited[best_prev] = 1;
+            bwd.push_back(best_prev);
+            current = best_prev;
+        }
+        if (!bwd.empty()) {
+            std::reverse(bwd.begin(), bwd.end());
+            bwd.insert(bwd.end(), path.begin(), path.end());
+            path = std::move(bwd);
+        }
+    }
+
+    return path;
+}
+
+inline std::vector<int> anchored_trace_idx(
+    const IndexedGraph& g,
+    const std::vector<int>& node_scores,
+    uint64_t max_path_length = 2500,
+    int gap_limit = 3
+) {
+    if (g.empty()) return {};
+    int seed = -1, best_sc = 0, best_deg = 0;
+    for (int u = 0; u < g.V; ++u) {
+        if (g.out_deg[u] == 0) continue;   // matches Graph iteration
+        int sc = node_scores[u];
+        if (sc <= 0) continue;
+        int deg = g.out_deg[u] + g.in_deg[u];
+        if (sc > best_sc || (sc == best_sc && deg > best_deg)) {
+            best_sc = sc;
+            best_deg = deg;
+            seed = u;
+        }
+    }
+    if (seed < 0) return {};
+
+    auto walk = [&](const std::vector<int>& off, const std::vector<int>& dst) {
+        std::vector<int> path;
+        std::vector<uint8_t> visited(g.V, 0);
+        std::vector<uint8_t> seen(g.V, 0);
+        std::vector<int> frontier, next_frontier;
+        int cur = seed;
+        visited[cur] = 1;
+        int gap = 0;
+        while (path.size() + 1 < max_path_length) {
+            path.push_back(cur);
+            int b = off[cur], e = off[cur + 1];
+            if (b == e) break;
+            int chosen = -1, chosen_sc = -1, chosen_deg = 0;
+            for (int ei = b; ei < e; ++ei) {
+                int nx = dst[ei];
+                if (visited[nx]) continue;
+                int sc = node_scores[nx];
+                if (sc <= 0) continue;
+                int deg = g.out_deg[nx] + g.in_deg[nx];
+                if (sc > chosen_sc || (sc == chosen_sc && deg > chosen_deg)) {
+                    chosen = nx; chosen_sc = sc; chosen_deg = deg;
+                }
+            }
+            if (chosen < 0) {
+                if (gap >= gap_limit) break;
+                int allowed = gap_limit - gap;
+                int best_reach = -1;
+                for (int ei = b; ei < e; ++ei) {
+                    int nx = dst[ei];
+                    if (visited[nx]) continue;
+                    seen = visited;
+                    seen[nx] = 1;
+                    frontier.clear();
+                    frontier.push_back(nx);
+                    int reach = -1;
+                    for (int d = 1; d <= allowed && reach < 0; ++d) {
+                        next_frontier.clear();
+                        for (int f : frontier) {
+                            for (int fe = off[f]; fe < off[f + 1]; ++fe) {
+                                int f2 = dst[fe];
+                                if (seen[f2]) continue;
+                                int sc2 = node_scores[f2];
+                                if (sc2 > 0) { reach = sc2; break; }
+                                seen[f2] = 1;
+                                next_frontier.push_back(f2);
+                            }
+                            if (reach >= 0) break;
+                        }
+                        frontier.swap(next_frontier);
+                    }
+                    if (reach > best_reach) { best_reach = reach; chosen = nx; }
+                }
+                if (chosen < 0) break;
+                ++gap;
+            } else {
+                gap = 0;
+            }
+            visited[chosen] = 1;
+            cur = chosen;
+        }
+        return path;
+    };
+
+    auto fwd = walk(g.adj_off, g.adj_dst);
+    auto bwd = walk(g.rev_off, g.rev_dst);
+    std::vector<int> path;
+    path.reserve(bwd.size() + fwd.size());
+    for (auto rit = bwd.rbegin(); rit != bwd.rend(); ++rit) {
+        if (*rit != seed) path.push_back(*rit);
+    }
+    path.insert(path.end(), fwd.begin(), fwd.end());
+    return path;
+}
+
+inline std::string path_to_string_idx(const IndexedGraph& g, const std::vector<int>& path) {
+    if (path.empty()) return "";
+    std::string s;
+    s.reserve(g.nodes[path[0]].size() + path.size() - 1);
+    s.append(g.nodes[path[0]].data(), g.nodes[path[0]].size());
+    for (size_t i = 1; i < path.size(); ++i) {
+        s.push_back(g.nodes[path[i]].back());
+    }
+    return s;
+}
+
+inline std::string assemble_sequence_idx(const IndexedGraph& g,
+                                         const std::vector<int>& node_scores,
+                                         bool has_any_score,
+                                         std::vector<int>* out_path = nullptr) {
+    if (g.empty()) return "";
+    auto [start_id, end_id] = find_farthest_start_end_nodes_idx(g);
+    const std::vector<int>* ns_ptr = has_any_score ? &node_scores : nullptr;
+    auto path = trace_longest_path_idx(g, start_id, end_id, 2500, ns_ptr);
+    if (path.empty()) return "";
+    if (out_path) *out_path = path;
+    return path_to_string_idx(g, path);
+}
+
+inline void export_path_gfa_idx(
+    const IndexedGraph& g,
+    const std::vector<int>& node_scores,
+    const std::vector<int>& contig_path,
+    int ele_id, int k,
+    std::ofstream& out)
+{
+    if (contig_path.empty()) return;
+    std::vector<uint8_t> in_path(g.V, 0);
+    for (int u : contig_path) in_path[u] = 1;
+
+    constexpr int MAX_BRANCH_DEPTH = 10;
+    std::vector<uint8_t> used = in_path;
+    std::vector<std::vector<int>> bubble_paths;
+    std::vector<int> parent(g.V, -1);
+    std::vector<uint8_t> seen(g.V, 0);
+
+    for (int u : contig_path) {
+        for (int ei = g.adj_off[u]; ei < g.adj_off[u + 1]; ++ei) {
+            int next = g.adj_dst[ei];
+            if (in_path[next]) continue;
+            std::fill(seen.begin(), seen.end(), 0);
+            std::queue<std::pair<int, int>> q;
+            q.push({next, 0});
+            parent[next] = -1;
+            seen[next] = 1;
+            while (!q.empty()) {
+                auto [cur, depth] = q.front(); q.pop();
+                used[cur] = 1;
+                if (depth >= MAX_BRANCH_DEPTH) continue;
+                for (int ce = g.adj_off[cur]; ce < g.adj_off[cur + 1]; ++ce) {
+                    int cn = g.adj_dst[ce];
+                    if (in_path[cn]) {
+                        used[cn] = 1;
+                        std::vector<int> bp;
+                        int p = cur;
+                        while (p >= 0) {
+                            bp.push_back(p);
+                            p = parent[p];
+                        }
+                        std::reverse(bp.begin(), bp.end());
+                        if (!bp.empty()) bubble_paths.push_back(std::move(bp));
+                        continue;
+                    }
+                    if (seen[cn]) continue;
+                    seen[cn] = 1;
+                    parent[cn] = cur;
+                    q.push({cn, depth + 1});
+                }
+            }
+        }
+    }
+
+    std::vector<int> node_id(g.V, -1);
+    int n = 0;
+    for (int u = 0; u < g.V; ++u) {
+        if (used[u]) node_id[u] = n++;
+    }
+
+    for (int u = 0; u < g.V; ++u) {
+        if (!used[u]) continue;
+        int kc = g.kmer_counts.empty() ? 0 : g.kmer_counts[u];
+        int ms = node_scores.empty() ? 0 : node_scores[u];
+        out << "S\t" << ele_id << "_" << node_id[u]
+            << "\t" << g.nodes[u]
+            << "\tKC:i:" << kc
+            << "\tMS:i:" << ms
+            << "\tEL:Z:" << ele_id << "\n";
+    }
+    for (int u = 0; u < g.V; ++u) {
+        if (!used[u]) continue;
+        int src = node_id[u];
+        for (int ei = g.adj_off[u]; ei < g.adj_off[u + 1]; ++ei) {
+            int v = g.adj_dst[ei];
+            if (node_id[v] < 0) continue;
+            out << "L\t" << ele_id << "_" << src << "\t+\t"
+                << ele_id << "_" << node_id[v] << "\t+\t"
+                << (k - 1) << "M\n";
+        }
+    }
+    out << "P\tcontig_" << ele_id;
+    for (int u : contig_path) {
+        if (node_id[u] >= 0) out << "\t" << ele_id << "_" << node_id[u];
+    }
+    out << "\t" << std::string(contig_path.size(), '+') << "\n";
+
+    for (size_t bi = 0; bi < bubble_paths.size(); ++bi) {
+        out << "P\tcontig_" << ele_id << "_alt" << bi;
+        for (int u : bubble_paths[bi]) {
+            if (node_id[u] >= 0) out << "\t" << ele_id << "_" << node_id[u];
+        }
+        out << "\t" << std::string(bubble_paths[bi].size(), '+') << "\n";
+    }
+}
+
+inline bool scan_snps_idx(
+    const IndexedGraph& g,
+    const std::vector<int>& contig_path,
+    int ele_id, int k,
+    std::ofstream& out,
+    double min_af = 0.05,
+    int max_branch_depth = 5)
+{
+    bool has_var = false;
+    if (contig_path.empty()) return false;
+    std::vector<int> path_pos(g.V, -1);
+    for (size_t i = 0; i < contig_path.size(); ++i)
+        path_pos[contig_path[i]] = static_cast<int>(i);
+
+    std::vector<uint8_t> visited(g.V, 0);
+    std::vector<int> frontier, next_frontier, touched;
+
+    for (size_t i = 0; i + 1 < contig_path.size(); ++i) {
+        int u = contig_path[i];
+        int next_main = contig_path[i + 1];
+        if (g.out_deg[u] < 2) continue;
+        int main_ei = g.find_edge(u, next_main);
+
+        for (int ei = g.adj_off[u]; ei < g.adj_off[u + 1]; ++ei) {
+            int branch = g.adj_dst[ei];
+            if (branch == next_main) continue;
+
+            frontier.clear();
+            touched.clear();
+            frontier.push_back(branch);
+            visited[branch] = 1;
+            touched.push_back(branch);
+            int reconnect_pos = -1;
+
+            for (int depth = 1; depth <= max_branch_depth && !frontier.empty(); ++depth) {
+                next_frontier.clear();
+                for (int cur : frontier) {
+                    for (int ce = g.adj_off[cur]; ce < g.adj_off[cur + 1]; ++ce) {
+                        int cn = g.adj_dst[ce];
+                        if (path_pos[cn] > static_cast<int>(i)) {
+                            reconnect_pos = path_pos[cn];
+                            break;
+                        }
+                        if (!visited[cn]) {
+                            visited[cn] = 1;
+                            touched.push_back(cn);
+                            next_frontier.push_back(cn);
+                        }
+                    }
+                    if (reconnect_pos >= 0) break;
+                }
+                frontier.swap(next_frontier);
+                if (reconnect_pos >= 0) break;
+            }
+            for (int t : touched) visited[t] = 0;
+            if (reconnect_pos < 0) continue;
+
+            int branch_len = reconnect_pos - static_cast<int>(i);
+            if (branch_len > 10) continue;
+
+            int ref_cov = (main_ei >= 0 && !g.edge_counts.empty()) ? g.edge_counts[main_ei] : 0;
+            int alt_cov = (!g.edge_counts.empty()) ? g.edge_counts[ei] : 0;
+            if (ref_cov < 2 || alt_cov < 2) continue;
+
+            double af = static_cast<double>(alt_cov) / (ref_cov + alt_cov);
+            if (af < min_af) continue;
+
+            int contig_pos = static_cast<int>(i + k - 1);
+            const char* type = (branch_len == 1) ? "SNP" : "INDEL";
+            char ref_base = g.nodes[next_main].back();
+            char alt_base = g.nodes[branch].back();
 
             out << ele_id << "\t" << contig_pos
                 << "\t" << ref_base << "\t" << alt_base

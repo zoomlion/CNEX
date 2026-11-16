@@ -10,40 +10,49 @@ import argparse
 import sys
 
 
+_STRIP_TRANS = str.maketrans("", "", "- ")
+
+
 def block_generator(fasta_file):
-    buf = ''
+    lines = []
     with open(fasta_file) as f:
         for line in f:
-            buf += line
-            while '###\n' in buf:
-                part, buf = buf.split('###\n', 1)
-                if part.strip():
-                    yield part.strip()
-        if buf.strip():
-            yield buf.strip()
+            if line.endswith("###\n"):
+                lines.append(line[:-4])
+                part = "".join(lines).strip()
+                lines.clear()
+                if part:
+                    yield part
+            else:
+                lines.append(line)
+        if lines:
+            part = "".join(lines).strip()
+            if part:
+                yield part
 
 
 def block_stats(block_text):
     """Return (n_species, avg_len, min_len) for a block."""
     seqs = []
-    current_seq = []
+    current_len = 0
+    in_seq = False
     n_species = 0
     for line in block_text.split('\n'):
         if not line:
             continue
-        if line.startswith('>'):
-            if current_seq:
-                seq = ''.join(current_seq).replace('-', '').replace(' ', '').upper()
-                if seq:
-                    seqs.append(len(seq))
+        if line[0] == '>':
+            if in_seq:
+                if current_len > 0:
+                    seqs.append(current_len)
                 n_species += 1
-            current_seq = []
+            current_len = 0
+            in_seq = False
         else:
-            current_seq.append(line.strip())
-    if current_seq:
-        seq = ''.join(current_seq).replace('-', '').replace(' ', '').upper()
-        if seq:
-            seqs.append(len(seq))
+            in_seq = True
+            current_len += len(line.strip().translate(_STRIP_TRANS))
+    if in_seq:
+        if current_len > 0:
+            seqs.append(current_len)
         n_species += 1
 
     if not seqs:

@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import glob
 import time
 from collections import Counter, OrderedDict
@@ -230,22 +231,40 @@ def _align_one(args):
         seqs = {h: s for h, s in seqs.items() if h in keep_sp}
     if len(seqs) < 2:
         return False, fasta_path, "too_few_species"
-    tmp_fa = fasta_path.replace('.fasta', '_filtered.fasta')
-    write_fasta(seqs, tmp_fa)
-    # MAFFT (DNA aligner); mode: ginsi | auto | fftn2
-    if mafft_mode == "ginsi":
-        mafft_args = ["--globalpair", "--maxiterate", "1000"]
-    elif mafft_mode == "fftn2":
-        mafft_args = ["--retree", "2"]
-    else:
-        mafft_args = ["--auto"]
-    with open(aln_path, "w") as out:
+    # Stage temporary MAFFT input in /dev/shm when writable to avoid NFS roundtrips
+    shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else aln_dir
+    fd, tmp_fa = tempfile.mkstemp(prefix=f"cnex_aln_{base}_", suffix=".fa", dir=shm_dir)
+    os.close(fd)
+    try:
+        write_fasta(seqs, tmp_fa)
+        # MAFFT (DNA aligner); mode: ginsi | auto | fftn2
+        if mafft_mode == "ginsi":
+            mafft_args = ["--globalpair", "--maxiterate", "1000"]
+        elif mafft_mode == "fftn2":
+            mafft_args = ["--retree", "2"]
+        else:
+            mafft_args = ["--auto"]
         r = subprocess.run([aligner_bin] + mafft_args + ["--quiet", "--thread", "1", tmp_fa],
-                           stdout=out, stderr=subprocess.PIPE, text=True)
-    if r.returncode != 0:
-        return False, fasta_path, "align"
-    _flatten_fasta(aln_path)
-    os.remove(tmp_fa)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            return False, fasta_path, "align"
+        out = []
+        buf = []
+        for line in r.stdout.splitlines(keepends=True):
+            if line.startswith(">"):
+                if buf:
+                    out.append("".join(buf) + "\n")
+                    buf = []
+                out.append(line)
+            else:
+                buf.append(line.strip())
+        if buf:
+            out.append("".join(buf) + "\n")
+        with open(aln_path, "w") as f_out:
+            f_out.writelines(out)
+    finally:
+        if os.path.exists(tmp_fa):
+            os.remove(tmp_fa)
     # local trim: remove gap-rich columns via trimal
     if min_site_occ > 0:
         trim_path = aln_path.replace(".aln", ".trimmed.aln")
@@ -580,7 +599,24 @@ def main():
 
     keep_sp = filter_species_by_cne_count(fasta_files, args.min_cne_per_species)
 
-    # ─── Groups ──────────────────────────────────────────
+    # ─── Alignment (MAFFT) ───────────────────────────────────
+    print(f"\n--- Aligning elements (MAFFT) ---")
+    t0 = time.time()
+    work = [(f, aligner, mafft_mode, args.resume, aln_root, keep_sp, args.min_site_occupancy) for f in fasta_files]
+    ok_count = fail_count = 0
+    if args.threads > 1:
+        with Pool(args.threads) as p:
+            for ok, _, _ in p.imap_unordered(_align_one, work):
+                if ok: ok_count += 1
+                else: fail_count += 1
+    else:
+        for w in work:
+            ok, _, _ = _align_one(w)
+            if ok: ok_count += 1
+            else: fail_count += 1
+    print(f"  Done in {time.time() - t0:.1f}s ({ok_count} OK, {fail_count} FAIL)")
+
+    # ─── Groups (must run after MAFFT + trimal populate aln_root) ───
     groups = OrderedDict()
     if args.species_file and os.path.isfile(args.species_file):
         raw_groups = read_species_groups(args.species_file)
@@ -611,23 +647,6 @@ def main():
             groups["all"] = aln_root
     else:
         groups["all"] = aln_root
-
-    # ─── Alignment (MAFFT) ───────────────────────────────────
-    print(f"\n--- Aligning elements (MAFFT) ---")
-    t0 = time.time()
-    work = [(f, aligner, mafft_mode, args.resume, aln_root, keep_sp, args.min_site_occupancy) for f in fasta_files]
-    ok_count = fail_count = 0
-    if args.threads > 1:
-        with Pool(args.threads) as p:
-            for ok, _, _ in p.imap_unordered(_align_one, work):
-                if ok: ok_count += 1
-                else: fail_count += 1
-    else:
-        for w in work:
-            ok, _, _ = _align_one(w)
-            if ok: ok_count += 1
-            else: fail_count += 1
-    print(f"  Done in {time.time() - t0:.1f}s ({ok_count} OK, {fail_count} FAIL)")
 
     # ─── Tags ────────────────────────────────────────────
     if args.element_tags and os.path.isfile(args.element_tags):

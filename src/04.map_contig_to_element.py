@@ -70,16 +70,16 @@ def _read_one_species(sp_and_dir):
     sp, assemble_dir = sp_and_dir
     fa = os.path.join(assemble_dir, sp, "contigs.fa")
     if not os.path.isfile(fa):
-        return {}
+        return sp, []
     seqs = read_fasta_dict(fa)
-    # Convert to {element_id: {sp: seq}} dict
+    # Convert to [(element_id, seq), ...] pairs
     # bunch_id format may be "0.chr:start-end(+)" in genome mode;
     # strip locus suffix to group all copies under the same element
-    result = {}
+    local = {}
     for bunch_id, seq in seqs.items():
         bid = bunch_id.split(".")[0]
-        result[bid] = {sp: seq}
-    return result
+        local[bid] = seq
+    return sp, list(local.items())
 
 
 def main():
@@ -99,23 +99,23 @@ def main():
     elements = {}
     if args.parallel > 1:
         with Pool(args.parallel) as p:
-            for chunk in p.imap_unordered(_read_one_species,
-                                          [(sp, assemble_dir) for sp in species]):
-                for bid, sp_dict in chunk.items():
-                    if bid not in elements:
-                        elements[bid] = {}
-                    for sp, seq in sp_dict.items():
-                        if sp not in elements[bid]:
-                            elements[bid][sp] = seq
+            for sp, items in p.imap_unordered(_read_one_species,
+                                              [(sp, assemble_dir) for sp in species]):
+                for bid, seq in items:
+                    d = elements.get(bid)
+                    if d is None:
+                        elements[bid] = {sp: seq}
+                    elif sp not in d:
+                        d[sp] = seq
     else:
         for sp in species:
-            chunk = _read_one_species((sp, assemble_dir))
-            for bid, sp_dict in chunk.items():
-                if bid not in elements:
-                    elements[bid] = {}
-                for sp, seq in sp_dict.items():
-                    if sp not in elements[bid]:
-                        elements[bid][sp] = seq
+            sp, items = _read_one_species((sp, assemble_dir))
+            for bid, seq in items:
+                d = elements.get(bid)
+                if d is None:
+                    elements[bid] = {sp: seq}
+                elif sp not in d:
+                    d[sp] = seq
     t1 = time.time()
     print(f"Read {len(elements)} unique elements in {t1 - t0:.1f}s")
 
@@ -153,8 +153,7 @@ def main():
     for bunch_id, sp_seqs in sorted_elements:
         out_path = os.path.join(args.outdir, f"{bunch_id}.fasta")
         with open(out_path, "w") as f:
-            for sp in sorted(sp_seqs.keys()):
-                f.write(f">{sp}\n{sp_seqs[sp]}\n")
+            f.write("".join(f">{sp}\n{sp_seqs[sp]}\n" for sp in sorted(sp_seqs.keys())))
     t1 = time.time()
     print(f"Written {len(sorted_elements)} element FASTAs to {args.outdir} in {t1 - t0:.1f}s")
 

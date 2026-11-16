@@ -10,17 +10,41 @@
 #include <tuple>
 #include <vector>
 
-inline float mer_entropy(const std::string& seq) {
-    for (char c : seq) {
-        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') return 0.0f;
+inline float mer_entropy_code(uint32_t code, int k) {
+    int freq[4] = {0, 0, 0, 0};
+    for (int i = 0; i < k; ++i) {
+        ++freq[code & 3u];
+        code >>= 2;
     }
-    tsl::robin_map<char, int> freq;
-    for (char c : seq) freq[c]++;
+    float entropy = 0.0f;
+    const float len = static_cast<float>(k);
+    for (int f : freq) {
+        if (f > 0) {
+            float prob = static_cast<float>(f) / len;
+            entropy -= prob * std::log2(prob);
+        }
+    }
+    return entropy;
+}
+
+inline float mer_entropy(const std::string& seq) {
+    int freq[4] = {0, 0, 0, 0};
+    for (char c : seq) {
+        switch (c) {
+            case 'A': ++freq[0]; break;
+            case 'C': ++freq[1]; break;
+            case 'G': ++freq[2]; break;
+            case 'T': ++freq[3]; break;
+            default: return 0.0f;
+        }
+    }
     float entropy = 0.0f;
     float len = static_cast<float>(seq.size());
-    for (const auto& p : freq) {
-        float prob = static_cast<float>(p.second) / len;
-        entropy -= prob * std::log2(prob);
+    for (int f : freq) {
+        if (f > 0) {
+            float prob = static_cast<float>(f) / len;
+            entropy -= prob * std::log2(prob);
+        }
     }
     return entropy;
 }

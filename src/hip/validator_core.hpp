@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +25,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 // Optional counters for the segmented genome-mode validator. Enabled by
 // setting the VALIDATE_PROFILE environment variable to a non-zero value.
@@ -272,11 +278,13 @@ public:
     // a flat arena instead of one heap vector per k-mer.
     tsl::robin_map<uint32_t, uint64_t> compressed_mer_query;
     std::vector<std::pair<int, int>> assign_arena;
+    std::vector<uint32_t> present_codes;
+    size_t kept_mers_ = 0;
     int mer_size = 0;
 
     // Optional direct-index accelerator (k <= 13): maps each 2-bit k-mer code
-    // to the packed assignment range (count in the top 2 bits, arena offset in
-    // the low 30). Storing the range inline lets a scan resolve code -> range in
+    // to the packed assignment range (count in the top 3 bits, arena offset in
+    // the low 29). Storing the range inline lets a scan resolve code -> range in
     // ONE random access instead of the previous code -> rank -> range chain
     // (which needed a second direct_rng array). Costs 4^k * 4 bytes.
     std::vector<uint32_t> direct_index;
@@ -291,6 +299,7 @@ public:
 
     void build_direct_index() {
         if (mer_size <= 0 || mer_size > 13) return;
+        if (!direct_index.empty()) return;
         direct_index.assign(size_t(1) << (2 * mer_size), 0);
         for (const auto& kv : compressed_mer_query) {
             uint32_t off = range_off(kv.second);
@@ -298,6 +307,39 @@ public:
             if (off > kDirOffMask || cnt > 7) { direct_index.clear(); return; }
             direct_index[kv.first] = pack_dir(off, cnt);
         }
+    }
+
+    void ensure_hashmap() {
+        if (!compressed_mer_query.empty() || kept_mers_ == 0) return;
+        compressed_mer_query.reserve(kept_mers_);
+        if (!direct_index.empty() && !present_codes.empty()) {
+            for (uint32_t code : present_codes) {
+                uint32_t v = direct_index[code];
+                if (v) compressed_mer_query[code] = pack_range(dir_off(v), dir_cnt(v));
+            }
+        }
+    }
+
+    void drop_raw_after_canon() {
+        std::vector<uint32_t>().swap(direct_index);
+        std::vector<uint32_t>().swap(present_codes);
+        std::vector<std::pair<int, int>>().swap(assign_arena);
+        compressed_mer_query.clear();
+    }
+
+    inline bool has_id_fast(uint32_t code, int id) const {
+        if (!direct_index.empty()) {
+            uint32_t v = direct_index[code];
+            if (!v) return false;
+            uint32_t off = dir_off(v);
+            uint32_t cnt = dir_cnt(v);
+            for (uint32_t i = 0; i < cnt; ++i) {
+                if (assign_arena[off + i].first == id) return true;
+            }
+            return false;
+        }
+        auto it = compressed_mer_query.find(code);
+        return it != compressed_mer_query.end() && has_id(it->second, id);
     }
 
     // ─── Canonical (strand-merged) index ───
@@ -322,6 +364,56 @@ public:
     bool build_canonical_index() {
         if (mer_size <= 0 || mer_size > 13) return false;
         const int k = mer_size;
+
+        // Zero-hash array path when direct_index + present_codes are already populated.
+        if (!direct_index.empty() && !present_codes.empty()) {
+            dir_canon.assign(size_t(1) << (2 * k), 0);
+            std::vector<uint32_t> canon_keys;
+            canon_keys.reserve(present_codes.size());
+            size_t total = 0;
+            for (uint32_t code : present_codes) {
+                uint32_t v = direct_index[code];
+                uint32_t n = dir_cnt(v);
+                if (n == 0) continue;
+                uint32_t c = std::min(code, rc_code_2bit(code, k));
+                if (dir_canon[c] == 0) canon_keys.push_back(c);
+                dir_canon[c] += n;
+                total += n;
+            }
+            if (total > kDirOffMask) { dir_canon.clear(); return false; }
+            uint32_t off = 0;
+            for (uint32_t c : canon_keys) {
+                uint32_t cnt = dir_canon[c];
+                if (cnt > 7) { dir_canon.clear(); return false; }
+                dir_canon[c] = pack_dir(off, cnt);
+                off += cnt;
+            }
+            arena_canon.resize(total);
+            for (uint32_t code : present_codes) {
+                uint32_t v = direct_index[code];
+                uint32_t o = dir_off(v), n = dir_cnt(v);
+                if (n == 0) continue;
+                uint32_t c = std::min(code, rc_code_2bit(code, k));
+                uint32_t form = (code == c) ? 0u : 1u;
+                uint32_t cur_off = dir_off(dir_canon[c]);
+                for (uint32_t a = 0; a < n; ++a) {
+                    int id = assign_arena[o + a].first;
+                    int loci = assign_arena[o + a].second;
+                    if (id < 0 || id > 0x7fff || loci < 0 || loci > 0xffff) {
+                        dir_canon.clear();
+                        arena_canon.clear();
+                        return false;
+                    }
+                    arena_canon[cur_off + a] = pack_crow(id, loci, form);
+                }
+                dir_canon[c] += n;
+            }
+            for (uint32_t c : canon_keys) {
+                dir_canon[c] -= dir_cnt(dir_canon[c]);
+            }
+            return true;
+        }
+
         tsl::robin_map<uint32_t, uint32_t> cnt;   // canonical -> row count
         cnt.reserve(compressed_mer_query.size());
         size_t total = 0;
@@ -394,24 +486,159 @@ public:
     // Load a mers table. Rows are grouped per k-mer (dump order). When
     // max_assign > 0, groups with more than max_assign (element, locus)
     // assignments are dropped at load time (repeat/paralog filter); 0 = keep all.
-    void load_from_file(const std::string& path, int max_assign = 0) {
-        std::ifstream file(path);
-        if (!file.is_open()) {
+    // When defer_hashmap is true and the table fits direct_index (k<=13, cnt<=7),
+    // skip populating the 12M-entry robin_map and build direct_index in place.
+    void load_from_file(const std::string& path, int max_assign = 0, bool defer_hashmap = false) {
+        struct BinHeader {
+            char magic[8];
+            uint32_t version;
+            int32_t mer_size;
+            int32_t max_assign;
+            uint32_t fits_direct;
+            int64_t src_size;
+            int64_t src_mtime_sec;
+            int64_t src_mtime_nsec;
+            uint64_t kept_mers;
+            uint64_t arena_size;
+            uint64_t dropped_mers;
+            uint64_t dropped_rows;
+            uint64_t shared_mers;
+        };
+
+        auto read_exact = [](int fd, void* dst, size_t nbytes) -> bool {
+            char* p = static_cast<char*>(dst);
+            size_t got = 0;
+            while (got < nbytes) {
+                ssize_t r = ::read(fd, p + got, nbytes - got);
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    return false;
+                }
+                if (r == 0) return false;
+                got += static_cast<size_t>(r);
+            }
+            return true;
+        };
+
+        auto write_exact = [](int fd, const void* src, size_t nbytes) -> bool {
+            const char* p = static_cast<const char*>(src);
+            size_t sent = 0;
+            while (sent < nbytes) {
+                ssize_t w = ::write(fd, p + sent, nbytes - sent);
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    return false;
+                }
+                sent += static_cast<size_t>(w);
+            }
+            return true;
+        };
+
+        auto print_filter_stats = [&](long long km, long long kr, long long dm,
+                                      long long dr, long long sm) {
+            if (max_assign > 0) {
+                const long long total_mers = km + dm;
+                std::cerr << "  mer load filter: max-assign=" << max_assign
+                          << "  kept " << km << " mers/" << kr << " rows"
+                          << "  dropped " << dm << " mers/" << dr << " rows";
+                if (total_mers > 0) {
+                    std::cerr << " (" << (100.0 * static_cast<double>(dm) /
+                                          static_cast<double>(total_mers)) << "% mers)";
+                }
+                std::cerr << "  shared(>1 assign): " << sm << "\n";
+            }
+        };
+
+        struct stat src_st{};
+        if (::stat(path.c_str(), &src_st) != 0) {
             throw std::runtime_error("Cannot open mers file: " + path);
         }
-        file.seekg(0, std::ios::end);
-        size_t file_size = static_cast<size_t>(file.tellg());
-        file.seekg(0, std::ios::beg);
-        compressed_mer_query.reserve(file_size / 25);
-        assign_arena.reserve(file_size / 20);
 
-        std::string line;
+        const char* no_cache_env = std::getenv("CNEX_NO_BIN_CACHE");
+        const bool use_cache = (no_cache_env == nullptr || no_cache_env[0] == '\0' || no_cache_env[0] == '0');
+        const std::string cache_path = path + ".ma" + std::to_string(max_assign) + ".cnexidx";
+
+        if (use_cache) {
+            struct stat cst{};
+            if (::stat(cache_path.c_str(), &cst) == 0 &&
+                cst.st_size >= static_cast<off_t>(sizeof(BinHeader))) {
+                int cfd = ::open(cache_path.c_str(), O_RDONLY);
+                if (cfd >= 0) {
+                    BinHeader hdr{};
+                    bool ok = read_exact(cfd, &hdr, sizeof(hdr)) &&
+                              std::memcmp(hdr.magic, "CNEXIDX1", 8) == 0 &&
+                              hdr.version == 1 &&
+                              hdr.max_assign == max_assign &&
+                              hdr.src_size == static_cast<int64_t>(src_st.st_size) &&
+                              hdr.src_mtime_sec == static_cast<int64_t>(src_st.st_mtim.tv_sec) &&
+                              hdr.src_mtime_nsec == static_cast<int64_t>(src_st.st_mtim.tv_nsec);
+                    uint64_t expected_sz = sizeof(BinHeader) +
+                        hdr.kept_mers * sizeof(uint32_t) +
+                        hdr.kept_mers * sizeof(uint64_t) +
+                        hdr.arena_size * sizeof(std::pair<int, int>);
+                    if (ok && static_cast<uint64_t>(cst.st_size) == expected_sz) {
+                        present_codes.resize(hdr.kept_mers);
+                        std::vector<uint64_t> packed_ranges(hdr.kept_mers);
+                        assign_arena.resize(hdr.arena_size);
+                        bool body_ok =
+                            read_exact(cfd, present_codes.data(), hdr.kept_mers * sizeof(uint32_t)) &&
+                            read_exact(cfd, packed_ranges.data(), hdr.kept_mers * sizeof(uint64_t)) &&
+                            read_exact(cfd, assign_arena.data(), hdr.arena_size * sizeof(std::pair<int, int>));
+                        ::close(cfd);
+                        if (body_ok) {
+                            mer_size = hdr.mer_size;
+                            kept_mers_ = hdr.kept_mers;
+                            if (defer_hashmap && hdr.fits_direct && mer_size >= 7 && mer_size <= 13) {
+                                direct_index.assign(size_t(1) << (2 * mer_size), 0);
+                                for (size_t i = 0; i < hdr.kept_mers; ++i) {
+                                    uint64_t r = packed_ranges[i];
+                                    direct_index[present_codes[i]] = pack_dir(range_off(r), range_cnt(r));
+                                }
+                            } else {
+                                compressed_mer_query.reserve(hdr.kept_mers);
+                                for (size_t i = 0; i < hdr.kept_mers; ++i) {
+                                    compressed_mer_query[present_codes[i]] = packed_ranges[i];
+                                }
+                            }
+                            print_filter_stats(static_cast<long long>(hdr.kept_mers),
+                                               static_cast<long long>(hdr.arena_size),
+                                               static_cast<long long>(hdr.dropped_mers),
+                                               static_cast<long long>(hdr.dropped_rows),
+                                               static_cast<long long>(hdr.shared_mers));
+                            return;
+                        }
+                        present_codes.clear();
+                        assign_arena.clear();
+                    } else {
+                        ::close(cfd);
+                    }
+                }
+            }
+        }
+
+        const size_t file_size = static_cast<size_t>(src_st.st_size);
+        assign_arena.reserve(file_size / 20);
+        present_codes.reserve(file_size / 25);
+
         uint32_t cur_key = 0;
         bool have_cur = false;
         std::vector<std::pair<int, int>> group;
         group.reserve(64);
         long long kept_mers = 0, kept_rows = 0, dropped_mers = 0, dropped_rows = 0;
         long long shared_mers = 0;
+        bool dir_inited = false;
+        bool can_direct = false;
+
+        auto switch_to_hashmap = [&]() {
+            if (!can_direct) return;
+            compressed_mer_query.reserve(present_codes.size() + 1024);
+            for (uint32_t code : present_codes) {
+                uint32_t v = direct_index[code];
+                if (v) compressed_mer_query[code] = pack_range(dir_off(v), dir_cnt(v));
+            }
+            std::vector<uint32_t>().swap(direct_index);
+            can_direct = false;
+        };
 
         auto flush_group = [&]() {
             if (!have_cur) return;
@@ -420,7 +647,18 @@ public:
             if (max_assign == 0 || sz <= max_assign) {
                 const size_t off = assign_arena.size();
                 assign_arena.insert(assign_arena.end(), group.begin(), group.end());
-                compressed_mer_query[cur_key] = pack_range(off, group.size());
+                if (can_direct && (sz > 7 || off > kDirOffMask)) {
+                    switch_to_hashmap();
+                }
+                if (can_direct) {
+                    if (direct_index[cur_key] == 0) present_codes.push_back(cur_key);
+                    direct_index[cur_key] = pack_dir(static_cast<uint32_t>(off), static_cast<uint32_t>(sz));
+                } else {
+                    if (compressed_mer_query.find(cur_key) == compressed_mer_query.end()) {
+                        present_codes.push_back(cur_key);
+                    }
+                    compressed_mer_query[cur_key] = pack_range(off, group.size());
+                }
                 ++kept_mers;
                 kept_rows += sz;
             } else {
@@ -430,17 +668,27 @@ public:
             group.clear();
         };
 
-        while (std::getline(file, line)) {
-            if (line.empty()) continue;
-            const char* p = line.data();
-            const char* e = p + line.size();
-            const char* t1 = static_cast<const char*>(memchr(p, '\t', e - p));
-            if (t1 == nullptr) continue;
-            const char* t2 = static_cast<const char*>(memchr(t1 + 1, '\t', e - t1 - 1));
-            if (t2 == nullptr) continue;
-            const char* t3 = static_cast<const char*>(memchr(t2 + 1, '\t', e - t2 - 1));
+        auto process_line = [&](const char* p, size_t len) {
+            if (len == 0) return;
+            const char* e = p + len;
+            const char* t1 = static_cast<const char*>(memchr(p, '\t', len));
+            if (t1 == nullptr) return;
+            const char* t2 = static_cast<const char*>(memchr(t1 + 1, '\t', static_cast<size_t>(e - t1 - 1)));
+            if (t2 == nullptr) return;
+            const char* t3 = static_cast<const char*>(memchr(t2 + 1, '\t', static_cast<size_t>(e - t2 - 1)));
             const char* loci_end = (t3 != nullptr) ? t3 : e;
-            if (mer_size == 0) mer_size = static_cast<int>(t1 - p);
+            if (mer_size == 0) {
+                mer_size = static_cast<int>(t1 - p);
+                if (!dir_inited) {
+                    dir_inited = true;
+                    if (defer_hashmap && mer_size >= 7 && mer_size <= 13) {
+                        direct_index.assign(size_t(1) << (2 * mer_size), 0);
+                        can_direct = true;
+                    } else {
+                        compressed_mer_query.reserve(file_size / 25);
+                    }
+                }
+            }
 
             uint32_t encoded_mer = 0;
             bool valid = true;
@@ -454,7 +702,7 @@ public:
                 }
                 if (!valid) break;
             }
-            if (!valid) continue;
+            if (!valid) return;
             int id = 0;
             for (const char* q = t1 + 1; q < t2; ++q) id = id * 10 + (*q - '0');
             int loci = 0;
@@ -465,24 +713,101 @@ public:
                 have_cur = true;
             }
             group.emplace_back(id, loci);
+        };
+
+        bool mapped_ok = false;
+        if (file_size > 0) {
+            int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                void* map_ptr = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (map_ptr != MAP_FAILED) {
+                    ::madvise(map_ptr, file_size, MADV_SEQUENTIAL);
+                    const char* cur = static_cast<const char*>(map_ptr);
+                    const char* end = cur + file_size;
+                    while (cur < end) {
+                        const char* nl = static_cast<const char*>(
+                            memchr(cur, '\n', static_cast<size_t>(end - cur)));
+                        size_t line_len = nl ? static_cast<size_t>(nl - cur)
+                                             : static_cast<size_t>(end - cur);
+                        process_line(cur, line_len);
+                        cur = nl ? (nl + 1) : end;
+                    }
+                    ::munmap(map_ptr, file_size);
+                    mapped_ok = true;
+                }
+                ::close(fd);
+            }
+        }
+        if (!mapped_ok && file_size > 0) {
+            std::ifstream file(path);
+            if (!file.is_open()) {
+                throw std::runtime_error("Cannot open mers file: " + path);
+            }
+            std::string line;
+            while (std::getline(file, line)) {
+                process_line(line.data(), line.size());
+            }
         }
         flush_group();
+        kept_mers_ = present_codes.size();
 
-        if (max_assign > 0) {
-            const long long total_mers = kept_mers + dropped_mers;
-            std::cerr << "  mer load filter: max-assign=" << max_assign
-                      << "  kept " << kept_mers << " mers/" << kept_rows << " rows"
-                      << "  dropped " << dropped_mers << " mers/" << dropped_rows << " rows";
-            if (total_mers > 0) {
-                std::cerr << " (" << (100.0 * static_cast<double>(dropped_mers) /
-                                      static_cast<double>(total_mers)) << "% mers)";
+        if (use_cache && kept_mers_ > 0 && mer_size > 0) {
+            bool fits_dir = can_direct;
+            if (!fits_dir && mer_size >= 7 && mer_size <= 13) {
+                fits_dir = true;
+                for (uint32_t code : present_codes) {
+                    uint64_t r = compressed_mer_query[code];
+                    if (range_off(r) > kDirOffMask || range_cnt(r) > 7) {
+                        fits_dir = false;
+                        break;
+                    }
+                }
             }
-            std::cerr << "  shared(>1 assign): " << shared_mers << "\n";
+            std::vector<uint64_t> packed_ranges;
+            packed_ranges.reserve(kept_mers_);
+            if (can_direct) {
+                for (uint32_t code : present_codes) {
+                    uint32_t v = direct_index[code];
+                    packed_ranges.push_back(pack_range(dir_off(v), dir_cnt(v)));
+                }
+            } else {
+                for (uint32_t code : present_codes) {
+                    packed_ranges.push_back(compressed_mer_query[code]);
+                }
+            }
+            const std::string tmp_path = cache_path + ".tmp." + std::to_string(::getpid());
+            int wfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (wfd >= 0) {
+                BinHeader hdr{};
+                std::memcpy(hdr.magic, "CNEXIDX1", 8);
+                hdr.version = 1;
+                hdr.mer_size = mer_size;
+                hdr.max_assign = max_assign;
+                hdr.fits_direct = fits_dir ? 1u : 0u;
+                hdr.src_size = static_cast<int64_t>(src_st.st_size);
+                hdr.src_mtime_sec = static_cast<int64_t>(src_st.st_mtim.tv_sec);
+                hdr.src_mtime_nsec = static_cast<int64_t>(src_st.st_mtim.tv_nsec);
+                hdr.kept_mers = static_cast<uint64_t>(kept_mers_);
+                hdr.arena_size = static_cast<uint64_t>(assign_arena.size());
+                hdr.dropped_mers = static_cast<uint64_t>(dropped_mers);
+                hdr.dropped_rows = static_cast<uint64_t>(dropped_rows);
+                hdr.shared_mers = static_cast<uint64_t>(shared_mers);
+                bool wok = write_exact(wfd, &hdr, sizeof(hdr)) &&
+                           write_exact(wfd, present_codes.data(), kept_mers_ * sizeof(uint32_t)) &&
+                           write_exact(wfd, packed_ranges.data(), kept_mers_ * sizeof(uint64_t)) &&
+                           write_exact(wfd, assign_arena.data(), assign_arena.size() * sizeof(std::pair<int, int>));
+                if (::close(wfd) != 0) wok = false;
+                if (!wok || ::rename(tmp_path.c_str(), cache_path.c_str()) != 0) {
+                    ::unlink(tmp_path.c_str());
+                }
+            }
         }
+
+        print_filter_stats(kept_mers, kept_rows, dropped_mers, dropped_rows, shared_mers);
     }
 
     int get_mer_size() const { return mer_size; }
-    size_t size() const { return compressed_mer_query.size(); }
+    size_t size() const { return kept_mers_ > 0 ? kept_mers_ : compressed_mer_query.size(); }
 };
 
 
@@ -820,6 +1145,8 @@ inline void validate_sequence_segmented(
 
     const int SEG = 1 << 18;   // 256k bases per segment
 
+    thread_local std::vector<uint32_t> fwd_dir;
+    thread_local std::vector<uint32_t> rc_dir;
     thread_local std::vector<uint64_t> fwd_ranges;
     thread_local std::vector<uint64_t> rc_ranges;
     thread_local std::vector<uint64_t> upper_bits;
@@ -827,6 +1154,7 @@ inline void validate_sequence_segmented(
     thread_local std::vector<uint32_t> codes_rc;
     int cur_o = 0;   // current window origin within the segment
     const bool vp = validate_profile_enabled();
+    const bool use_dir = mqm.has_direct_index();
     thread_local long long tl_prep_ns = 0;
     thread_local long long tl_win_ns = 0;
     thread_local long long tl_tally_ns = 0;
@@ -881,18 +1209,39 @@ inline void validate_sequence_segmented(
     // new right edge and removing the old left edge. The exact legacy tally is
     // recomputed only when the top count is tied (the only case where the
     // first-seen order can change the winning element id).
+    // Uses a contiguous power-of-2 ring buffer instead of std::deque.
     struct SlidingTally {
         std::vector<int> cnt;
         std::vector<int> pos;
         std::vector<int> active;
-        std::deque<int> pos_hits;   // non-empty k-mer positions, ascending
+        std::vector<int> pos_ring;
+        uint32_t ring_head = 0;
+        uint32_t ring_tail = 0;
+        uint32_t ring_mask = 0;
         int total = 0;
 
+        void ensure_ring(int nspan_val) {
+            uint32_t need = static_cast<uint32_t>(nspan_val) + 4u;
+            if (ring_mask + 1 >= need) return;
+            uint32_t cap = 16;
+            while (cap < need) cap <<= 1;
+            pos_ring.resize(cap);
+            ring_mask = cap - 1;
+        }
         void clear() {
             for (int id : active) { cnt[id] = 0; pos[id] = -1; }
             active.clear();
-            pos_hits.clear();
+            ring_head = 0;
+            ring_tail = 0;
             total = 0;
+        }
+        inline void push_hit(int p) {
+            pos_ring[ring_tail++ & ring_mask] = p;
+        }
+        inline void pop_hit_if(int p) {
+            if (ring_head != ring_tail && pos_ring[ring_head & ring_mask] == p) {
+                ++ring_head;
+            }
         }
         inline void add(int id) {
             if (id >= static_cast<int>(cnt.size())) {
@@ -942,21 +1291,37 @@ inline void validate_sequence_segmented(
         }
     };
     thread_local SlidingTally slide_f, slide_r;
+    slide_f.ensure_ring(nspan);
+    slide_r.ensure_ring(nspan);
 
-    auto make_chain = [&](const std::vector<uint64_t>* ranges,
-                          const SlidingTally* slide, bool rc_strand) {
-        return [&, ranges, slide, rc_strand](int confi_id) -> std::pair<int, int> {
+    auto get_range = [&](int p, bool rc, uint32_t& off, uint32_t& cnt) -> bool {
+        if (use_dir) {
+            uint32_t v = (rc ? rc_dir : fwd_dir)[p];
+            if (!v) return false;
+            off = MerQueryManager::dir_off(v);
+            cnt = MerQueryManager::dir_cnt(v);
+            return true;
+        }
+        uint64_t r = (rc ? rc_ranges : fwd_ranges)[p];
+        if (!r) return false;
+        off = MerQueryManager::range_off(r);
+        cnt = MerQueryManager::range_cnt(r);
+        return true;
+    };
+
+    auto make_chain = [&](const SlidingTally* slide, bool rc_strand) {
+        return [&, slide, rc_strand](int confi_id) -> std::pair<int, int> {
             if (vp) ++g_val_profile.chain_calls;
             int first = -1, last = -1, prev_x = -1, prev_l = -1, passing = 0, m = 0;
-            const auto& positions = slide->pos_hits;
-            for (size_t qi = 0; qi < positions.size(); ++qi) {
-                int p = rc_strand
-                    ? positions[positions.size() - 1 - qi]
-                    : positions[qi];
+            const uint32_t npos = slide->ring_tail - slide->ring_head;
+            for (uint32_t qi = 0; qi < npos; ++qi) {
+                uint32_t slot = rc_strand
+                    ? (slide->ring_tail - 1 - qi)
+                    : (slide->ring_head + qi);
+                int p = slide->pos_ring[slot & slide->ring_mask];
                 int x = rc_strand ? (nspan - 1 - (p - cur_o)) : (p - cur_o);
-                uint64_t r = (*ranges)[p];
-                uint32_t off = MerQueryManager::range_off(r);
-                uint32_t cnt = MerQueryManager::range_cnt(r);
+                uint32_t off = 0, cnt = 0;
+                if (!get_range(p, rc_strand, off, cnt)) continue;
                 for (uint32_t a = 0; a < cnt; ++a) {
                     const auto& pr = mqm.assign_arena[off + a];
                     int id = pr.first;
@@ -971,20 +1336,30 @@ inline void validate_sequence_segmented(
             return {passing, last - first + k};
         };
     };
-    auto chain_fwd = make_chain(&fwd_ranges, &slide_f, false);
-    auto chain_rc = make_chain(&rc_ranges, &slide_r, true);
+    auto chain_fwd = make_chain(&slide_f, false);
+    auto chain_rc = make_chain(&slide_r, true);
+
+    int min_req_c = INT_MAX;
+    for (const auto& tier : cfg.tiers) min_req_c = std::min(min_req_c, tier.min_c);
+    if (cfg.verify.enabled) min_req_c = std::min(min_req_c, cfg.verify.t3.min_c);
+    const int min_any_hits = (min_req_c == INT_MAX) ? 0 : (min_req_c + 1);
 
     const int seg_stride = SEG - (window_size - 1);
     for (int seg_start = 0; seg_start < L; seg_start += seg_stride) {
         const int seg_end = std::min(L, seg_start + SEG);
         const int seg_len = seg_end - seg_start;
 
-        fwd_ranges.assign(seg_len, 0);
-        rc_ranges.assign(seg_len, 0);
+        if (use_dir) {
+            fwd_dir.assign(seg_len, 0);
+            rc_dir.assign(seg_len, 0);
+        } else {
+            fwd_ranges.assign(seg_len, 0);
+            rc_ranges.assign(seg_len, 0);
+        }
         upper_bits.assign((seg_len + 63) >> 6, 0ULL);
 
         auto _t_prep = std::chrono::steady_clock::now();
-        if (mqm.has_direct_index()) {
+        if (use_dir) {
             // Two passes: compute k-mer codes sequentially (no dependent
             // memory stalls), then run the direct-index lookups with software
             // prefetching to hide the random-access latency.
@@ -1025,16 +1400,8 @@ inline void validate_sequence_segmented(
                 }
                 uint32_t cf = codes_fwd[st];
                 if (cf == UINT32_MAX) continue;
-                uint32_t v = mqm.direct_index[cf];
-                if (v)
-                    fwd_ranges[st] =
-                        (static_cast<uint64_t>(MerQueryManager::dir_off(v)) << 32) |
-                        MerQueryManager::dir_cnt(v);
-                uint32_t vr = mqm.direct_index[codes_rc[st]];
-                if (vr)
-                    rc_ranges[st] =
-                        (static_cast<uint64_t>(MerQueryManager::dir_off(vr)) << 32) |
-                        MerQueryManager::dir_cnt(vr);
+                fwd_dir[st] = mqm.direct_index[cf];
+                rc_dir[st] = mqm.direct_index[codes_rc[st]];
             }
         } else {
             uint32_t rolling = 0;
@@ -1084,23 +1451,18 @@ inline void validate_sequence_segmented(
         const bool tie_needs_exact = min_gate_ratio <= 1.0;
 
         auto add_pos = [&](int p, bool rc, SlidingTally& st) {
-            const auto& ranges = rc ? rc_ranges : fwd_ranges;
-            uint64_t r = ranges[p];
-            uint32_t off = MerQueryManager::range_off(r);
-            uint32_t cnt = MerQueryManager::range_cnt(r);
+            uint32_t off = 0, cnt = 0;
+            if (!get_range(p, rc, off, cnt)) return;
             for (uint32_t a = 0; a < cnt; ++a)
                 st.add(mqm.assign_arena[off + a].first);
-            if (cnt > 0) st.pos_hits.push_back(p);
+            st.push_hit(p);
         };
         auto remove_pos = [&](int p, bool rc, SlidingTally& st) {
-            const auto& ranges = rc ? rc_ranges : fwd_ranges;
-            uint64_t r = ranges[p];
-            uint32_t off = MerQueryManager::range_off(r);
-            uint32_t cnt = MerQueryManager::range_cnt(r);
+            uint32_t off = 0, cnt = 0;
+            if (!get_range(p, rc, off, cnt)) return;
             for (uint32_t a = 0; a < cnt; ++a)
                 st.remove(mqm.assign_arena[off + a].first);
-            if (cnt > 0 && !st.pos_hits.empty() && st.pos_hits.front() == p)
-                st.pos_hits.pop_front();
+            st.pop_hit_if(p);
         };
         auto rebuild_slide = [&](int o, bool rc, SlidingTally& st) {
             st.clear();
@@ -1110,17 +1472,15 @@ inline void validate_sequence_segmented(
             tally_acc.begin();
             if (!rc) {
                 for (int p = o; p < o + nspan; ++p) {
-                    uint64_t r = fwd_ranges[p];
-                    uint32_t off = MerQueryManager::range_off(r);
-                    uint32_t cnt = MerQueryManager::range_cnt(r);
+                    uint32_t off = 0, cnt = 0;
+                    if (!get_range(p, false, off, cnt)) continue;
                     for (uint32_t a = 0; a < cnt; ++a)
                         tally_acc.add(mqm.assign_arena[off + a].first);
                 }
             } else {
                 for (int p = o + nspan - 1; p >= o; --p) {
-                    uint64_t r = rc_ranges[p];
-                    uint32_t off = MerQueryManager::range_off(r);
-                    uint32_t cnt = MerQueryManager::range_cnt(r);
+                    uint32_t off = 0, cnt = 0;
+                    if (!get_range(p, true, off, cnt)) continue;
                     for (uint32_t a = 0; a < cnt; ++a)
                         tally_acc.add(mqm.assign_arena[off + a].first);
                 }
@@ -1167,29 +1527,35 @@ inline void validate_sequence_segmented(
             }
             int fwd_id = -1, fwd_count = 0;
             bool fwd_ok = false;
-            bool tie_f = false;
-            VoteTally fwd_t = slide_f.finish(tie_f);
-            if (tie_f && tie_needs_exact) fwd_t = full_tally(o, false);
-            if (gate_ratio_precheck(fwd_t, cfg)) {
-                int passing = 0, span = 0;
-                if (gate_pass(fwd_t, cfg, chain_fwd, passing, span)) {
-                    fwd_ok = true;
-                    fwd_id = fwd_t.best_id;
-                    fwd_count = fwd_t.n;
+            VoteTally fwd_t;
+            if (slide_f.total >= min_any_hits) {
+                bool tie_f = false;
+                fwd_t = slide_f.finish(tie_f);
+                if (tie_f && tie_needs_exact) fwd_t = full_tally(o, false);
+                if (gate_ratio_precheck(fwd_t, cfg)) {
+                    int passing = 0, span = 0;
+                    if (gate_pass(fwd_t, cfg, chain_fwd, passing, span)) {
+                        fwd_ok = true;
+                        fwd_id = fwd_t.best_id;
+                        fwd_count = fwd_t.n;
+                    }
                 }
             }
 
             int rev_id = -1, rev_count = 0;
             bool rev_ok = false;
-            bool tie_r = false;
-            VoteTally rev_t = slide_r.finish(tie_r);
-            if (tie_r && tie_needs_exact) rev_t = full_tally(o, true);
-            if (gate_ratio_precheck(rev_t, cfg)) {
-                int passing = 0, span = 0;
-                if (gate_pass(rev_t, cfg, chain_rc, passing, span)) {
-                    rev_ok = true;
-                    rev_id = rev_t.best_id;
-                    rev_count = rev_t.n;
+            VoteTally rev_t;
+            if (slide_r.total >= min_any_hits) {
+                bool tie_r = false;
+                rev_t = slide_r.finish(tie_r);
+                if (tie_r && tie_needs_exact) rev_t = full_tally(o, true);
+                if (gate_ratio_precheck(rev_t, cfg)) {
+                    int passing = 0, span = 0;
+                    if (gate_pass(rev_t, cfg, chain_rc, passing, span)) {
+                        rev_ok = true;
+                        rev_id = rev_t.best_id;
+                        rev_count = rev_t.n;
+                    }
                 }
             }
             if (vp) {

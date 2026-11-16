@@ -119,7 +119,7 @@ ASSEMBLE_DIR = "assemble"
 
 def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
                 window_size=None, step_size=None, type_=None, log_dir=None,
-                keep_validate=False, depth=None, cne_ref=None, ssd_dir=None, tiers=None,
+                keep_validate=False, depth=None, ssd_dir=None, tiers=None,
                 max_assign=3, trim_margin=None, rescue_panels=None, rescue_tau=None,
                 t3=None, multi_k=None, no_multi_k=False, min_count=None,
                 max_reads=None, max_loci_gap=None, snp=False):
@@ -196,9 +196,16 @@ def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
             val_cmd += ["--depth", str(depth)]
         rc_val = _run(val_cmd, log)
 
+    if rc_val != 0:
+        log.close()
+        if not keep_validate:
+            for f in glob.glob(os.path.join(val_dir, "Assemble.*.reads")):
+                os.remove(f)
+        return 0, rc_val
+
     asm_out = os.path.join(val_dir, "contigs.fa")
     asm_cmd = [ASSEMBLE, val_dir + "/", "--mers", mers, "-o", asm_out,
-               "--max-assign", str(max_assign)]
+               "-t", str(threads), "--max-assign", str(max_assign)]
     if trim is True:
         asm_cmd.append("--trim")
     elif trim is False:
@@ -217,8 +224,6 @@ def process_one(genome, mers, base_dir, threads, trim, vote_frac=0.05,
         asm_cmd += ["--max-loci-gap", str(max_loci_gap)]
     if snp:
         asm_cmd.append("--snp")
-    if cne_ref:
-        asm_cmd += ["--cne-ref", cne_ref]
     result_rc = _run(asm_cmd, log)
     log.close()
 
@@ -267,6 +272,7 @@ def cmd_assemble(args):
     check_binaries()
     cmd = [ASSEMBLE, args.input_dir,
            "--mers", args.mers,
+           "-t", str(args.threads),
            "-o", args.output]
     if args.max_assign is not None:
         cmd += ["--max-assign", str(args.max_assign)]
@@ -301,20 +307,17 @@ def cmd_pipeline(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    cne_ref = None
     mers = args.mers
-    if mers:
-        ref_path = os.path.join(os.path.dirname(os.path.abspath(mers)), "ref.fa")
-        if os.path.exists(ref_path):
-            cne_ref = ref_path
     if args.cne:
         filtered = os.path.join(args.output_dir, "msa.filtered.fa")
         subprocess.run(["python3", os.path.join(C.ROOT, "src", "00.filter_msa.py"),
-                        args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered])
+                        args.cne, "--min-species", "8", "--min-avg-len", "50", "-o", filtered],
+                       check=True)
         mers = os.path.join(args.output_dir, "mers_table.tsv")
+        mertable_threads = max(1, args.threads * args.jobs)
         subprocess.run([MERTABLE,
-                        filtered, "-k", "13", "-c", "4", "-o", mers])
-        cne_ref = os.path.join(args.output_dir, "ref.fa")
+                        filtered, "-k", "13", "-c", "4", "-t", str(mertable_threads), "-o", mers],
+                       check=True)
 
     trim = getattr(args, 'trim', None)
     rescue_panels = getattr(args, 'rescue_panels', None)
@@ -346,7 +349,7 @@ def cmd_pipeline(args):
                             args.vote_frac,
                             args.window_size, args.step_size, args.type, log_dir,
                             keep_validate=getattr(args, 'keep_validate', False),
-                            depth=args.depth, cne_ref=cne_ref, ssd_dir=_SSD_DIR,
+                            depth=args.depth, ssd_dir=_SSD_DIR,
                             tiers=getattr(args, 'tiers', None),
                             max_assign=getattr(args, 'max_assign', 3),
                             trim_margin=getattr(args, 'trim_margin', None),
@@ -361,12 +364,16 @@ def cmd_pipeline(args):
                             snp=getattr(args, 'snp', False))
             futures[f] = name
 
+        any_fail = False
         for f in as_completed(futures):
             contigs, rc = f.result()
+            if rc != 0:
+                any_fail = True
             status = "✓" if rc == 0 else "✗"
             print(f"  {status}  {futures[f]:<30} {contigs:>6} contigs")
 
     check_tree_deps()
+    return 1 if any_fail else 0
 
 
 def main():
@@ -404,6 +411,7 @@ def main():
     p_asm = sub.add_parser("assemble", help="De Bruijn assembly from validated reads")
     p_asm.add_argument("input_dir", help="Directory with Assemble.*.reads files")
     p_asm.add_argument("--mers", required=True, help="Confident k-mer table")
+    p_asm.add_argument("-t", "--threads", type=int, default=4, help="Worker threads (default: 4)")
     p_asm.add_argument("-o", "--output", default="assembled.fasta", help="Output FASTA (default: assembled.fasta)")
     p_asm.add_argument("-k", "--kmer", type=int, default=None,
                        help="Single-k length (default: binary 19; reads mode uses --multi-k 27)")

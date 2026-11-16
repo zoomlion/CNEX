@@ -6,7 +6,9 @@
 
 #include <tsl/robin_set.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -229,7 +232,7 @@ static inline bool is_gz_file(const std::string& path) {
 
 class BufferedLineReader {
 public:
-    explicit BufferedLineReader(const std::string& path) {
+    explicit BufferedLineReader(const std::string& path) : buf_(1 << 18) {
         if (is_gz_file(path)) {
             std::string cmd = "pigz -dc \"" + path + "\" 2>/dev/null";
             fp_ = popen(cmd.c_str(), "r");
@@ -250,40 +253,53 @@ public:
         }
     }
 
-    bool readline(std::string& line) {
-        line.clear();
-        while (true) {
-            auto nl = buffer_.find('\n', pos_);
-            if (nl != std::string::npos) {
-                line = buffer_.substr(pos_, nl - pos_);
-                pos_ = nl + 1;
+    bool readline_view(const char*& out_ptr, size_t& out_len) {
+        if (pos_ < len_) {
+            const char* start = buf_.data() + pos_;
+            const char* nl = static_cast<const char*>(std::memchr(start, '\n', len_ - pos_));
+            if (nl != nullptr) {
+                out_ptr = start;
+                out_len = static_cast<size_t>(nl - start);
+                pos_ += out_len + 1;
                 return true;
             }
-            if (pos_ < buffer_.size()) {
-                buffer_ = buffer_.substr(pos_);
-            } else {
-                buffer_.clear();
+        }
+        spill_.clear();
+        while (true) {
+            if (pos_ < len_) {
+                const char* start = buf_.data() + pos_;
+                const char* nl = static_cast<const char*>(std::memchr(start, '\n', len_ - pos_));
+                if (nl != nullptr) {
+                    size_t chunk_len = static_cast<size_t>(nl - start);
+                    spill_.append(start, chunk_len);
+                    pos_ += chunk_len + 1;
+                    out_ptr = spill_.data();
+                    out_len = spill_.size();
+                    return true;
+                }
+                spill_.append(start, len_ - pos_);
+                pos_ = len_;
             }
             pos_ = 0;
-            size_t bytes_read = fread(raw_, 1, sizeof(raw_), fp_);
-            if (bytes_read == 0) {
-                if (!buffer_.empty()) {
-                    line = std::move(buffer_);
-                    buffer_.clear();
+            len_ = fread(buf_.data(), 1, buf_.size(), fp_);
+            if (len_ == 0) {
+                if (!spill_.empty()) {
+                    out_ptr = spill_.data();
+                    out_len = spill_.size();
                     return true;
                 }
                 return false;
             }
-            buffer_.append(raw_, bytes_read);
         }
     }
 
 private:
     FILE* fp_ = nullptr;
     bool is_pipe_ = false;
-    char raw_[65536];
-    std::string buffer_;
+    std::vector<char> buf_;
+    std::string spill_;
     size_t pos_ = 0;
+    size_t len_ = 0;
 };
 
 struct GenomePos {
@@ -292,15 +308,14 @@ struct GenomePos {
     int end;
 };
 
-bool parse_genome_id(const std::string& seq_id, GenomePos& pos) {
+inline bool parse_genome_id_sv(std::string_view seq_id, std::string& chr, int& start, int& end) {
     const size_t dash = seq_id.rfind('-');
-    if (dash == std::string::npos || dash == 0 || dash + 1 >= seq_id.size())
+    if (dash == std::string_view::npos || dash == 0 || dash + 1 >= seq_id.size())
         return false;
     const size_t colon = seq_id.rfind(':', dash);
-    if (colon == std::string::npos || colon == 0 || colon + 1 >= dash)
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 >= dash)
         return false;
-    for (size_t i = 0; i < seq_id.size(); ++i) {
-        const unsigned char c = static_cast<unsigned char>(seq_id[i]);
+    for (unsigned char c : seq_id) {
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v')
             return false;
     }
@@ -308,9 +323,10 @@ bool parse_genome_id(const std::string& seq_id, GenomePos& pos) {
         if (seq_id[i] < '0' || seq_id[i] > '9') return false;
     for (size_t i = dash + 1; i < seq_id.size(); ++i)
         if (seq_id[i] < '0' || seq_id[i] > '9') return false;
-    pos.chr = seq_id.substr(0, colon);
-    pos.start = std::stoi(seq_id.substr(colon + 1, dash - colon - 1));
-    pos.end = std::stoi(seq_id.substr(dash + 1));
+    auto r1 = std::from_chars(seq_id.data() + colon + 1, seq_id.data() + dash, start);
+    auto r2 = std::from_chars(seq_id.data() + dash + 1, seq_id.data() + seq_id.size(), end);
+    if (r1.ec != std::errc{} || r2.ec != std::errc{}) return false;
+    chr.assign(seq_id.data(), colon);
     return true;
 }
 
@@ -336,11 +352,13 @@ struct PanelScorer {
         if (it == panels->end()) return out;
         std::vector<double> ids;
         ids.reserve(it->second.size());
+        parasail_profile_t* prof = parasail_profile_create_stats_16(
+            seq.c_str(), static_cast<int>(seq.size()), mat);
+        if (!prof) throw std::runtime_error("parasail_profile_create_stats_16 failed");
         for (const std::string& ref : it->second) {
             if (ref.empty()) continue;
-            parasail_result_t* r = parasail_sw_stats_striped_16(
-                seq.c_str(), static_cast<int>(seq.size()),
-                ref.c_str(), static_cast<int>(ref.size()), 2, 1, mat);
+            parasail_result_t* r = parasail_sw_stats_striped_profile_16(
+                prof, ref.c_str(), static_cast<int>(ref.size()), 2, 1);
             if (r->stats->length > 0) {
                 const int mn = static_cast<int>(std::min(seq.size(), ref.size()));
                 const double cov = mn > 0 ? static_cast<double>(r->stats->length) / mn : 0.0;
@@ -350,6 +368,7 @@ struct PanelScorer {
             }
             parasail_result_free(r);
         }
+        parasail_profile_free(prof);
         if (ids.empty()) return out;
         std::sort(ids.begin(), ids.end());
         out.n_used = static_cast<int>(ids.size());
@@ -375,45 +394,68 @@ struct ContigScore {
     int distinct = 0;
 };
 
-ContigScore score_contig(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
-    ContigScore sc;
-    int mer_size = mqm.get_mer_size();
-    tsl::robin_set<uint32_t> seen;
-    for (size_t i = 0; i + mer_size <= seq.size(); ++i) {
-        uint32_t code;
-        if (!encode_mer_at(seq, i, mer_size, code)) continue;
-        auto it = mqm.compressed_mer_query.find(code);
-        if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-            ++sc.hits;
-            seen.insert(code);
+template <typename Fn>
+static inline void scan_ele_mers(std::string_view seq, const MerQueryManager& mqm,
+                                 int ele_id, Fn&& fn) {
+    const int ms = mqm.get_mer_size();
+    const int L = static_cast<int>(seq.size());
+    if (ms <= 0 || L < ms) return;
+    static constexpr std::array<int8_t, 256> base_lut = [] {
+        std::array<int8_t, 256> t{};
+        for (int i = 0; i < 256; ++i) t[i] = -1;
+        t['A'] = 0; t['C'] = 1; t['G'] = 2; t['T'] = 3;
+        return t;
+    }();
+    const uint32_t mask = static_cast<uint32_t>((1ULL << (2 * ms)) - 1ULL);
+    uint32_t code = 0;
+    int run = 0;
+    for (int i = 0; i < L; ++i) {
+        int8_t b = base_lut[static_cast<unsigned char>(seq[i])];
+        if (b < 0) { run = 0; code = 0; continue; }
+        code = ((code << 2) | static_cast<uint32_t>(b)) & mask;
+        if (++run >= ms) {
+            if (mqm.has_id_fast(code, ele_id)) {
+                fn(i - ms + 1, code);
+            }
         }
     }
-    sc.distinct = static_cast<int>(seen.size());
+}
+
+ContigScore score_contig(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
+    ContigScore sc;
+    thread_local std::vector<uint32_t> seen;
+    seen.clear();
+    scan_ele_mers(seq, mqm, ele_id, [&](int, uint32_t code) {
+        ++sc.hits;
+        seen.push_back(code);
+    });
+    if (!seen.empty()) {
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        sc.distinct = static_cast<int>(seen.size());
+    }
     return sc;
 }
 
-std::unordered_map<std::string, int> build_node_scores(
-    const Graph& graph, const MerQueryManager& mqm, int ele_id, int k)
-{
-    std::unordered_map<std::string, int> scores;
-    scores.reserve(graph.size());
-    int mer_size = mqm.get_mer_size();
-    for (const auto& [node, _] : graph) {
-        if (node.size() < (size_t)mer_size) continue;
-        int score = 0;
-        for (size_t i = 0; i + mer_size <= node.size(); ++i) {
-            uint32_t code;
-            if (!encode_mer_at(node, i, mer_size, code)) continue;
-            auto it = mqm.compressed_mer_query.find(code);
-            if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-                ++score;
-            }
-        }
-        if (score > 0) {
-            scores[node] = score;
-        }
+static inline std::pair<ContigScore, int> score_and_span(
+    const std::string& seq, const MerQueryManager& mqm, int ele_id) {
+    ContigScore sc;
+    thread_local std::vector<uint32_t> seen;
+    seen.clear();
+    int first = -1, last = -1;
+    scan_ele_mers(seq, mqm, ele_id, [&](int pos, uint32_t code) {
+        ++sc.hits;
+        seen.push_back(code);
+        if (first < 0) first = pos;
+        last = pos;
+    });
+    if (!seen.empty()) {
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        sc.distinct = static_cast<int>(seen.size());
     }
-    return scores;
+    int span = (first < 0) ? 0 : (last - first + mqm.get_mer_size());
+    return {sc, span};
 }
 
 std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
@@ -423,20 +465,33 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
                                bool debug = false)
 {
     const bool need_kcounts = (gfa_out != nullptr);
-    auto [graph, kmer_counts, e_counts] =
-        de_bruijn_graph(reads, k, min_count, need_kcounts, snp_out != nullptr);
-    if (graph.empty()) return "";
+    const bool need_ecounts = (snp_out != nullptr);
+    IndexedGraph g = build_indexed_graph(reads, static_cast<uint64_t>(k),
+                                         min_count, need_kcounts, need_ecounts);
+    if (g.empty()) return "";
 
-    std::unordered_map<std::string, int> node_scores = build_node_scores(graph, mqm, ele_id, k);
+    std::vector<int> node_scores(g.V, 0);
+    bool has_any_score = false;
+    const int mer_size = mqm.get_mer_size();
+    for (int u = 0; u < g.V; ++u) {
+        if (g.out_deg[u] == 0) continue;   // matches Graph iteration in legacy build_node_scores
+        if (g.nodes[u].size() < static_cast<size_t>(mer_size)) continue;
+        int sc = 0;
+        scan_ele_mers(g.nodes[u], mqm, ele_id, [&](int, uint32_t) { ++sc; });
+        if (sc > 0) {
+            node_scores[u] = sc;
+            has_any_score = true;
+        }
+    }
 
-    std::vector<std::string> contig_path;
-    std::string contig = assemble_sequence(graph, node_scores, &contig_path);
+    std::vector<int> contig_path;
+    std::string contig = assemble_sequence_idx(g, node_scores, has_any_score, &contig_path);
 
-    if (!node_scores.empty() && !contig.empty()) {
+    if (has_any_score && !contig.empty()) {
         ContigScore cs1 = score_contig(contig, mqm, ele_id);
         if (cs1.hits < 3) {
-            auto path2 = anchored_trace(graph, node_scores);
-            std::string contig2 = path_to_string(path2);
+            auto path2 = anchored_trace_idx(g, node_scores);
+            std::string contig2 = path_to_string_idx(g, path2);
             ContigScore cs2 = score_contig(contig2, mqm, ele_id);
             if (debug)
                 std::cerr << "DBG ele=" << ele_id << " pass1 hits=" << cs1.hits
@@ -452,27 +507,21 @@ std::string debruijn_assemble(const std::vector<std::string>& reads, int k,
 
     bool has_var = false;
     if (snp_out && !contig_path.empty())
-        has_var = scan_snps(graph, e_counts, contig_path, contig, ele_id, k, *snp_out);
+        has_var = scan_snps_idx(g, contig_path, ele_id, k, *snp_out);
 
     if (has_var && gfa_out && !contig_path.empty())
-        export_path_gfa(graph, node_scores, contig_path, ele_id, k, *gfa_out, &kmer_counts);
+        export_path_gfa_idx(g, node_scores, contig_path, ele_id, k, *gfa_out);
 
     return contig;
 }
 
 static int target_span(const std::string& seq, const MerQueryManager& mqm, int ele_id) {
-    const int mer_size = mqm.get_mer_size();
     int first = -1, last = -1;
-    for (size_t i = 0; i + mer_size <= seq.size(); ++i) {
-        uint32_t code;
-        if (!encode_mer_at(seq, i, mer_size, code)) continue;
-        auto it = mqm.compressed_mer_query.find(code);
-        if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-            if (first < 0) first = static_cast<int>(i);
-            last = static_cast<int>(i);
-        }
-    }
-    return first < 0 ? 0 : last - first + mer_size;
+    scan_ele_mers(seq, mqm, ele_id, [&](int pos, uint32_t) {
+        if (first < 0) first = pos;
+        last = pos;
+    });
+    return first < 0 ? 0 : last - first + mqm.get_mer_size();
 }
 
 void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id, int margin) {
@@ -481,15 +530,10 @@ void trim_contig(std::string& seq, const MerQueryManager& mqm, int ele_id, int m
     int n = static_cast<int>(seq.size()) - mer_size + 1;
 
     int first_hit = -1, last_hit = -1;
-    for (int i = 0; i < n; ++i) {
-        uint32_t code;
-        if (!encode_mer_at(seq, static_cast<size_t>(i), mer_size, code)) continue;
-        auto it = mqm.compressed_mer_query.find(code);
-        if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, ele_id)) {
-            if (first_hit < 0) first_hit = i;
-            last_hit = i;
-        }
-    }
+    scan_ele_mers(seq, mqm, ele_id, [&](int pos, uint32_t) {
+        if (first_hit < 0) first_hit = pos;
+        last_hit = pos;
+    });
 
     if (first_hit < 0) return;
 
@@ -512,24 +556,34 @@ static void polish_contig(std::string& contig, const std::vector<std::string>& r
     const int L = static_cast<int>(contig.size());
     if (L < k + 5 || reads.size() < 2) return;
     static const char BASES[4] = {'A', 'C', 'G', 'T'};
+    static constexpr std::array<int8_t, 256> bidx_lut = [] {
+        std::array<int8_t, 256> t{};
+        for (int i = 0; i < 256; ++i) t[i] = -1;
+        t['A'] = 0; t['C'] = 1; t['G'] = 2; t['T'] = 3;
+        return t;
+    }();
     auto bidx = [](char c) -> int {
-        switch (c) { case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; default: return -1; }
+        return bidx_lut[static_cast<unsigned char>(c)];
     };
-    auto comp = [](char c) -> char {
-        switch (c) { case 'A': return 'T'; case 'C': return 'G'; case 'G': return 'C'; case 'T': return 'A'; default: return 'N'; }
-    };
-    std::unordered_map<uint32_t, std::vector<int>> idx;
-    std::string rcbuf;
-    // Flat, epoch-stamped offset counters: offset d lies in [-base, L-k], so a
-    // dense array replaces the per-read hash map (no allocation per read).
+    const uint32_t mer_mask = static_cast<uint32_t>((1ULL << (2 * k)) - 1ULL);
+
+    thread_local tsl::robin_map<uint32_t, std::vector<int>> idx;
+    thread_local std::vector<uint32_t> fwd_codes, rc_codes;
     thread_local std::vector<int> offcnt, offstamp;
     thread_local std::vector<int> touched;
     thread_local int offep = 0;
+
     for (int it = 0; it < iters; ++it) {
         idx.clear();
-        for (int i = 0; i + k <= L; ++i) {
-            uint32_t code;
-            if (encode_mer_at(contig, static_cast<size_t>(i), k, code)) idx[code].push_back(i);
+        {
+            uint32_t rolling = 0;
+            int valid_run = 0;
+            for (int i = 0; i < L; ++i) {
+                int b = bidx(contig[i]);
+                if (b < 0) { valid_run = 0; rolling = 0; continue; }
+                rolling = ((rolling << 2) | static_cast<uint32_t>(b)) & mer_mask;
+                if (++valid_run >= k) idx[rolling].push_back(i - k + 1);
+            }
         }
         std::vector<std::array<int, 4>> cnt(L);
         for (int i = 0; i < L; ++i) {
@@ -537,10 +591,12 @@ static void polish_contig(std::string& contig, const std::vector<std::string>& r
             int b = bidx(contig[i]);
             if (b >= 0) cnt[i][b] = 1;   // contig base seeds the vote (tie-break)
         }
-        auto place = [&](const std::string& q, int& m, int& ov, int& d) {
-            const int n = static_cast<int>(q.size());
+        auto place_codes = [&](const std::string& r, const std::vector<uint32_t>& codes,
+                               bool is_rc, int& m, int& ov, int& d) {
+            const int n = static_cast<int>(r.size());
             m = -1; ov = 0; d = 0;
             if (n < k) return;
+            const int nc = n - k + 1;
             const int base = n - k;            // offset d_min = -base
             const int D = (L - k) + base + 1;  // offsets in [-base, L-k]
             if (static_cast<int>(offcnt.size()) < D) {
@@ -550,9 +606,9 @@ static void polish_contig(std::string& contig, const std::vector<std::string>& r
             ++offep;
             if (offep == 0) { std::fill(offstamp.begin(), offstamp.end(), 0); offep = 1; }
             touched.clear();
-            for (int i = 0; i + k <= n; ++i) {
-                uint32_t code;
-                if (!encode_mer_at(q, static_cast<size_t>(i), k, code)) continue;
+            for (int i = 0; i < nc; ++i) {
+                uint32_t code = codes[i];
+                if (code == UINT32_MAX) continue;
                 auto ii = idx.find(code);
                 if (ii == idx.end()) continue;
                 for (int cp : ii->second) {
@@ -569,24 +625,56 @@ static void polish_contig(std::string& contig, const std::vector<std::string>& r
             ov = hi - lo;
             if (ov <= 0) return;
             int mm = 0;
-            for (int p = lo; p < hi; ++p) if (q[p - bd] == contig[p]) ++mm;
+            if (!is_rc) {
+                for (int p = lo; p < hi; ++p) if (r[p - bd] == contig[p]) ++mm;
+            } else {
+                for (int p = lo; p < hi; ++p) {
+                    int cb = bidx(r[n - 1 - (p - bd)]);
+                    char rc_c = (cb >= 0) ? BASES[3 - cb] : 'N';
+                    if (rc_c == contig[p]) ++mm;
+                }
+            }
             m = mm; d = bd;
         };
         for (const auto& r : reads) {
-            rcbuf.assign(r.rbegin(), r.rend());
-            for (char& c : rcbuf) c = comp(c);
+            const int n = static_cast<int>(r.size());
+            if (n < k) continue;
+            const int nc = n - k + 1;
+            fwd_codes.assign(nc, UINT32_MAX);
+            rc_codes.assign(nc, UINT32_MAX);
+            {
+                uint32_t rolling = 0, rc_rolling = 0;
+                int valid_run = 0;
+                for (int i = 0; i < n; ++i) {
+                    int b = bidx(r[i]);
+                    if (b < 0) { valid_run = 0; rolling = 0; rc_rolling = 0; continue; }
+                    rolling = ((rolling << 2) | static_cast<uint32_t>(b)) & mer_mask;
+                    rc_rolling = (rc_rolling >> 2) | (static_cast<uint32_t>(3 - b) << (2 * k - 2));
+                    if (++valid_run >= k) {
+                        int j = i - k + 1;
+                        fwd_codes[j] = rolling;
+                        rc_codes[nc - 1 - j] = rc_rolling;
+                    }
+                }
+            }
             int mf, of, df, mr, orr, dr;
-            place(r, mf, of, df);
-            place(rcbuf, mr, orr, dr);
+            place_codes(r, fwd_codes, false, mf, of, df);
+            place_codes(r, rc_codes, true, mr, orr, dr);
             const bool use_rc = (mr * of > mf * orr) ||
                                 (mr * of == mf * orr && mr > mf);
-            const std::string& q = use_rc ? rcbuf : r;
             const int m = use_rc ? mr : mf, ov = use_rc ? orr : of, d = use_rc ? dr : df;
             if (m < 0 || m < static_cast<int>(min_ident * ov)) continue;
-            int lo = std::max(0, d), hi = std::min(L, d + static_cast<int>(q.size()));
-            for (int p = lo; p < hi; ++p) {
-                int b = bidx(q[p - d]);
-                if (b >= 0) ++cnt[p][b];
+            int lo = std::max(0, d), hi = std::min(L, d + n);
+            if (!use_rc) {
+                for (int p = lo; p < hi; ++p) {
+                    int b = bidx(r[p - d]);
+                    if (b >= 0) ++cnt[p][b];
+                }
+            } else {
+                for (int p = lo; p < hi; ++p) {
+                    int b = bidx(r[n - 1 - (p - d)]);
+                    if (b >= 0) ++cnt[p][3 - b];
+                }
             }
         }
         for (int i = 0; i < L; ++i) {
@@ -624,39 +712,92 @@ static std::vector<int> cluster_reads_by_shared_kmers(
         return x;
     };
 
-    std::unordered_map<uint32_t, std::vector<int>> occ;
+    static constexpr std::array<int8_t, 256> base_lut = [] {
+        std::array<int8_t, 256> t{};
+        for (int i = 0; i < 256; ++i) t[i] = -1;
+        t['A'] = 0; t['C'] = 1; t['G'] = 2; t['T'] = 3;
+        return t;
+    }();
+    // Matches encode_mer_at(..., uint32_t&) wraparound semantics when k > 16.
+    const uint32_t mask = (k >= 16) ? 0xFFFFFFFFu : ((1u << (2 * k)) - 1u);
+
+    thread_local std::vector<std::pair<uint32_t, int>> occ_pairs;
+    occ_pairs.clear();
     for (int i = 0; i < n; ++i) {
         const std::string& s = reads[i];
-        const int last = static_cast<int>(s.size()) - k;
-        for (int p = 0; p <= last; ++p) {
-            uint32_t code;
-            if (!encode_mer_at(s, static_cast<size_t>(p), static_cast<size_t>(k), code))
-                continue;
-            auto& lst = occ[code];
-            if (!lst.empty() && lst.back() == i) continue;
-            lst.push_back(i);
-        }
-    }
-
-    std::unordered_map<uint64_t, double> pair_score;
-    for (const auto& kv : occ) {
-        const auto& lst = kv.second;
-        if (lst.size() < 2 || lst.size() > 128) continue;
-        const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(lst.size());
-        for (size_t a = 0; a + 1 < lst.size(); ++a) {
-            for (size_t b = a + 1; b < lst.size(); ++b) {
-                int x = lst[a], y = lst[b];
-                if (x > y) std::swap(x, y);
-                pair_score[(static_cast<uint64_t>(x) << 32) |
-                           static_cast<uint32_t>(y)] += w;
+        const int slen = static_cast<int>(s.size());
+        uint32_t rolling = 0;
+        int valid_run = 0;
+        for (int p = 0; p < slen; ++p) {
+            int8_t b = base_lut[static_cast<unsigned char>(s[p])];
+            if (b < 0) { valid_run = 0; rolling = 0; continue; }
+            rolling = ((rolling << 2) | static_cast<uint32_t>(b)) & mask;
+            if (++valid_run >= k) {
+                occ_pairs.emplace_back(rolling, i);
             }
         }
     }
-    for (const auto& kv : pair_score) {
-        if (kv.second < min_score) continue;
-        int a = find_root(static_cast<int>(kv.first >> 32));
-        int b = find_root(static_cast<int>(kv.first & 0xffffffffu));
-        if (a != b) parent[b] = a;
+    std::sort(occ_pairs.begin(), occ_pairs.end());
+    occ_pairs.erase(std::unique(occ_pairs.begin(), occ_pairs.end()), occ_pairs.end());
+
+    if (n <= 512) {
+        thread_local std::vector<double> pair_mat;
+        pair_mat.assign(static_cast<size_t>(n) * static_cast<size_t>(n), 0.0);
+        size_t r0 = 0;
+        const size_t m = occ_pairs.size();
+        while (r0 < m) {
+            uint32_t code = occ_pairs[r0].first;
+            size_t r1 = r0 + 1;
+            while (r1 < m && occ_pairs[r1].first == code) ++r1;
+            const size_t cnt = r1 - r0;
+            if (cnt >= 2 && cnt <= 128) {
+                const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(cnt);
+                for (size_t a = r0; a + 1 < r1; ++a) {
+                    int x = occ_pairs[a].second;
+                    double* row = pair_mat.data() + static_cast<size_t>(x) * static_cast<size_t>(n);
+                    for (size_t b = a + 1; b < r1; ++b) {
+                        row[occ_pairs[b].second] += w;
+                    }
+                }
+            }
+            r0 = r1;
+        }
+        for (int x = 0; x + 1 < n; ++x) {
+            const double* row = pair_mat.data() + static_cast<size_t>(x) * static_cast<size_t>(n);
+            for (int y = x + 1; y < n; ++y) {
+                if (row[y] < min_score) continue;
+                int a = find_root(x);
+                int b = find_root(y);
+                if (a != b) parent[b] = a;
+            }
+        }
+    } else {
+        tsl::robin_map<uint64_t, double> pair_score;
+        size_t r0 = 0;
+        const size_t m = occ_pairs.size();
+        while (r0 < m) {
+            uint32_t code = occ_pairs[r0].first;
+            size_t r1 = r0 + 1;
+            while (r1 < m && occ_pairs[r1].first == code) ++r1;
+            const size_t cnt = r1 - r0;
+            if (cnt >= 2 && cnt <= 128) {
+                const double w = count_mode ? 1.0 : 1.0 / static_cast<double>(cnt);
+                for (size_t a = r0; a + 1 < r1; ++a) {
+                    for (size_t b = a + 1; b < r1; ++b) {
+                        int x = occ_pairs[a].second, y = occ_pairs[b].second;
+                        pair_score[(static_cast<uint64_t>(x) << 32) |
+                                   static_cast<uint32_t>(y)] += w;
+                    }
+                }
+            }
+            r0 = r1;
+        }
+        for (const auto& kv : pair_score) {
+            if (kv.second < min_score) continue;
+            int a = find_root(static_cast<int>(kv.first >> 32));
+            int b = find_root(static_cast<int>(kv.first & 0xffffffffu));
+            if (a != b) parent[b] = a;
+        }
     }
     for (int i = 0; i < n; ++i) parent[i] = find_root(i);
     return parent;
@@ -683,6 +824,7 @@ static void process_genome_element(
     };
     std::vector<EleRead> ele_reads;
     ele_reads.reserve(end - begin);
+    thread_local std::vector<uint32_t> seen_codes;
     size_t idx = begin;
     while (idx < end) {
         const auto& r = all_reads[idx];
@@ -691,27 +833,24 @@ static void process_genome_element(
         // Repeat ratio check for genome mode; the distinct element-mer count
         // doubles as a per-read score bound for branch-and-bound below.
         {
-            thread_local tsl::robin_set<uint32_t> seen;
-            seen.clear();
+            seen_codes.clear();
             int total = 0;
-            int ms = mqm.get_mer_size();
-            for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
-                uint32_t code;
-                if (encode_mer_at(local_seq, k, ms, code)) {
-                    auto it = mqm.compressed_mer_query.find(code);
-                    if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, cur_ele)) {
-                        ++total;
-                        seen.insert(code);
-                    }
-                }
+            scan_ele_mers(local_seq, mqm, cur_ele, [&](int, uint32_t code) {
+                ++total;
+                seen_codes.push_back(code);
+            });
+            int n_distinct = 0;
+            if (!seen_codes.empty()) {
+                std::sort(seen_codes.begin(), seen_codes.end());
+                seen_codes.erase(std::unique(seen_codes.begin(), seen_codes.end()), seen_codes.end());
+                n_distinct = static_cast<int>(seen_codes.size());
             }
-            double ratio = (double)total / std::max(1, (int)seen.size());
+            double ratio = static_cast<double>(total) / std::max(1, n_distinct);
             if (ratio > args.repeat_ratio) {
                 ++idx;
                 continue;
             }
-            ele_reads.push_back(EleRead{r, std::move(local_seq),
-                                        static_cast<int>(seen.size()), total});
+            ele_reads.push_back(EleRead{r, std::move(local_seq), n_distinct, total});
         }
         ++idx;
     }
@@ -954,9 +1093,15 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "Loading mers table from " << args.mers_file << " ...\n";
         MerQueryManager mqm;
-        mqm.load_from_file(args.mers_file, args.max_assign);
+        mqm.load_from_file(args.mers_file, args.max_assign, true);
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
+        if (mer_size >= 7 && mer_size <= 13) {
+            mqm.build_direct_index();
+        }
+        if (!mqm.has_direct_index()) {
+            mqm.ensure_hashmap();
+        }
 
         // Optional leave-one-out panels for cluster selection / low-support
         // rescue. The strict path is untouched when this is empty.
@@ -975,7 +1120,7 @@ int main(int argc, char* argv[]) {
                       << " sequences; rescue tau=" << args.rescue_tau << "\n";
         }
 
-        // Phase 1: Read all Assemble.*.reads files
+        // Phase 1: Read all Assemble.*.reads files (in parallel across shards)
         std::vector<Read> all_reads;
         bool is_genome = false;
 
@@ -983,57 +1128,107 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Input directory not found: " + args.input_dir);
         }
 
+        std::vector<std::string> read_files;
         for (const auto& entry : fs::directory_iterator(args.input_dir)) {
             auto path = entry.path().string();
             if (path.find("Assemble.") == std::string::npos) continue;
             if (path.rfind(".reads") != path.size() - 6) continue;
+            read_files.push_back(std::move(path));
+        }
+        std::sort(read_files.begin(), read_files.end());
 
-            BufferedLineReader reader(path);
-            std::string line;
-            while (reader.readline(line)) {
-                if (line.empty()) continue;
-                // Parse 4 columns
-                size_t t1 = line.find('\t');
-                if (t1 == std::string::npos) continue;
-                size_t t2 = line.find('\t', t1 + 1);
-                if (t2 == std::string::npos) continue;
-                size_t t3 = line.find('\t', t2 + 1);
-                if (t3 == std::string::npos) continue;
+        const int nthreads = std::max(1, args.threads);
+        if (!read_files.empty()) {
+            std::vector<std::vector<Read>> per_file(read_files.size());
+            std::vector<uint8_t> file_is_genome(read_files.size(), 0);
+            std::atomic<size_t> next_file{0};
+            const size_t n_readers = std::min<size_t>(static_cast<size_t>(nthreads), read_files.size());
 
-                std::string seq_id = line.substr(0, t1);
-                int strand = std::stoi(line.substr(t1 + 1, t2 - t1 - 1));
-                int ele_id = std::stoi(line.substr(t2 + 1, t3 - t2 - 1));
-                // Optional 5th column: rescue score from validate (tab-separated).
-                size_t t4 = line.find('\t', t3 + 1);
-                std::string seq = (t4 == std::string::npos)
-                    ? line.substr(t3 + 1)
-                    : line.substr(t3 + 1, t4 - t3 - 1);
+            auto read_worker = [&]() {
+                char num_tmp[64];
+                std::string chr_tmp;
+                while (true) {
+                    size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
+                    if (fi >= read_files.size()) break;
+                    auto& dst = per_file[fi];
+                    bool local_genome = false;
+                    BufferedLineReader reader(read_files[fi]);
+                    const char* p = nullptr;
+                    size_t len = 0;
+                    while (reader.readline_view(p, len)) {
+                        if (len == 0) continue;
+                        const char* e = p + len;
+                        const char* t1 = static_cast<const char*>(std::memchr(p, '\t', len));
+                        if (t1 == nullptr) continue;
+                        const char* t2 = static_cast<const char*>(
+                            std::memchr(t1 + 1, '\t', static_cast<size_t>(e - t1 - 1)));
+                        if (t2 == nullptr) continue;
+                        const char* t3 = static_cast<const char*>(
+                            std::memchr(t2 + 1, '\t', static_cast<size_t>(e - t2 - 1)));
+                        if (t3 == nullptr) continue;
+                        const char* t4 = static_cast<const char*>(
+                            std::memchr(t3 + 1, '\t', static_cast<size_t>(e - t3 - 1)));
+                        const char* seq_end = (t4 != nullptr) ? t4 : e;
+                        if (seq_end == t3 + 1) continue;
 
-                if (seq.empty()) continue;
+                        int strand = 0, ele_id = 0;
+                        auto r_st = std::from_chars(t1 + 1, t2, strand);
+                        auto r_el = std::from_chars(t2 + 1, t3, ele_id);
+                        if (r_st.ec != std::errc{} || r_el.ec != std::errc{}) continue;
 
-                Read read;
-                read.seq_id = seq_id;
-                read.strand = strand;
-                read.ele_id = ele_id;
-                read.seq = seq;
-                if (t4 != std::string::npos) {
-                    try { read.rescue = std::stod(line.substr(t4 + 1)); }
-                    catch (...) { read.rescue = 0.0; }
-                }
+                        Read read;
+                        read.seq_id.assign(p, static_cast<size_t>(t1 - p));
+                        read.strand = strand;
+                        read.ele_id = ele_id;
+                        read.seq.assign(t3 + 1, static_cast<size_t>(seq_end - (t3 + 1)));
+                        if (t4 != nullptr) {
+                            size_t rlen = static_cast<size_t>(e - (t4 + 1));
+                            if (rlen > 0 && rlen < sizeof(num_tmp)) {
+                                std::memcpy(num_tmp, t4 + 1, rlen);
+                                num_tmp[rlen] = '\0';
+                                char* endptr = nullptr;
+                                double rv = std::strtod(num_tmp, &endptr);
+                                if (endptr != num_tmp) read.rescue = rv;
+                            } else if (rlen > 0) {
+                                try { read.rescue = std::stod(std::string(t4 + 1, rlen)); }
+                                catch (...) { read.rescue = 0.0; }
+                            }
+                        }
 
-                GenomePos gp;
-                if (!is_genome && parse_genome_id(seq_id, gp)) {
-                    is_genome = true;
-                }
-                if (is_genome) {
-                    if (parse_genome_id(seq_id, gp)) {
-                        read.chr = gp.chr;
-                        read.start = gp.start;
-                        read.end = gp.end;
+                        int gp_start = 0, gp_end = 0;
+                        if (parse_genome_id_sv(std::string_view(p, static_cast<size_t>(t1 - p)),
+                                               chr_tmp, gp_start, gp_end)) {
+                            local_genome = true;
+                            read.chr = std::move(chr_tmp);
+                            read.start = gp_start;
+                            read.end = gp_end;
+                        }
+                        dst.push_back(std::move(read));
                     }
+                    file_is_genome[fi] = local_genome ? 1 : 0;
                 }
+            };
 
-                all_reads.push_back(std::move(read));
+            if (n_readers <= 1) {
+                read_worker();
+            } else {
+                std::vector<std::thread> rthreads;
+                rthreads.reserve(n_readers);
+                for (size_t i = 0; i < n_readers; ++i) rthreads.emplace_back(read_worker);
+                for (auto& t : rthreads) t.join();
+            }
+
+            size_t total_sz = 0;
+            for (size_t fi = 0; fi < read_files.size(); ++fi) {
+                total_sz += per_file[fi].size();
+                if (file_is_genome[fi]) is_genome = true;
+            }
+            all_reads.reserve(total_sz);
+            for (size_t fi = 0; fi < read_files.size(); ++fi) {
+                all_reads.insert(all_reads.end(),
+                                 std::make_move_iterator(per_file[fi].begin()),
+                                 std::make_move_iterator(per_file[fi].end()));
+                std::vector<Read>().swap(per_file[fi]);
             }
         }
 
@@ -1056,20 +1251,57 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        // Phase 2: Sort
-        if (is_genome) {
-            std::sort(all_reads.begin(), all_reads.end(),
-                [](const Read& a, const Read& b) {
-                    if (a.ele_id != b.ele_id) return a.ele_id < b.ele_id;
-                    if (a.chr != b.chr) return a.chr < b.chr;
-                    return a.start < b.start;
-                });
-        } else {
-            std::sort(all_reads.begin(), all_reads.end(),
-                [](const Read& a, const Read& b) {
-                    if (a.ele_id != b.ele_id) return a.ele_id < b.ele_id;
-                    return a.seq_id < b.seq_id;
-                });
+        // Phase 2: Group by ele_id in O(N) via counting buckets (with fallback to global sort).
+        // Within-element sorting happens in parallel inside the per-element workers.
+        std::vector<std::pair<size_t, size_t>> ele_ranges;
+        {
+            int min_ele = all_reads[0].ele_id;
+            int max_ele = all_reads[0].ele_id;
+            for (const auto& r : all_reads) {
+                if (r.ele_id < min_ele) min_ele = r.ele_id;
+                if (r.ele_id > max_ele) max_ele = r.ele_id;
+            }
+            if (min_ele >= 0 && max_ele < 20000000) {
+                const size_t n_bins = static_cast<size_t>(max_ele) + 1;
+                std::vector<size_t> counts(n_bins, 0);
+                for (const auto& r : all_reads) ++counts[r.ele_id];
+                std::vector<size_t> offsets(n_bins, 0);
+                size_t cur = 0;
+                for (size_t e = 0; e < n_bins; ++e) {
+                    offsets[e] = cur;
+                    if (counts[e] > 0) {
+                        ele_ranges.emplace_back(cur, cur + counts[e]);
+                        cur += counts[e];
+                    }
+                }
+                std::vector<Read> grouped(all_reads.size());
+                for (auto& r : all_reads) {
+                    grouped[offsets[r.ele_id]++] = std::move(r);
+                }
+                all_reads.swap(grouped);
+            } else {
+                if (is_genome) {
+                    std::sort(all_reads.begin(), all_reads.end(),
+                        [](const Read& a, const Read& b) {
+                            if (a.ele_id != b.ele_id) return a.ele_id < b.ele_id;
+                            if (a.chr != b.chr) return a.chr < b.chr;
+                            return a.start < b.start;
+                        });
+                } else {
+                    std::sort(all_reads.begin(), all_reads.end(),
+                        [](const Read& a, const Read& b) {
+                            if (a.ele_id != b.ele_id) return a.ele_id < b.ele_id;
+                            return a.seq_id < b.seq_id;
+                        });
+                }
+                size_t i = 0;
+                while (i < all_reads.size()) {
+                    size_t j = i + 1;
+                    while (j < all_reads.size() && all_reads[j].ele_id == all_reads[i].ele_id) ++j;
+                    ele_ranges.emplace_back(i, j);
+                    i = j;
+                }
+            }
         }
 
         // Phase 3: Group and assemble
@@ -1092,10 +1324,14 @@ int main(int argc, char* argv[]) {
         // Pure w.r.t. shared state (mqm/panels are read-only), so it can run
         // from several threads; the only shared resource is the optional SNP/GFA
         // stream pair, which is why the SNP path stays sequential.
-        auto process_reads_element = [&](const std::vector<Read>& pool,
+        auto process_reads_element = [&](std::vector<Read>& pool,
                                          size_t begin, size_t end,
                                          std::ofstream* snp_out_ptr,
                                          std::ofstream* gfa_out_ptr) -> std::string {
+                if (end - begin > 1) {
+                    std::sort(pool.begin() + begin, pool.begin() + end,
+                              [](const Read& a, const Read& b) { return a.seq_id < b.seq_id; });
+                }
                 size_t idx = begin;
                 int cur_ele = pool[idx].ele_id;
 
@@ -1104,6 +1340,7 @@ int main(int argc, char* argv[]) {
                 reads.reserve(args.max_reads);
                 std::vector<double> rescues;   // parallel to reads: T3 rescue score
                 rescues.reserve(args.max_reads);
+                thread_local std::vector<uint32_t> seen_codes;
                 int cnt = 0;
                 while (idx < end && cnt < args.max_reads) {
                     const auto& r = pool[idx];
@@ -1111,21 +1348,19 @@ int main(int argc, char* argv[]) {
                     normalize_read_seq(local_seq, r.strand);
                     // Repeat ratio check
                     {
-                        thread_local tsl::robin_set<uint32_t> seen;
-                        seen.clear();
+                        seen_codes.clear();
                         int total = 0;
-                        int ms = mqm.get_mer_size();
-                        for (int k = 0; k + ms <= (int)local_seq.size(); ++k) {
-                            uint32_t code;
-                            if (encode_mer_at(local_seq, k, ms, code)) {
-                                auto it = mqm.compressed_mer_query.find(code);
-                                if (it != mqm.compressed_mer_query.end() && mqm.has_id(it->second, cur_ele)) {
-                                    ++total;
-                                    seen.insert(code);
-                                }
-                            }
+                        scan_ele_mers(local_seq, mqm, cur_ele, [&](int, uint32_t code) {
+                            ++total;
+                            seen_codes.push_back(code);
+                        });
+                        int n_distinct = 0;
+                        if (!seen_codes.empty()) {
+                            std::sort(seen_codes.begin(), seen_codes.end());
+                            seen_codes.erase(std::unique(seen_codes.begin(), seen_codes.end()), seen_codes.end());
+                            n_distinct = static_cast<int>(seen_codes.size());
                         }
-                        double ratio = (double)total / std::max(1, (int)seen.size());
+                        double ratio = static_cast<double>(total) / std::max(1, n_distinct);
                         if (ratio > args.repeat_ratio) {
                             ++idx;
                             continue;
@@ -1340,9 +1575,9 @@ int main(int argc, char* argv[]) {
                         size_t ri = reads.size();
                         double best_pid = -1.0;
                         for (size_t i = 0; i < reads.size(); ++i) {
-                            ContigScore sc = score_contig(reads[i], mqm, cur_ele);
+                            auto [sc, sp] = score_and_span(reads[i], mqm, cur_ele);
                             if (sc.distinct < args.rescue_min_distinct) continue;
-                            if (target_span(reads[i], mqm, cur_ele) < args.rescue_min_span) continue;
+                            if (sp < args.rescue_min_span) continue;
                             double pid = psc.identity(cur_ele, reads[i], 0.5);
                             if (pid > best_pid) { best_pid = pid; ri = i; }
                         }
@@ -1416,19 +1651,9 @@ int main(int argc, char* argv[]) {
 
         if (!is_genome) {
             // One range per element so the work can fan out across threads.
-            std::vector<std::pair<size_t, size_t>> ranges;
-            {
-                size_t i = 0;
-                while (i < all_reads.size()) {
-                    size_t j = i + 1;
-                    while (j < all_reads.size() && all_reads[j].ele_id == all_reads[i].ele_id) ++j;
-                    ranges.emplace_back(i, j);
-                    i = j;
-                }
-            }
+            const auto& ranges = ele_ranges;
             std::vector<std::pair<int, std::string>> eres;
             eres.reserve(ranges.size());
-            const int nthreads = std::max(1, args.threads);
             if (args.output_snp || nthreads == 1 || ranges.size() <= 1) {
                 for (const auto& r : ranges) {
                     std::string c = process_reads_element(all_reads, r.first, r.second, snp_out_ptr, gfa_out_ptr);
@@ -1442,7 +1667,7 @@ int main(int argc, char* argv[]) {
                 for (int t = 0; t < nthreads; ++t) {
                     workers.emplace_back([&, t]() {
                         while (true) {
-                            size_t ri = next_range.fetch_add(1);
+                            size_t ri = next_range.fetch_add(1, std::memory_order_relaxed);
                             if (ri >= ranges.size()) break;
                             const auto rr = ranges[ri];
                             std::string c = process_reads_element(all_reads, rr.first, rr.second, nullptr, nullptr);
@@ -1465,19 +1690,9 @@ int main(int argc, char* argv[]) {
             for (auto& kv : final_map)
                 results.emplace_back(std::to_string(kv.first), std::move(kv.second));
         } else {
-            // Element blocks: all_reads is sorted by ele_id
-            std::vector<std::pair<size_t, size_t>> blocks;
-            {
-                size_t i = 0;
-                while (i < all_reads.size()) {
-                    size_t j = i + 1;
-                    while (j < all_reads.size() && all_reads[j].ele_id == all_reads[i].ele_id) ++j;
-                    blocks.emplace_back(i, j);
-                    i = j;
-                }
-            }
+            // Element blocks: grouped by ele_id
+            const auto& blocks = ele_ranges;
             std::vector<GenomeResult> grs;
-            const int nthreads = std::max(1, args.threads);
             if (nthreads == 1) {
                 for (const auto& b : blocks) {
                     process_genome_element(all_reads, b.first, b.second, args, mqm, &psc, grs);
@@ -1490,7 +1705,7 @@ int main(int argc, char* argv[]) {
                 for (int t = 0; t < nthreads; ++t) {
                     workers.emplace_back([&, t]() {
                         while (true) {
-                            size_t bi = next_block.fetch_add(1);
+                            size_t bi = next_block.fetch_add(1, std::memory_order_relaxed);
                             if (bi >= blocks.size()) break;
                             process_genome_element(all_reads, blocks[bi].first, blocks[bi].second,
                                                    args, mqm, &psc, per_thread[t]);

@@ -79,18 +79,18 @@ public:
 
     void push(std::vector<Read> chunk) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return queue_.size() < max_size_; });
+        cv_not_full_.wait(lock, [this] { return queue_.size() < max_size_; });
         queue_.push(std::move(chunk));
-        cv_.notify_one();
+        cv_not_empty_.notify_one();
     }
 
     bool pop(std::vector<Read>& chunk) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return !queue_.empty() || done_; });
+        cv_not_empty_.wait(lock, [this] { return !queue_.empty() || done_; });
         if (!queue_.empty()) {
             chunk = std::move(queue_.front());
             queue_.pop();
-            cv_.notify_one();
+            cv_not_full_.notify_one();
             return true;
         }
         return false;
@@ -99,13 +99,14 @@ public:
     void finish() {
         std::lock_guard<std::mutex> lock(mutex_);
         done_ = true;
-        cv_.notify_all();
+        cv_not_empty_.notify_all();
     }
 
 private:
     std::queue<std::vector<Read>> queue_;
     std::mutex mutex_;
-    std::condition_variable cv_;
+    std::condition_variable cv_not_empty_;
+    std::condition_variable cv_not_full_;
     bool done_ = false;
     size_t max_size_;
 };
@@ -120,7 +121,8 @@ static inline bool is_gz_file(const std::string& path) {
 
 class BufferedLineReader {
 public:
-    explicit BufferedLineReader(const std::string& path, const std::string& pigz_path) {
+    explicit BufferedLineReader(const std::string& path, const std::string& pigz_path)
+        : buf_(1 << 18) {
         if (is_gz_file(path)) {
             std::string cmd = pigz_path + " -dc \"" + path + "\" 2>/dev/null";
             fp_ = popen(cmd.c_str(), "r");
@@ -144,28 +146,23 @@ public:
     bool readline(std::string& line) {
         line.clear();
         while (true) {
-            auto nl = buffer_.find('\n', pos_);
-            if (nl != std::string::npos) {
-                line.assign(buffer_.data() + pos_, nl - pos_);
-                pos_ = nl + 1;
-                return true;
-            }
-            if (pos_ < buffer_.size()) {
-                buffer_ = buffer_.substr(pos_);
-            } else {
-                buffer_.clear();
-            }
-            pos_ = 0;
-            size_t bytes_read = fread(raw_, 1, sizeof(raw_), fp_);
-            if (bytes_read == 0) {
-                if (!buffer_.empty()) {
-                    line = std::move(buffer_);
-                    buffer_.clear();
+            if (pos_ < len_) {
+                const char* start = buf_.data() + pos_;
+                const char* nl = static_cast<const char*>(std::memchr(start, '\n', len_ - pos_));
+                if (nl != nullptr) {
+                    size_t chunk_len = static_cast<size_t>(nl - start);
+                    line.append(start, chunk_len);
+                    pos_ += chunk_len + 1;
                     return true;
                 }
-                return false;
+                line.append(start, len_ - pos_);
+                pos_ = len_;
             }
-            buffer_.append(raw_, bytes_read);
+            pos_ = 0;
+            len_ = fread(buf_.data(), 1, buf_.size(), fp_);
+            if (len_ == 0) {
+                return !line.empty();
+            }
         }
     }
 
@@ -173,36 +170,32 @@ public:
     // Mirrors readline's EOF behavior: a trailing line without '\n' counts
     // as one line, an empty remainder does not.
     bool skip_line() {
+        bool saw_bytes = false;
         while (true) {
-            auto nl = buffer_.find('\n', pos_);
-            if (nl != std::string::npos) {
-                pos_ = nl + 1;
-                return true;
-            }
-            if (pos_ < buffer_.size()) {
-                buffer_ = buffer_.substr(pos_);
-            } else {
-                buffer_.clear();
-            }
-            pos_ = 0;
-            size_t bytes_read = fread(raw_, 1, sizeof(raw_), fp_);
-            if (bytes_read == 0) {
-                if (!buffer_.empty()) {
-                    buffer_.clear();
+            if (pos_ < len_) {
+                const char* start = buf_.data() + pos_;
+                const char* nl = static_cast<const char*>(std::memchr(start, '\n', len_ - pos_));
+                if (nl != nullptr) {
+                    pos_ += static_cast<size_t>(nl - start) + 1;
                     return true;
                 }
-                return false;
+                saw_bytes = true;
+                pos_ = len_;
             }
-            buffer_.append(raw_, bytes_read);
+            pos_ = 0;
+            len_ = fread(buf_.data(), 1, buf_.size(), fp_);
+            if (len_ == 0) {
+                return saw_bytes;
+            }
         }
     }
 
 private:
     FILE* fp_ = nullptr;
     bool is_pipe_ = false;
-    char raw_[65536];
-    std::string buffer_;
+    std::vector<char> buf_;
     size_t pos_ = 0;
+    size_t len_ = 0;
 };
 
 enum class FileType { FASTQ, FASTA, UNKNOWN };
@@ -387,16 +380,19 @@ static double verify_window(const VerifyContext& vc, int ele, const std::string&
     }
     double best = 0.0;
     long long np = 0;
+    parasail_profile_t* prof = parasail_profile_create_16(
+        s.c_str(), static_cast<int>(s.size()), vc.mat);
+    if (!prof) throw std::runtime_error("parasail_profile_create_16 failed");
     for (const std::string& q : it->second) {
-        parasail_result_t* r = parasail_sw_striped_16(
-            q.c_str(), static_cast<int>(q.size()),
-            s.c_str(), static_cast<int>(s.size()), 2, 1, vc.mat);
+        parasail_result_t* r = parasail_sw_striped_profile_16(
+            prof, q.c_str(), static_cast<int>(q.size()), 2, 1);
         ++np;
         int m = std::min<int>(q.size(), s.size());
         double v = m > 0 ? static_cast<double>(r->score) / m : 0.0;
         parasail_result_free(r);
         if (v > best) best = v;
     }
+    parasail_profile_free(prof);
     vc.pairs->fetch_add(np, std::memory_order_relaxed);
     if (best >= vc.tau) {
         vc.passed->fetch_add(1, std::memory_order_relaxed);
@@ -453,6 +449,8 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
         if (out_pos > OUT_BUF_SIZE * 0.8) flush_buffer();
     };
 
+    std::string sid;
+    std::string wseq;
     std::vector<Read> chunk;
     while (queue.pop(chunk)) {
         for (const auto& read : chunk) {
@@ -463,7 +461,7 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                 validate_sequence_segmented(
                     read.seq, mqm, base_offset, cfg,
                     [&](int start, int strand, int confi_id, double rescue_score) {
-                        std::string sid;
+                        sid.clear();
                         sid.reserve(contig.size() + 24);
                         sid += contig;
                         sid += ':';
@@ -473,9 +471,9 @@ void worker_thread(int thread_id, ChunkQueue& queue, const MerQueryManager& mqm,
                         sid += '-';
                         rc = std::to_chars(num, num + 15, base_offset + start + window_size);
                         sid.append(num, rc.ptr - num);
-                        std::string wseq(read.seq, start, window_size);
+                        wseq.assign(read.seq, static_cast<size_t>(start), static_cast<size_t>(window_size));
                         for (char& c : wseq) {
-                            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+                            if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
                         }
                         write_entry(sid.c_str(), strand, confi_id, wseq.c_str(),
                                     rescue_score, margin);
@@ -754,7 +752,7 @@ int main(int argc, char* argv[]) {
         // Load mers table
         std::cerr << "Loading mers table from " << args.mers_file << " ...\n";
         MerQueryManager mqm;
-        mqm.load_from_file(args.mers_file, args.max_assign);
+        mqm.load_from_file(args.mers_file, args.max_assign, true);
         int mer_size = mqm.get_mer_size();
         std::cerr << "  Loaded " << mqm.size() << " mers, k=" << mer_size << "\n";
 
@@ -774,16 +772,24 @@ int main(int argc, char* argv[]) {
                 // index if the table doesn't fit the canonical row packing.
                 if (!mqm.build_canonical_index()) {
                     mqm.build_direct_index();
-                    if (!mqm.has_direct_index())
+                    if (!mqm.has_direct_index()) {
+                        mqm.ensure_hashmap();
                         std::cerr << "  (canonical/direct index unavailable for k=" << mer_size
                                   << ", using hash lookups)\n";
+                    }
+                } else {
+                    mqm.drop_raw_after_canon();
                 }
             } else {
                 mqm.build_direct_index();
-                if (!mqm.has_direct_index())
+                if (!mqm.has_direct_index()) {
+                    mqm.ensure_hashmap();
                     std::cerr << "  (direct index unavailable for k=" << mer_size
                               << ", using hash lookups)\n";
+                }
             }
+        } else {
+            mqm.ensure_hashmap();
         }
 
         // Create output directory

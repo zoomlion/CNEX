@@ -41,17 +41,22 @@ def bunch_generator(fasta_file):
     """
     Build a generator to yield bunched FASTA sequences.
     """
-    buffer = ''
+    lines = []
     with open(fasta_file, 'r') as file:
         for line in file:
-            buffer += line
-            while '###\n' in buffer:
-                part, buffer = buffer.split('###\n', 1)
-                if part.strip():
-                    yield part.strip()
+            if line.endswith('###\n'):
+                lines.append(line[:-4])
+                part = ''.join(lines).strip()
+                lines.clear()
+                if part:
+                    yield part
+            else:
+                lines.append(line)
         # Yield any remaining part after the loop
-        if buffer.strip():
-            yield buffer.strip()
+        if lines:
+            part = ''.join(lines).strip()
+            if part:
+                yield part
 
 
 def align_bunch(args):
